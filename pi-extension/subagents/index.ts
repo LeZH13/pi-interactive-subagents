@@ -204,20 +204,49 @@ export function registerToolExtension(name: string, extensionPath: string): void
 };
 
 /**
+ * Helper to find the pi-web-access extension entry point with project-over-global precedence.
+ */
+function getWebAccessExtensionPath(startDir: string = process.cwd()): string | undefined {
+  // 1. Search ancestor directories for project-local .pi/npm or node_modules
+  let current = resolve(startDir);
+  while (true) {
+    const projectPiNpm = join(current, ".pi", "npm", "node_modules", "pi-web-access", "index.ts");
+    if (existsSync(projectPiNpm)) return projectPiNpm;
+
+    const projectNodeModules = join(current, "node_modules", "pi-web-access", "index.ts");
+    if (existsSync(projectNodeModules)) return projectNodeModules;
+
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  // 2. Global agent config dir (~/.pi/agent/npm/node_modules/pi-web-access/index.ts)
+  const globalPkg = join(getAgentConfigDir(), "npm", "node_modules", "pi-web-access", "index.ts");
+  if (existsSync(globalPkg)) return globalPkg;
+
+  return undefined;
+}
+
+/**
  * Map a custom (non-built-in) tool name to the pi-extension file that
  * registers it. Used to build the child's `--extension` whitelist after
  * `--no-extensions` disables global discovery. Returns undefined for built-in
  * tools and for unknown names (which simply won't be granted).
  */
-function getToolExtensionPath(tool: string): string | undefined {
+function getToolExtensionPath(tool: string, cwd?: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
-  // The four spawning tools are registered by THIS extension.
+  // The spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
-  const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
+  const webAccessPath = getWebAccessExtensionPath(cwd ?? process.cwd());
+  const map: Record<string, string | undefined> = {
+    web_search: webAccessPath ?? join(extBase, "web-search", "index.ts"),
+    fetch_content: webAccessPath,
+    get_search_content: webAccessPath,
+    source_check: webAccessPath,
     web_fetch: join(extBase, "web-fetch", "index.ts"),
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
@@ -237,12 +266,12 @@ function getToolExtensionPath(tool: string): string | undefined {
  * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
  * restriction (top-level session, or an unrestricted child).
  */
-const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
+function getSubagentAllowlist(): Set<string> | null {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
   if (!raw) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
-})();
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -327,7 +356,8 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
   // When this process is itself a restricted subagent, only expose the agents
   // it is permitted to spawn (PI_SUBAGENT_ALLOWED). Top-level sessions see all.
   const all = [...agents.values()];
-  return SUBAGENT_ALLOWLIST ? all.filter((a) => SUBAGENT_ALLOWLIST.has(a.name)) : all;
+  const allowlist = getSubagentAllowlist();
+  return allowlist ? all.filter((a) => allowlist.has(a.name)) : all;
 }
 
 function resolveSubagentPaths(
@@ -866,7 +896,7 @@ function applySandboxToParts(
 
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool);
+      const extPath = getToolExtensionPath(tool, loadout.cwd ?? undefined);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
@@ -1723,8 +1753,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
+        const allowlist = getSubagentAllowlist();
+        const permittedAgents = allowlist
+          ? [...allowlist]
           : discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
@@ -1748,12 +1779,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 type: "text",
                 text:
                   `You may not spawn the "${params.agent}" agent — it is not ` +
-                  `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. ` +
+                  `${allowlist ? "in your allowlist" : "a known agent"}. ` +
                   `Available agents: ${permittedList}.`,
               },
             ],
             details: {
-              error: SUBAGENT_ALLOWLIST ? "agent not in allowlist" : "unknown agent",
+              error: allowlist ? "agent not in allowlist" : "unknown agent",
             },
           };
         }

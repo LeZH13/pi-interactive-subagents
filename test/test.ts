@@ -1,11 +1,14 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+
+// Tests run as top-level orchestrator tests; clear any inherited child subagent allowlist.
+delete process.env.PI_SUBAGENT_ALLOWED;
 
 import {
   getLeafId,
@@ -156,6 +159,8 @@ async function withIsolatedAgentEnv(
   const root = createTestDir();
   const previousCwd = process.cwd();
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousSubagentAllowed = process.env.PI_SUBAGENT_ALLOWED;
+  delete process.env.PI_SUBAGENT_ALLOWED;
   const projectDir = join(root, "project");
   const projectAgentsDir = join(projectDir, ".pi", "agents");
   const globalDir = join(root, "global");
@@ -171,6 +176,7 @@ async function withIsolatedAgentEnv(
   } finally {
     process.chdir(previousCwd);
     restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", previousSubagentAllowed);
     rmSync(root, { recursive: true, force: true });
   }
 }
@@ -1209,10 +1215,60 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    assert.equal(testApi.getToolExtensionPath("edit"), undefined);
+    assert.equal(testApi.getToolExtensionPath("write"), undefined);
+    assert.equal(testApi.getToolExtensionPath("grep"), undefined);
+    assert.equal(testApi.getToolExtensionPath("find"), undefined);
+    assert.equal(testApi.getToolExtensionPath("ls"), undefined);
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
+  });
+
+  it("getToolExtensionPath resolves global pi-web-access tools with fallback", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const globalPkg = join(globalDir, "npm", "node_modules", "pi-web-access", "index.ts");
+      mkdirSync(dirname(globalPkg), { recursive: true });
+      writeFileSync(globalPkg, "export default () => {}");
+
+      assert.equal(testApi.getToolExtensionPath("web_search"), globalPkg);
+      assert.equal(testApi.getToolExtensionPath("fetch_content"), globalPkg);
+      assert.equal(testApi.getToolExtensionPath("get_search_content"), globalPkg);
+      assert.equal(testApi.getToolExtensionPath("source_check"), globalPkg);
+      // web_fetch is strictly reserved for legacy standalone extension
+      assert.equal(testApi.getToolExtensionPath("web_fetch"), undefined);
+    });
+  });
+
+  it("getToolExtensionPath prefers project-local pi-web-access over global", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const globalPkg = join(globalDir, "npm", "node_modules", "pi-web-access", "index.ts");
+      mkdirSync(dirname(globalPkg), { recursive: true });
+      writeFileSync(globalPkg, "// global version");
+
+      const localPkg = join(projectDir, ".pi", "npm", "node_modules", "pi-web-access", "index.ts");
+      mkdirSync(dirname(localPkg), { recursive: true });
+      writeFileSync(localPkg, "// local version");
+
+      assert.equal(testApi.getToolExtensionPath("fetch_content", projectDir), localPkg);
+      assert.equal(testApi.getToolExtensionPath("web_search", projectDir), localPkg);
+    });
+  });
+
+  it("getToolExtensionPath falls back to legacy extensions directory when package is absent", async () => {
+    await withIsolatedAgentEnv(async ({ globalDir }) => {
+      const legacySearch = join(globalDir, "extensions", "web-search", "index.ts");
+      mkdirSync(dirname(legacySearch), { recursive: true });
+      writeFileSync(legacySearch, "// legacy search");
+
+      const legacyFetch = join(globalDir, "extensions", "web-fetch", "index.ts");
+      mkdirSync(dirname(legacyFetch), { recursive: true });
+      writeFileSync(legacyFetch, "// legacy fetch");
+
+      assert.equal(testApi.getToolExtensionPath("web_search"), legacySearch);
+      assert.equal(testApi.getToolExtensionPath("web_fetch"), legacyFetch);
+      assert.equal(testApi.getToolExtensionPath("fetch_content"), undefined);
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
