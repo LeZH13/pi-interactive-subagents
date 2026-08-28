@@ -2710,16 +2710,20 @@ describe("subagent display helpers", () => {
 
 describe("tmux.ts", () => {
   describe("layoutForDimensions", () => {
-    it("uses equal columns for landscape windows", () => {
-      assert.equal(layoutForDimensions(160, 90), "even-horizontal");
+    it("uses equal columns for physically landscape windows", () => {
+      assert.equal(layoutForDimensions(240, 90), "even-horizontal");
     });
 
-    it("uses equal columns for square windows", () => {
-      assert.equal(layoutForDimensions(100, 100), "even-horizontal");
+    it("uses equal columns at the physical square boundary", () => {
+      assert.equal(layoutForDimensions(200, 100), "even-horizontal");
     });
 
-    it("uses equal rows for portrait windows", () => {
-      assert.equal(layoutForDimensions(90, 160), "even-vertical");
+    it("uses equal rows below the physical square boundary", () => {
+      assert.equal(layoutForDimensions(199, 100), "even-vertical");
+    });
+
+    it("uses equal rows for a 120x103-cell portrait window", () => {
+      assert.equal(layoutForDimensions(120, 103), "even-vertical");
     });
   });
 

@@ -72,12 +72,12 @@ export function shellEscape(s: string): string {
 type SubagentLayout = "even-horizontal" | "even-vertical";
 
 /**
- * Pick equal columns for square/landscape windows and equal rows for portrait
- * windows. tmux reports dimensions in character cells, which matches the
- * user-visible width:height rule and avoids relying on terminal font metrics.
+ * Pick equal columns for physically square/landscape windows and equal rows
+ * for portrait windows. tmux reports columns and rows, but monospace cells are
+ * roughly twice as tall as they are wide, so scale row count before comparing.
  */
 export function layoutForDimensions(width: number, height: number): SubagentLayout {
-  return width >= height ? "even-horizontal" : "even-vertical";
+  return width >= height * 2 ? "even-horizontal" : "even-vertical";
 }
 
 function windowLayout(target: string): SubagentLayout {
