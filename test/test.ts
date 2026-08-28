@@ -33,7 +33,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { layoutForDimensions, shellEscape } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -2709,6 +2709,20 @@ describe("subagent display helpers", () => {
 });
 
 describe("tmux.ts", () => {
+  describe("layoutForDimensions", () => {
+    it("uses equal columns for landscape windows", () => {
+      assert.equal(layoutForDimensions(160, 90), "even-horizontal");
+    });
+
+    it("uses equal columns for square windows", () => {
+      assert.equal(layoutForDimensions(100, 100), "even-horizontal");
+    });
+
+    it("uses equal rows for portrait windows", () => {
+      assert.equal(layoutForDimensions(90, 160), "even-vertical");
+    });
+  });
+
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");

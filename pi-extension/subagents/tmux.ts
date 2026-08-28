@@ -69,12 +69,33 @@ export function shellEscape(s: string): string {
 
 // ── Pane layout ──
 
+type SubagentLayout = "even-horizontal" | "even-vertical";
+
 /**
- * tmux layout applied to the subagent window to keep panes evenly sized.
- * Switchable: "even-horizontal" (equal columns, matches Ctrl+b Alt+1),
- * "main-vertical" (big main pane + tiled column), "tiled" (grid).
+ * Pick equal columns for square/landscape windows and equal rows for portrait
+ * windows. tmux reports dimensions in character cells, which matches the
+ * user-visible width:height rule and avoids relying on terminal font metrics.
  */
-const SUBAGENT_TMUX_LAYOUT = "even-horizontal";
+export function layoutForDimensions(width: number, height: number): SubagentLayout {
+  return width >= height ? "even-horizontal" : "even-vertical";
+}
+
+function windowLayout(target: string): SubagentLayout {
+  try {
+    const output = execFileSync(
+      "tmux",
+      ["display-message", "-p", "-t", target, "#{window_width} #{window_height}"],
+      { encoding: "utf8" },
+    ).trim();
+    const [width, height] = output.split(/\s+/).map(Number);
+    if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
+      return layoutForDimensions(width, height);
+    }
+  } catch {
+    // Fall back to the historical side-by-side layout if dimensions cannot be read.
+  }
+  return "even-horizontal";
+}
 
 let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -82,8 +103,8 @@ let rebalanceTimer: ReturnType<typeof setTimeout> | null = null;
  * Re-balance subagent panes so repeated splits don't leave them lopsided.
  * tmux halves the target pane on every split and dumps freed space onto a
  * neighbor on close, so without this panes drift to wildly uneven widths.
- * Applies SUBAGENT_TMUX_LAYOUT to the parent pi window. Debounced so a burst
- * of parallel spawns or staggered exits collapses into a single layout call,
+ * Applies the aspect-ratio-selected layout to the parent pi window. Debounced
+ * so a burst of parallel spawns or staggered exits collapses into one call,
  * and non-fatal: a cosmetic resize must never break spawning or watching.
  */
 function rebalanceSurfaces(hintPane?: string): void {
@@ -95,7 +116,8 @@ function rebalanceSurfaces(hintPane?: string): void {
     rebalanceTimer = null;
     try {
       // -t <pane> resolves to that pane's window; does not change focus.
-      execFileSync("tmux", ["select-layout", "-t", target, SUBAGENT_TMUX_LAYOUT], {
+      const layout = windowLayout(target);
+      execFileSync("tmux", ["select-layout", "-t", target, layout], {
         encoding: "utf8",
       });
     } catch {
@@ -107,15 +129,18 @@ function rebalanceSurfaces(hintPane?: string): void {
 // ── Surface primitives ──
 
 /**
- * Create a new pane for a subagent: a right split off the parent pi's pane,
- * so new panes follow the agent rather than the user's focus.
+ * Create a new pane for a subagent. Square/landscape windows split to the
+ * right; portrait windows split downward. New panes follow the parent pi pane
+ * rather than the user's focus.
  * See https://github.com/HazAT/pi-interactive-subagents/issues/12
  *
  * Returns the new pane id (e.g. `%12`).
  */
 export function createSurface(name: string): string {
   void name; // tmux panes are not named; the pi process inside shows its own title.
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  const target = process.env.TMUX_PANE;
+  const direction = target && windowLayout(target) === "even-vertical" ? "down" : "right";
+  return createSurfaceSplit(name, direction, target);
 }
 
 /**
@@ -203,13 +228,14 @@ export function sendLongCommand(
 }
 
 /**
- * Read the screen contents of a pane (sync).
+ * Read the screen contents of a pane (sync), joining terminal-wrapped rows so
+ * callers can match logical output even when a pane is narrow.
  */
 export function readScreen(surface: string, lines = 50): string {
   requireTmux();
   return execFileSync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     {
       encoding: "utf8",
     },
@@ -217,13 +243,13 @@ export function readScreen(surface: string, lines = 50): string {
 }
 
 /**
- * Read the screen contents of a pane (async).
+ * Read the screen contents of a pane (async), joining terminal-wrapped rows.
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   requireTmux();
   const { stdout } = await execFileAsync(
     "tmux",
-    ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
+    ["capture-pane", "-p", "-J", "-t", surface, "-S", `-${Math.max(1, lines)}`],
     { encoding: "utf8" },
   );
   return stdout;

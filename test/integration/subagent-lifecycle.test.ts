@@ -1,23 +1,24 @@
 /**
  * Integration tests for the full subagent lifecycle.
  *
- * These tests spawn REAL pi sessions with REAL LLM calls (haiku by default).
+ * These tests spawn REAL pi sessions with REAL LLM calls (Gemini by default).
  * Each test creates a tmux pane, runs pi with a task that uses the subagent
  * tool, and verifies the outcome via marker files and screen output.
  *
- * Costs: ~$0.01-0.05 per test run (haiku).
+ * Costs depend on the configured provider and model.
  * Duration: ~30-90s per test.
  *
  * Run inside tmux:
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: cliproxy/gemini-3.7-flash-high)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -193,80 +194,74 @@ for (const backend of backends) {
     it("fork mode creates a child session linked to the parent", async () => {
       const id = uniqueId();
       const markerFile = `/tmp/pi-integ-fork-${id}.txt`;
+      const sessionPointerFile = `/tmp/pi-integ-fork-session-${id}.txt`;
       trackTempFile(env, markerFile);
+      trackTempFile(env, sessionPointerFile);
 
       const surface = createTrackedSurface(env, `fork-${id}`);
       await sleep(1000);
 
+      const childCommand =
+        `echo 'FORK_OK_${id}' > '${markerFile}'; ` +
+        `printf '%s' "$PI_SUBAGENT_SESSION" > '${sessionPointerFile}'`;
       const task = [
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
-        `  fork: true`,
-        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
-        `Do not set the agent parameter. Just set name, fork, and task.`,
+        `  agent: "test-fork"`,
+        `  task: ${JSON.stringify(`Run this bash command exactly: ${childCommand}`)}`,
+        `Do not do anything else. Just call the subagent tool once.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // Verify: forked subagent created the file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
       assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
 
-      // Wait for the outer pi to show the result
-      const screen = await waitForScreen(
-        surface,
-        /FORK_COMPLETE|completed|Sub-agent.*"Fork/i,
-        PI_TIMEOUT,
-      );
+      const sessionFile = (await waitForFile(sessionPointerFile, PI_TIMEOUT)).trim();
+      assert.ok(sessionFile.endsWith(".jsonl"), `Expected child session path, got: ${sessionFile}`);
+      assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
 
-      // Verify: the forked session has a parent link
-      const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
-      if (sessionMatch) {
-        const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
-
-        const entries = readFileSync(sessionFile, "utf8")
-          .trim()
-          .split("\n")
-          .map((l) => JSON.parse(l));
-        const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
-        // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
-      }
+      const entries = readFileSync(sessionFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const header = entries[0];
+      assert.equal(header.type, "session", "First entry should be session header");
+      assert.ok(header.parentSession, "Fork session should have parentSession field");
+      assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
     });
 
-    // ── caller_ping ──
+    // ── ask_question round trip ──
 
-    it("subagent caller_ping sends notification back to the parent", async () => {
+    it("subagent ask_question receives a reply from the parent", async () => {
       const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-question-${id}.txt`;
+      trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `ping-${id}`);
+      const surface = createTrackedSurface(env, `question-${id}`);
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these EXACT parameters:`,
-        `  name: "Ping-${id}"`,
-        `  agent: "test-ping"`,
-        `  task: "PING_TEST_${id}"`,
-        `Just call the subagent tool once. Do not do anything else before calling it.`,
+        `Call the subagent tool exactly once with:`,
+        `  name: "Question-${id}"`,
+        `  agent: "test-question"`,
+        `  task: ${JSON.stringify(
+          `Call ask_question with question "QUESTION_${id}". Stop and wait. ` +
+            `After the parent replies, run: echo 'QUESTION_OK_${id}' > '${markerFile}'`,
+        )}`,
+        `When Question-${id} asks its question, reply by calling subagent_message with:`,
+        `  name: "Question-${id}"`,
+        `  message: "ANSWER_${id}"`,
+        `Do not write ${markerFile} yourself.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      // The test-ping agent calls caller_ping, which steers a "needs help" message
-      // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(
-        surface,
-        /needs help|PING|caller_ping|ping/i,
-        PI_TIMEOUT,
-      );
-
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /QUESTION_OK/);
       assert.ok(
-        /needs help|PING/i.test(screen),
-        `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
+        content.includes(`QUESTION_OK_${id}`),
+        `Question round-trip marker should exist with content`,
       );
     });
 
@@ -298,29 +293,30 @@ for (const backend of backends) {
       assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
     });
 
-    // ── Subagent with custom system prompt ──
+    // ── Subagent working directory ──
 
-    it("passes systemPrompt to subagent", async () => {
+    it("passes cwd to subagent", async () => {
       const id = uniqueId();
-      const markerFile = `/tmp/pi-integ-sysprompt-${id}.txt`;
+      const relativeMarker = `cwd-${id}.txt`;
+      const markerFile = join(env.dir, relativeMarker);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `sysprompt-${id}`);
+      const surface = createTrackedSurface(env, `cwd-${id}`);
       await sleep(1000);
 
       const task = [
-        `Call the subagent tool with these parameters:`,
-        `  name: "SysP-${id}"`,
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Cwd-${id}"`,
         `  agent: "test-echo"`,
-        `  systemPrompt: "Always start your response with CUSTOM_PROMPT_ACTIVE."`,
-        `  task: "Write 'SYSPROMPT_${id}' to ${markerFile} using bash: echo 'SYSPROMPT_${id}' > '${markerFile}'"`,
-        `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
+        `  cwd: ${JSON.stringify(env.dir)}`,
+        `  task: "Run: echo 'CWD_OK_${id}' > '${relativeMarker}'"`,
+        `Do not do anything else. Just call the subagent tool once.`,
       ].join("\n");
 
       startPi(surface, env.dir, task);
 
-      const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
-      assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /CWD_OK/);
+      assert.ok(content.includes(`CWD_OK_${id}`), `cwd marker should exist in the requested directory`);
     });
   });
 }
