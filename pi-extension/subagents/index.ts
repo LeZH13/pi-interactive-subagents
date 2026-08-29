@@ -394,15 +394,19 @@ function normalizeThinking(thinking: string | undefined): string | undefined {
   return NAMED_THINKING_LEVELS.has(namedLevel) ? namedLevel : normalized;
 }
 
-const NAMED_THINKING_LEVELS = new Set([
+const STANDARD_THINKING_LEVELS = [
   "off",
-  "none",
   "minimal",
   "low",
   "medium",
   "high",
   "xhigh",
   "max",
+] as const;
+
+const NAMED_THINKING_LEVELS = new Set([
+  ...STANDARD_THINKING_LEVELS,
+  "none",
 ]);
 
 /**
@@ -426,6 +430,123 @@ function splitModelThinking(model: string | undefined): {
   return {
     model: model.slice(0, lastColon),
     thinking: normalizeThinking(suffix),
+  };
+}
+
+function getKnownModelsFromRegistry(): string[] {
+  const modelIds = new Set<string>();
+  if (latestCtx?.modelRegistry) {
+    try {
+      for (const m of latestCtx.modelRegistry.getAll()) {
+        if (m.provider && m.id) {
+          modelIds.add(`${m.provider}/${m.id}`);
+        }
+      }
+    } catch {}
+  }
+  for (const agent of discoverAgentDefinitions()) {
+    const model = splitModelThinking(agent.model).model?.trim();
+    if (model) modelIds.add(model);
+  }
+  const environmentModel = splitModelThinking(process.env.PI_MODEL).model?.trim();
+  if (environmentModel) modelIds.add(environmentModel);
+
+  return [...modelIds];
+}
+
+function getSupportedThinkingLevelsForModel(modelName: string | undefined): readonly string[] {
+  if (!modelName || !latestCtx?.modelRegistry) return STANDARD_THINKING_LEVELS;
+  try {
+    const match = latestCtx.modelRegistry.getAll().find((m) =>
+      `${m.provider}/${m.id}` === modelName || m.id === modelName
+    );
+    if (match && match.reasoning === false) {
+      return ["off"];
+    }
+  } catch {}
+  return STANDARD_THINKING_LEVELS;
+}
+
+/** Generate completions for `/subagent <agent>[@<model>][:<thinking>]`. */
+function getSubagentArgumentCompletions(prefix: string) {
+  // Once the first argument is followed by whitespace, the rest is the task.
+  if (/\s/.test(prefix)) return null;
+
+  const atIndex = prefix.indexOf("@");
+  if (atIndex !== -1) {
+    const agentName = prefix.slice(0, atIndex);
+    const modelPart = prefix.slice(atIndex + 1);
+    const colonIndex = modelPart.lastIndexOf(":");
+
+    if (colonIndex !== -1) {
+      const baseModel = modelPart.slice(0, colonIndex);
+      const levelPrefix = modelPart.slice(colonIndex + 1).toLowerCase();
+      const levels = getSupportedThinkingLevelsForModel(baseModel);
+      return levels
+        .filter((level) => level.startsWith(levelPrefix))
+        .map((level) => {
+          const value = `${agentName}@${baseModel}:${level}`;
+          return { value, label: value };
+        });
+    }
+
+    const models = getKnownModelsFromRegistry();
+    return models
+      .filter((model) => model.startsWith(modelPart))
+      .map((model) => {
+        const value = `${agentName}@${model}`;
+        return { value, label: value };
+      });
+  }
+
+  const colonIndex = prefix.indexOf(":");
+  if (colonIndex !== -1) {
+    const agentName = prefix.slice(0, colonIndex);
+    const levelPrefix = prefix.slice(colonIndex + 1).toLowerCase();
+    const agentDef = loadAgentDefaults(agentName);
+    const agentModel = splitModelThinking(agentDef?.model).model?.trim();
+    const levels = getSupportedThinkingLevelsForModel(agentModel);
+    return levels
+      .filter((level) => level.startsWith(levelPrefix))
+      .map((level) => {
+        const value = `${agentName}:${level}`;
+        return { value, label: value };
+      });
+  }
+
+  return discoverAgentDefinitions()
+    .filter((agent) => agent.name.startsWith(prefix))
+    .map((agent) => ({
+      value: agent.name,
+      label: agent.name,
+      description: agent.description,
+    }));
+}
+
+/** Parse `/subagent <agent>[@<model>][:<thinking>]`'s first argument. */
+function parseSubagentSpec(spec: string): {
+  agentName: string;
+  model: string | undefined;
+  thinking: string | undefined;
+} {
+  const trimmed = spec.trim();
+  const atIndex = trimmed.indexOf("@");
+
+  if (atIndex === -1) {
+    const parsed = splitModelThinking(trimmed);
+    return {
+      agentName: parsed.model ?? "",
+      model: undefined,
+      thinking: parsed.thinking,
+    };
+  }
+
+  const agentName = trimmed.slice(0, atIndex);
+  const parsed = splitModelThinking(trimmed.slice(atIndex + 1));
+  return {
+    agentName,
+    model: parsed.model?.trim() || undefined,
+    thinking: parsed.thinking,
   };
 }
 
@@ -1293,6 +1414,13 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  getSubagentArgumentCompletions,
+  getKnownModelsFromRegistry,
+  getSupportedThinkingLevelsForModel,
+  setTestContext: (ctx: any) => {
+    latestCtx = ctx;
+  },
+  parseSubagentSpec,
   resolveEffectiveModelAndThinking,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
@@ -2505,19 +2633,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent command — spawn a subagent by name
+  // /subagent command — spawn a subagent by name with optional model/thinking overrides
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+    description: "Spawn a subagent: /subagent <agent>[@<model>][:<thinking>] [task]",
+    getArgumentCompletions: getSubagentArgumentCompletions,
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        ctx.ui.notify(
+          "Usage: /subagent <agent>[@<model>][:<thinking>] [task]",
+          "warning",
+        );
         return;
       }
 
-      const spaceIdx = trimmed.indexOf(" ");
-      const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+      const firstWhitespace = trimmed.search(/\s/);
+      const spec = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace);
+      const task = firstWhitespace === -1 ? "" : trimmed.slice(firstWhitespace).trim();
+      const { agentName, model, thinking } = parseSubagentSpec(spec);
 
       const defs = loadAgentDefaults(agentName);
       if (!defs) {
@@ -2530,7 +2663,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      const attributes = [`agent: ${JSON.stringify(agentName)}`];
+      if (model) attributes.push(`model: ${JSON.stringify(model)}`);
+      if (thinking) attributes.push(`thinking: ${JSON.stringify(thinking)}`);
+      attributes.push(`name: ${JSON.stringify(displayName)}`);
+      const toolCall =
+        `Use subagent with ${attributes.join(", ")}, task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });

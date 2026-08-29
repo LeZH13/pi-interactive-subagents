@@ -36,7 +36,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly, and `/subagent-sessions` for session inspection and explicit orphan cleanup.
+There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for spawning directly, and `/subagent-sessions` for session inspection and explicit orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
 ### Spawning
 

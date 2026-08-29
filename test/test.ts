@@ -1610,6 +1610,43 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("parses /subagent agent, model, and thinking spec variations", () => {
+    const cases = [
+      ["worker", { agentName: "worker", model: undefined, thinking: undefined }],
+      ["worker:high", { agentName: "worker", model: undefined, thinking: "high" }],
+      ["worker@openai/o3-mini", {
+        agentName: "worker",
+        model: "openai/o3-mini",
+        thinking: undefined,
+      }],
+      ["worker@openai/o3-mini:high", {
+        agentName: "worker",
+        model: "openai/o3-mini",
+        thinking: "high",
+      }],
+      ["worker@ollama/llama3.1:8b", {
+        agentName: "worker",
+        model: "ollama/llama3.1:8b",
+        thinking: undefined,
+      }],
+      ["worker@ollama/llama3.1:8b:high", {
+        agentName: "worker",
+        model: "ollama/llama3.1:8b",
+        thinking: "high",
+      }],
+      ["worker:32768", { agentName: "worker", model: undefined, thinking: "32768" }],
+      ["worker@openai/o3-mini:none", {
+        agentName: "worker",
+        model: "openai/o3-mini",
+        thinking: "off",
+      }],
+    ] as const;
+
+    for (const [spec, expected] of cases) {
+      assert.deepEqual(testApi.parseSubagentSpec(spec), expected, spec);
+    }
+  });
+
   it("resolves an explicit thinking parameter over the agent default", () => {
     assert.deepEqual(
       testApi.resolveEffectiveModelAndThinking(
@@ -2433,6 +2470,154 @@ describe("tmux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("/subagent completes agent names for empty and partial prefixes", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "completion-worker",
+        "name: completion-worker\ndescription: Completes focused implementation tasks",
+      );
+
+      const expected = {
+        value: "completion-worker",
+        label: "completion-worker",
+        description: "Completes focused implementation tasks",
+      };
+      assert.ok(testApi.getSubagentArgumentCompletions("").some(
+        (completion: any) => completion.value === "completion-worker",
+      ));
+      assert.deepEqual(testApi.getSubagentArgumentCompletions("completion-w"), [expected]);
+    });
+  });
+
+  it("/subagent completes thinking levels after an agent name", () => {
+    assert.deepEqual(
+      testApi.getSubagentArgumentCompletions("worker:").map((item: any) => item.value),
+      ["worker:off", "worker:minimal", "worker:low", "worker:medium", "worker:high", "worker:xhigh", "worker:max"],
+    );
+    assert.deepEqual(
+      testApi.getSubagentArgumentCompletions("worker:h").map((item: any) => item.value),
+      ["worker:high"],
+    );
+  });
+
+  it("/subagent dynamically includes active models from ExtensionContext modelRegistry", () => {
+    const mockModelRegistry = {
+      getAll: () => [
+        { provider: "custom-provider", id: "custom-model-1", reasoning: true },
+        { provider: "custom-provider", id: "custom-non-reasoning", reasoning: false },
+      ],
+    };
+    testApi.setTestContext({ modelRegistry: mockModelRegistry });
+    try {
+      const completions = testApi.getSubagentArgumentCompletions("worker@custom").map(
+        (item: any) => item.value,
+      );
+      assert.ok(completions.includes("worker@custom-provider/custom-model-1"));
+      assert.ok(completions.includes("worker@custom-provider/custom-non-reasoning"));
+    } finally {
+      testApi.setTestContext(null);
+    }
+  });
+
+  it("/subagent derives reasoning capabilities from active model registry", () => {
+    const mockModelRegistry = {
+      getAll: () => [
+        { provider: "test-prov", id: "reasoning-model", reasoning: true },
+        { provider: "test-prov", id: "non-reasoning-model", reasoning: false },
+      ],
+    };
+    testApi.setTestContext({ modelRegistry: mockModelRegistry });
+    try {
+      // Model with reasoning: true should offer all levels
+      const reasoningCompletions = testApi
+        .getSubagentArgumentCompletions("worker@test-prov/reasoning-model:")
+        .map((item: any) => item.value);
+      assert.deepEqual(reasoningCompletions, [
+        "worker@test-prov/reasoning-model:off",
+        "worker@test-prov/reasoning-model:minimal",
+        "worker@test-prov/reasoning-model:low",
+        "worker@test-prov/reasoning-model:medium",
+        "worker@test-prov/reasoning-model:high",
+        "worker@test-prov/reasoning-model:xhigh",
+        "worker@test-prov/reasoning-model:max",
+      ]);
+
+      // Model with reasoning: false should only offer "off"
+      const nonReasoningCompletions = testApi
+        .getSubagentArgumentCompletions("worker@test-prov/non-reasoning-model:")
+        .map((item: any) => item.value);
+      assert.deepEqual(nonReasoningCompletions, [
+        "worker@test-prov/non-reasoning-model:off",
+      ]);
+    } finally {
+      testApi.setTestContext(null);
+    }
+  });
+
+  it("/subagent completes discovered agent models and environment model IDs", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "completion-agent",
+        "name: completion-agent\ndescription: Test agent\nmodel: openrouter/z-ai/glm-5.3:medium",
+      );
+
+      const previousModel = process.env.PI_MODEL;
+      process.env.PI_MODEL = "openai/environment-test:high";
+      try {
+        const allModels = testApi.getSubagentArgumentCompletions("completion-agent@").map(
+          (item: any) => item.value,
+        );
+        assert.ok(allModels.includes("completion-agent@openai/environment-test"));
+        assert.ok(allModels.includes("completion-agent@openrouter/z-ai/glm-5.3"));
+
+        const openModels = testApi.getSubagentArgumentCompletions("completion-agent@open").map(
+          (item: any) => item.value,
+        );
+        assert.ok(openModels.includes("completion-agent@openai/environment-test"));
+        assert.ok(openModels.includes("completion-agent@openrouter/z-ai/glm-5.3"));
+        assert.ok(openModels.every((value: string) => value.startsWith("completion-agent@open")));
+      } finally {
+        restoreEnvVar("PI_MODEL", previousModel);
+      }
+    });
+  });
+
+  it("/subagent completes thinking levels after a model ID", () => {
+    assert.deepEqual(
+      testApi.getSubagentArgumentCompletions("worker@openai/o3-mini:").map(
+        (item: any) => item.value,
+      ),
+      [
+        "worker@openai/o3-mini:off",
+        "worker@openai/o3-mini:minimal",
+        "worker@openai/o3-mini:low",
+        "worker@openai/o3-mini:medium",
+        "worker@openai/o3-mini:high",
+        "worker@openai/o3-mini:xhigh",
+        "worker@openai/o3-mini:max",
+      ],
+    );
+    assert.deepEqual(
+      testApi.getSubagentArgumentCompletions("worker@openai/o3-mini:m").map(
+        (item: any) => item.value,
+      ),
+      [
+        "worker@openai/o3-mini:minimal",
+        "worker@openai/o3-mini:medium",
+        "worker@openai/o3-mini:max",
+      ],
+    );
+  });
+
+  it("/subagent stops completing once task text begins", () => {
+    assert.equal(testApi.getSubagentArgumentCompletions("worker "), null);
+    assert.equal(testApi.getSubagentArgumentCompletions("worker implement this"), null);
+  });
+
   it("/subagent emits a spawn tool call for a known agent", () => {
     const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
 
@@ -2440,14 +2625,49 @@ describe("commands", () => {
 
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
+    assert.equal(
+      subagent.description,
+      "Spawn a subagent: /subagent <agent>[@<model>][:<thinking>] [task]",
+    );
+    assert.equal(typeof subagent.getArgumentCompletions, "function");
 
     subagent.handler("scout map the auth code", {
       ui: { notify() {} },
     });
 
-    assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /agent: "scout"/);
-    assert.match(sentUserMessages[0], /map the auth code/);
+    assert.deepEqual(sentUserMessages, [
+      'Use subagent with agent: "scout", name: "Scout", task: "map the auth code"',
+    ]);
+  });
+
+  it("/subagent includes model and thinking overrides in the spawn tool prompt", () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    subagent.handler("worker@ollama/llama3.1:8b:high implement the fix", {
+      ui: { notify() {} },
+    });
+
+    assert.deepEqual(sentUserMessages, [
+      'Use subagent with agent: "worker", model: "ollama/llama3.1:8b", thinking: "high", name: "Worker", task: "implement the fix"',
+    ]);
+  });
+
+  it("/subagent includes a thinking-only override without adding a model", () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    subagent.handler("worker:high inspect the failure", {
+      ui: { notify() {} },
+    });
+
+    assert.deepEqual(sentUserMessages, [
+      'Use subagent with agent: "worker", thinking: "high", name: "Worker", task: "inspect the failure"',
+    ]);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {
