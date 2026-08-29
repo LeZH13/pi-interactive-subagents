@@ -25,6 +25,10 @@ function finiteNonNegative(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
+function finitePositive(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 /** Extract the model and latest usage snapshot from an assistant message. */
 export function telemetryFromMessage(message: unknown): SubagentTelemetry | undefined {
   if (message == null || typeof message !== "object" || (message as any).role !== "assistant") return undefined;
@@ -36,14 +40,30 @@ export function telemetryFromMessage(message: unknown): SubagentTelemetry | unde
   const usage = assistant.usage;
   if (usage != null && typeof usage === "object" && !Array.isArray(usage)) {
     const values = usage as Record<string, unknown>;
-    telemetry.inputTokens = finiteNonNegative(values.input);
-    telemetry.outputTokens = finiteNonNegative(values.output);
-    telemetry.cacheReadTokens = finiteNonNegative(values.cacheRead);
-    telemetry.cacheWriteTokens = finiteNonNegative(values.cacheWrite);
-    telemetry.contextTokens = finiteNonNegative(values.totalTokens);
-    const cost = values.cost;
-    if (cost != null && typeof cost === "object" && !Array.isArray(cost)) {
-      telemetry.cost = finiteNonNegative((cost as Record<string, unknown>).total);
+    const input = finiteNonNegative(values.input);
+    const output = finiteNonNegative(values.output);
+    const cacheRead = finiteNonNegative(values.cacheRead);
+    const cacheWrite = finiteNonNegative(values.cacheWrite);
+    const contextTokens = finitePositive(values.totalTokens);
+    const costObj = values.cost;
+    const cost = costObj != null && typeof costObj === "object" && !Array.isArray(costObj)
+      ? finiteNonNegative((costObj as Record<string, unknown>).total)
+      : undefined;
+
+    const hasAnyUsage = (input != null && input > 0) ||
+      (output != null && output > 0) ||
+      (cacheRead != null && cacheRead > 0) ||
+      (cacheWrite != null && cacheWrite > 0) ||
+      (contextTokens != null && contextTokens > 0) ||
+      (cost != null && cost > 0);
+
+    if (hasAnyUsage) {
+      if (input != null) telemetry.inputTokens = input;
+      if (output != null) telemetry.outputTokens = output;
+      if (cacheRead != null) telemetry.cacheReadTokens = cacheRead;
+      if (cacheWrite != null) telemetry.cacheWriteTokens = cacheWrite;
+      if (contextTokens != null) telemetry.contextTokens = contextTokens;
+      if (cost != null) telemetry.cost = cost;
     }
   }
 
@@ -60,7 +80,7 @@ export function telemetryFromContext(ctx: unknown): SubagentTelemetry | undefine
   if (typeof context.getContextUsage === "function") {
     try {
       const usage = context.getContextUsage();
-      const tokens = finiteNonNegative(usage?.tokens);
+      const tokens = finitePositive(usage?.tokens);
       if (tokens != null) telemetry.contextTokens = tokens;
     } catch {
       // Telemetry is best effort and must never disrupt the subagent lifecycle.
@@ -69,12 +89,19 @@ export function telemetryFromContext(ctx: unknown): SubagentTelemetry | undefine
   return Object.values(telemetry).some((value) => value != null) ? telemetry : undefined;
 }
 
-function mergeTelemetry(
+export function mergeTelemetry(
   contextTelemetry: SubagentTelemetry | undefined,
   messageTelemetry: SubagentTelemetry | undefined,
 ): SubagentTelemetry | undefined {
   if (!contextTelemetry && !messageTelemetry) return undefined;
-  return { ...contextTelemetry, ...messageTelemetry };
+  const merged: SubagentTelemetry = { ...contextTelemetry };
+  if (!messageTelemetry) return merged;
+  for (const [key, value] of Object.entries(messageTelemetry)) {
+    if (value !== undefined) {
+      (merged as any)[key] = value;
+    }
+  }
+  return merged;
 }
 
 function lifecycleTelemetry(message: unknown, ctx: unknown): SubagentTelemetry | undefined {
@@ -257,7 +284,7 @@ export default function (pi: ExtensionAPI) {
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
-    recorder.sessionStart();
+    recorder.sessionStart(telemetryFromContext(ctx));
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
     denied = parseDeniedTools(deniedToolsValue);
@@ -282,16 +309,16 @@ export default function (pi: ExtensionAPI) {
     userTookOver = true;
   });
 
-  pi.on("before_agent_start", () => {
-    recorder.beforeAgentStart();
+  pi.on("before_agent_start", (_event, ctx) => {
+    recorder.beforeAgentStart(telemetryFromContext(ctx));
   });
 
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (_event, ctx) => {
     agentStarted = true;
     // A new turn is starting — any pending ask_question has now been answered
     // (or superseded), so let auto-exit resume normally when this turn ends.
     awaitingAnswer = false;
-    recorder.agentStart();
+    recorder.agentStart(telemetryFromContext(ctx));
   });
 
   pi.on("agent_end", (event, ctx) => {
@@ -348,8 +375,8 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("turn_start", (event) => {
-    recorder.turnStart((event as any).turnIndex);
+  pi.on("turn_start", (event, ctx) => {
+    recorder.turnStart((event as any).turnIndex, telemetryFromContext(ctx));
   });
 
   pi.on("turn_end", (event, ctx) => {
@@ -359,8 +386,8 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
-  pi.on("before_provider_request", () => {
-    recorder.beforeProviderRequest();
+  pi.on("before_provider_request", (_event, ctx) => {
+    recorder.beforeProviderRequest(telemetryFromContext(ctx));
   });
 
   pi.on("after_provider_response", (_event, ctx) => {

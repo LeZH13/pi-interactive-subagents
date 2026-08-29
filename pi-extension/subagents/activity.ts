@@ -63,15 +63,15 @@ export type ActivityReadResult =
 export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
 
 export interface SubagentActivityRecorder {
-  sessionStart(): void;
+  sessionStart(telemetry?: SubagentTelemetry): void;
   input(): void;
-  beforeAgentStart(): void;
-  agentStart(): void;
+  beforeAgentStart(telemetry?: SubagentTelemetry): void;
+  agentStart(telemetry?: SubagentTelemetry): void;
   agentEndWaiting(telemetry?: SubagentTelemetry): void;
   agentEndDone(telemetry?: SubagentTelemetry): void;
-  turnStart(turnIndex?: number): void;
+  turnStart(turnIndex?: number, telemetry?: SubagentTelemetry): void;
   turnEnd(turnIndex?: number, telemetry?: SubagentTelemetry): void;
-  beforeProviderRequest(): void;
+  beforeProviderRequest(telemetry?: SubagentTelemetry): void;
   afterProviderResponse(telemetry?: SubagentTelemetry): void;
   messageUpdate(messageEventType?: string, telemetry?: SubagentTelemetry): void;
   toolExecutionStart(toolCallId?: string, toolName?: string): void;
@@ -368,10 +368,12 @@ export function createSubagentActivityRecorder(params: {
       "outputTokens",
       "cacheReadTokens",
       "cacheWriteTokens",
-      "contextTokens",
     ] as const) {
       const value = telemetry[field];
       if (Number.isInteger(value) && (value as number) >= 0) normalized[field] = value;
+    }
+    if (Number.isInteger(telemetry.contextTokens) && (telemetry.contextTokens as number) > 0) {
+      normalized.contextTokens = telemetry.contextTokens;
     }
     if (Number.isFinite(telemetry.cost) && (telemetry.cost as number) >= 0) normalized.cost = telemetry.cost;
     return normalized;
@@ -391,7 +393,7 @@ export function createSubagentActivityRecorder(params: {
     const telemetry = normalizedTelemetry(rawTelemetry);
     if (!telemetry) return;
     if (telemetry.model != null) current.model = telemetry.model;
-    if (telemetry.contextTokens != null) current.contextTokens = telemetry.contextTokens;
+    if (telemetry.contextTokens != null && telemetry.contextTokens > 0) current.contextTokens = telemetry.contextTokens;
     if (!includeTurnUsage || !hasTurnUsage(telemetry)) return;
 
     currentTurnUsage ??= {
@@ -513,9 +515,10 @@ export function createSubagentActivityRecorder(params: {
   }
 
   return {
-    sessionStart() {
+    sessionStart(telemetry) {
       record("session_start", (current) => {
         current.phase = "starting";
+        applyTelemetry(current, telemetry);
         clearActiveState(current);
         delete current.waitingSince;
       }, "immediate");
@@ -523,16 +526,18 @@ export function createSubagentActivityRecorder(params: {
     input() {
       record("input", () => {}, "immediate");
     },
-    beforeAgentStart() {
+    beforeAgentStart(telemetry) {
       record("before_agent_start", (current, observedAt) => {
         current.agentActive = true;
+        applyTelemetry(current, telemetry);
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentStart() {
+    agentStart(telemetry) {
       record("agent_start", (current, observedAt) => {
         current.agentActive = true;
         telemetryTurnOpen = true;
+        applyTelemetry(current, telemetry);
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
@@ -553,11 +558,12 @@ export function createSubagentActivityRecorder(params: {
       }, "immediate");
       disable();
     },
-    turnStart(turnIndex) {
+    turnStart(turnIndex, telemetry) {
       record("turn_start", (current, observedAt) => {
         current.agentActive = true;
         current.turnActive = true;
         beginTelemetryTurn(current);
+        applyTelemetry(current, telemetry);
         if (turnIndex != null) current.turnIndex = turnIndex;
         markActive(current, current.toolActive || current.providerActive ? current.activeScope ?? "turn" : "turn", observedAt);
       }, "immediate");
@@ -572,9 +578,10 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
-    beforeProviderRequest() {
+    beforeProviderRequest(telemetry) {
       record("before_provider_request", (current, observedAt) => {
         current.providerActive = true;
+        applyTelemetry(current, telemetry);
         markActive(current, "provider", observedAt, true);
       }, "immediate");
     },

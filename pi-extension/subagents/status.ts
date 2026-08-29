@@ -211,6 +211,7 @@ export function formatElapsedDuration(ms: number): string {
 export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
+  model?: string;
 }): SubagentStatusState {
   const initialKind = params.source === "claude" ? "running" : "starting";
   return {
@@ -228,6 +229,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
+    model: params.model,
     snapshotState: params.source === "claude" ? "unseen" : "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -289,13 +291,15 @@ export function observeStatus(
     phase,
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
-    model: observation.model,
-    inputTokens: observation.inputTokens,
-    outputTokens: observation.outputTokens,
-    cacheReadTokens: observation.cacheReadTokens,
-    cacheWriteTokens: observation.cacheWriteTokens,
-    contextTokens: observation.contextTokens,
-    cost: observation.cost,
+    model: observation.model ?? state.model,
+    inputTokens: observation.inputTokens ?? state.inputTokens,
+    outputTokens: observation.outputTokens ?? state.outputTokens,
+    cacheReadTokens: observation.cacheReadTokens ?? state.cacheReadTokens,
+    cacheWriteTokens: observation.cacheWriteTokens ?? state.cacheWriteTokens,
+    contextTokens: (observation.contextTokens != null && observation.contextTokens > 0)
+      ? observation.contextTokens
+      : state.contextTokens,
+    cost: observation.cost ?? state.cost,
     snapshotState: "present",
     snapshotProblemSinceMs: null,
     snapshotError: null,

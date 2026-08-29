@@ -67,6 +67,7 @@ import {
   runningChildrenCount,
   telemetryFromContext,
   telemetryFromMessage,
+  mergeTelemetry,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
@@ -1053,6 +1054,35 @@ describe("status.ts", () => {
     assert.equal(snapshot.cost, 0.042);
   });
 
+  it("preserves model and contextTokens when later observations omit them", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0, model: "gpt-5.6-sol" });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "provider",
+      model: "gpt-5.6-sol",
+      contextTokens: 50_000,
+    }, 10_000);
+
+    // Later observation with no contextTokens / zero contextTokens preserves previous contextTokens & model
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 11_000,
+      sequence: 2,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      latestEvent: "message_update",
+    }, 11_000);
+
+    const snapshot = classifyStatus(state, 11_000);
+    assert.equal(snapshot.model, "gpt-5.6-sol");
+    assert.equal(snapshot.contextTokens, 50_000);
+  });
+
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
@@ -1939,6 +1969,45 @@ describe("subagent-done.ts", () => {
       });
     });
 
+    it("ignores empty zero-usage during streaming and avoids setting contextTokens to 0", () => {
+      const streamingAssistant = {
+        role: "assistant",
+        model: "gpt-5.6-sol",
+        content: [{ type: "text", text: "streaming partial text" }],
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { total: 0 },
+        },
+      };
+      assert.deepEqual(telemetryFromMessage(streamingAssistant), {
+        model: "gpt-5.6-sol",
+      });
+    });
+
+    it("mergeTelemetry preserves contextTokens from context during in-flight streaming updates", () => {
+      const contextTel = { model: "gpt-5.6-sol", contextTokens: 25_000 };
+      const streamingMessageTel = { model: "gpt-5.6-sol" };
+      assert.deepEqual(mergeTelemetry(contextTel, streamingMessageTel), {
+        model: "gpt-5.6-sol",
+        contextTokens: 25_000,
+      });
+    });
+
+    it("mergeTelemetry updates contextTokens when message telemetry has valid totalTokens", () => {
+      const contextTel = { model: "gpt-5.6-sol", contextTokens: 25_000 };
+      const completedMessageTel = { model: "gpt-5.6-sol", contextTokens: 28_000, inputTokens: 20_000, outputTokens: 8_000 };
+      assert.deepEqual(mergeTelemetry(contextTel, completedMessageTel), {
+        model: "gpt-5.6-sol",
+        contextTokens: 28_000,
+        inputTokens: 20_000,
+        outputTokens: 8_000,
+      });
+    });
+
     it("wires lifecycle event telemetry into the activity IPC snapshot", () => {
       withTempDir((dir) => {
         const activityFile = getSubagentActivityFile(dir, "event-child");
@@ -1998,6 +2067,80 @@ describe("subagent-done.ts", () => {
           assert.equal(read.activity.outputTokens, 1_000);
           assert.equal(read.activity.contextTokens, 10_000);
           assert.equal(read.activity.cost, 0.025);
+        } finally {
+          restoreEnvVar("PI_SUBAGENT_ID", saved.id);
+          restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", saved.activityFile);
+          restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        }
+      });
+    });
+
+    it("preserves contextTokens consistently during active streaming status", async () => {
+      await withTempDir(async (dir) => {
+        const activityFile = getSubagentActivityFile(dir, "streaming-child");
+        const saved = {
+          id: process.env.PI_SUBAGENT_ID,
+          activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+          autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        };
+        process.env.PI_SUBAGENT_ID = "streaming-child";
+        process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+        process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+
+        const handlers = new Map<string, Array<(...args: any[]) => void>>();
+        const api = {
+          on(event: string, handler: (...args: any[]) => void) {
+            if (!handlers.has(event)) handlers.set(event, []);
+            handlers.get(event)!.push(handler);
+          },
+          registerTool() {}, registerShortcut() {}, getAllTools() { return []; },
+        } as any;
+        const ctx = {
+          model: { id: "gpt-5.6-sol" },
+          getContextUsage: () => ({ tokens: 15_000, contextWindow: 200_000, percent: 7.5 }),
+          ui: { setWidget() {} },
+          shutdown() {},
+        } as any;
+        const emit = (event: string, payload: any = {}) =>
+          (handlers.get(event) ?? []).forEach((handler) => handler(payload, ctx));
+
+        // In-progress streaming assistant message with empty/zero usage
+        const streamingAssistant = {
+          role: "assistant",
+          model: "gpt-5.6-sol",
+          content: [{ type: "text", text: "streaming..." }],
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { total: 0 },
+          },
+        };
+
+        try {
+          subagentDoneExtension(api);
+          emit("session_start");
+          emit("agent_start");
+          emit("turn_start", { turnIndex: 0 });
+          emit("before_provider_request");
+          emit("after_provider_response", { status: 200, headers: {} });
+
+          // Mid-stream token update with empty usage
+          emit("message_update", { message: streamingAssistant, assistantMessageEvent: { type: "text_delta", delta: "streaming..." } });
+
+          // Wait for throttled write to flush to disk
+          await new Promise((resolve) => setTimeout(resolve, 550));
+
+          // Directly check the recorder's activity state on disk
+          const read = readSubagentActivityFile(activityFile, "streaming-child");
+          assert.ok(read.ok);
+          assert.equal(read.activity.phase, "active");
+          assert.equal(read.activity.activeScope, "streaming");
+          assert.equal(read.activity.model, "gpt-5.6-sol");
+          // Context tokens must remain 15,000, not wiped to 0 or undefined
+          assert.equal(read.activity.contextTokens, 15_000);
         } finally {
           restoreEnvVar("PI_SUBAGENT_ID", saved.id);
           restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", saved.activityFile);

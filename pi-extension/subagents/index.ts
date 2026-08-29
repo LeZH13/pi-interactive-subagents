@@ -1620,6 +1620,7 @@ async function launchSubagent(
     statusState: createStatusState({
       source: "pi",
       startTimeMs: startTime,
+      model: effectiveModel,
     }),
   };
 
@@ -2432,6 +2433,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
+            model: loadout.model,
           }),
         };
         runningSubagents.set(id, running);
