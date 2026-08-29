@@ -31,6 +31,7 @@ import {
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
+  getSubagentSessionDir,
   readNameRegistry,
   readSubagentLoadout,
   registerName,
@@ -38,6 +39,8 @@ import {
   seedSubagentSessionFile,
   summarizeSessionStats,
   writeSubagentLoadout,
+  writeArtifactOwnershipMarker,
+  cleanOrphanArtifactDirs,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
@@ -363,7 +366,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
+): { effectiveCwd: string | null; localAgentDir: string | null } {
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
@@ -373,18 +376,7 @@ function resolveSubagentPaths(
       : join(cwdBase, rawCwd)
     : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
-  const effectiveAgentDir =
-    localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
-  return { effectiveCwd, localAgentDir, effectiveAgentDir };
-}
-
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
-  const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-  const sessionDir = join(agentDir, "sessions", safePath);
-  if (!existsSync(sessionDir)) {
-    mkdirSync(sessionDir, { recursive: true });
-  }
-  return sessionDir;
+  return { effectiveCwd, localAgentDir };
 }
 
 function resolveEffectiveSessionMode(
@@ -1215,13 +1207,16 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
-  const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
-  // Generate a deterministic session file path for this subagent.
-  // This eliminates race conditions when multiple agents launch simultaneously —
-  // each agent knows exactly which file is theirs.
+  // Generate a deterministic session file path for this subagent scoped inside
+  // the parent session's artifact directory (artifacts/<parentSessionId>/subagents/).
+  // This scopes the subagent session to its parent and keeps ~/.pi/agent/sessions/--<cwd>--/ clean of child clusters.
+  writeArtifactOwnershipMarker(artifactDir, sessionId);
+  const subagentSessionDir = getSubagentSessionDir(artifactDir);
+  mkdirSync(subagentSessionDir, { recursive: true });
+
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
   const uuid = [
     id,
@@ -1229,7 +1224,7 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 10),
     Math.random().toString(16).slice(2, 6),
   ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const subagentSessionFile = join(subagentSessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
@@ -1683,6 +1678,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+
   });
 
   // Clean up on session shutdown
@@ -1858,6 +1854,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+
+            // Update registry with resolved sessionId if it was previously null
+            if (result.sessionId) {
+              registerName(parentArtifactDir, running.name, {
+                sessionFile: running.sessionFile,
+                sessionId: result.sessionId,
+              });
+            }
 
             const presentation = resolveResultPresentation(result, running.name);
 
@@ -2377,6 +2381,117 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagents command — inspect subagents and manually clean orphaned artifacts
+  pi.registerCommand("subagents", {
+    description: "Manage subagent sessions: /subagents [status|cleanup-orphans|help] [--apply]",
+    getArgumentCompletions: (prefix: string) => {
+      const subcommands = ["status", "list", "cleanup-orphans", "help"];
+      const trimmed = prefix.trim();
+      if (!trimmed) return subcommands.map((s) => ({ value: s, label: s }));
+      if (trimmed.startsWith("cleanup-orphans")) {
+        return ["cleanup-orphans", "cleanup-orphans --apply"]
+          .filter((c) => c.startsWith(trimmed))
+          .map((c) => ({ value: c, label: c }));
+      }
+      return subcommands
+        .filter((s) => s.startsWith(trimmed))
+        .map((s) => ({ value: s, label: s }));
+    },
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const subcmd = parts[0]?.toLowerCase() || "status";
+      const flag = parts[1]?.toLowerCase();
+      const isApply = flag === "--apply";
+
+      const sessionDir = ctx.sessionManager.getSessionDir();
+      const sessionId = ctx.sessionManager.getSessionId();
+      const artifactDir = getArtifactDir(sessionDir, sessionId);
+
+      if (subcmd === "status" || subcmd === "list") {
+        const runningList = Array.from(runningSubagents.values());
+        const registry = readNameRegistry(artifactDir);
+        const regEntries = Object.entries(registry);
+
+        const lines: string[] = [];
+        lines.push(`Subagents Status:`);
+        lines.push(`• Active running: ${runningList.length}`);
+        for (const r of runningList) {
+          lines.push(`  - ${r.name} (${r.agent ?? "agent"}) [${r.id}] — surface: ${r.surface}`);
+        }
+        lines.push(`• Registered in session (${sessionId}): ${regEntries.length}`);
+        for (const [name, entry] of regEntries) {
+          const exists = existsSync(entry.sessionFile) ? "persisted" : "missing";
+          lines.push(`  - ${name}: ${entry.sessionId ?? "n/a"} (${exists})`);
+        }
+
+        if (ctx.hasUI) {
+          ctx.ui.notify(lines.join("\n"), "info");
+        }
+        return;
+      }
+
+      if (subcmd === "cleanup-orphans") {
+        const runningSessionFiles = Array.from(runningSubagents.values()).map((r) => r.sessionFile);
+        const preview = cleanOrphanArtifactDirs(sessionDir, {
+          dryRun: true,
+          currentSessionId: sessionId,
+          runningSessionFiles,
+          minAgeMs: 0,
+        });
+
+        if (isApply) {
+          if (preview.candidates.length === 0) {
+            if (ctx.hasUI) ctx.ui.notify("Orphan cleanup: No orphan artifact directories found.", "info");
+            return;
+          }
+
+          if (ctx.hasUI) {
+            const totalFiles = preview.candidates.reduce((sum, c) => sum + c.fileCount, 0);
+            const totalKb = Math.round(preview.candidates.reduce((sum, c) => sum + c.sizeBytes, 0) / 1024);
+            const ok = await ctx.ui.confirm(
+              "Confirm Orphan Cleanup",
+              `Permanently clean recognized extension artifacts for ${preview.candidates.length} orphan session(s) (${totalFiles} stored files, ${totalKb} KB total)? Ensure no child from a deleted parent is still running in another Pi process.`,
+            );
+            if (!ok) {
+              ctx.ui.notify("Orphan cleanup cancelled.", "info");
+              return;
+            }
+          }
+
+          const result = cleanOrphanArtifactDirs(sessionDir, {
+            dryRun: false,
+            currentSessionId: sessionId,
+            runningSessionFiles,
+            minAgeMs: 0,
+          });
+
+          const msg = result.cleanedFilesCount > 0
+            ? `Orphan cleanup: Cleaned ${result.cleanedFilesCount} files across ${result.cleanedDirs.length + result.preservedForeignDirs.length} orphan session(s).`
+            : `Orphan cleanup: No orphan artifact files cleaned.`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        } else {
+          const candidateLines = preview.candidates.map(
+            (c) => `• ${basename(c.dir)} (${c.fileCount} files, ${Math.round(c.sizeBytes / 1024)} KB)`,
+          );
+          const msg = preview.candidates.length > 0
+            ? `Orphan cleanup preview (${preview.candidates.length} candidate(s)):\n${candidateLines.join("\n")}\nRun '/subagents cleanup-orphans --apply' to remove.`
+            : `Orphan cleanup preview: No orphan artifact directories found.`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        }
+        return;
+      }
+
+      // Help
+      const help = [
+        `Subagents Management (/subagents):`,
+        `  /subagents status       - Show active and registered subagents`,
+        `  /subagents cleanup-orphans           - Preview orphaned subagent artifacts`,
+        `  /subagents cleanup-orphans --apply   - Remove marked orphan artifacts`,
+      ].join("\n");
+      if (ctx.hasUI) ctx.ui.notify(help, "info");
     },
   });
 

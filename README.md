@@ -34,7 +34,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly.
+There is also a `/subagent <agent> <task>` command for spawning directly, and `/subagents` for session inspection and explicit orphan cleanup.
 
 ### Spawning
 
@@ -174,6 +174,50 @@ Status display is configured via `config.json` in the extension directory (copy 
   "status": { "enabled": true }
 }
 ```
+
+## Session Storage & Management
+
+### Parent-Scoped Storage
+
+Sub-agent session transcripts (`.jsonl`) and their sandbox loadout sidecars (`.loadout.json`) are stored within the parent session's artifact directory:
+
+```
+~/.pi/agent/sessions/--<project>--/
+├── 2026-08-28T10-00-00-000Z_parentSessionId.jsonl       ← Interactive parent sessions only
+└── artifacts/
+    └── <parentSessionId>/
+        ├── subagents/
+        │   ├── 2026-08-28T10-09-42-000Z_uuid1.jsonl     ← Child subagent sessions
+        │   └── 2026-08-28T10-09-42-000Z_uuid1.jsonl.loadout.json
+        ├── subagent-registry.json
+        ├── subagent-activity/
+        └── subagent-scripts/
+```
+
+- **Clean Session Picker**: `pi -r` and `/resume` only list human/interactive conversations — sub-agent runs never clutter the picker.
+- **Full Resumability**: Resuming via `subagent_message({ name, message })` resolves the scoped session path seamlessly from the parent's `subagent-registry.json`.
+- **Nested Hierarchies**: When a worker subagent spawns child scouts or researchers, the children are nested in `artifacts/<parentSessionId>/subagents/artifacts/<workerSessionId>/subagents/`.
+- **Explicit Retention**: Completed child sessions remain alongside the parent and are retained even after parent deletion until orphan cleanup is explicitly applied.
+- **Existing History Unchanged**: Legacy top-level child sessions are not moved automatically; clean them up manually if desired.
+
+### Explicit Orphan Cleanup
+
+Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the `/subagents cleanup-orphans` command when you want to inspect and remove them.
+
+- **Marker-Only Ownership**: Cleanup considers only directories with a valid extension ownership marker matching the parent session ID. Familiar filenames alone are not treated as proof of ownership.
+- **Preview First**: Cleanup defaults to a read-only, directory-level summary. It reports candidate directories, total stored file counts, and approximate sizes; it does not enumerate every file that will be removed.
+- **Explicit Apply**: Deletion requires both `--apply` and interactive confirmation. Before confirming, ensure no child process from the deleted parent is still running in another Pi process; cross-process liveness is not inferred from session files.
+- **Foreign Data Preservation**: Only recognized extension files are removed; unrelated files in the same artifact directory are preserved.
+
+### Management Command (`/subagents`)
+
+The `/subagents` command provides interactive session inspection and cleanup:
+
+| Command | Description |
+| --- | --- |
+| `/subagents status` (or `/subagents list`) | Show active running subagents and registered subagent sessions for this session |
+| `/subagents cleanup-orphans` | Preview marked artifact directories whose parent sessions were deleted |
+| `/subagents cleanup-orphans --apply` | Clean marked orphan artifacts after confirmation |
 
 ## Requirements
 

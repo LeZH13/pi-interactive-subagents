@@ -31,6 +31,14 @@ import {
   mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  getSubagentSessionDir,
+  isExtensionOwnedArtifactDir,
+  isParentSessionConclusivelyAbsent,
+  findOrphanArtifactDirs,
+  cleanOrphanArtifactDirs,
+  writeArtifactOwnershipMarker,
+  hasArtifactOwnershipMarker,
+  isExtensionContextFile,
 } from "../pi-extension/subagents/session.ts";
 
 import { layoutForDimensions, shellEscape } from "../pi-extension/subagents/tmux.ts";
@@ -74,12 +82,19 @@ function createSessionFile(dir: string, entries: object[]): string {
   return file;
 }
 
-function withTempDir(run: (dir: string) => void) {
+function withTempDir(run: (dir: string) => void | Promise<void>): void | Promise<void> {
   const dir = createTestDir();
   try {
-    run(dir);
-  } finally {
+    const res = run(dir);
+    if (res && typeof (res as any).then === "function") {
+      return (res as Promise<void>).finally(() => {
+        rmSync(dir, { recursive: true, force: true });
+      });
+    }
     rmSync(dir, { recursive: true, force: true });
+  } catch (err) {
+    rmSync(dir, { recursive: true, force: true });
+    throw err;
   }
 }
 
@@ -683,6 +698,202 @@ describe("session.ts", () => {
       assert.equal(summarizeSessionStats(join(dir, "does-not-exist.jsonl")), null);
     });
   });
+
+  describe("getSubagentSessionDir", () => {
+    it("scopes subagents directory inside parent artifact directory", () => {
+      const artDir = "/sessions/artifacts/parent-123";
+      assert.equal(getSubagentSessionDir(artDir), "/sessions/artifacts/parent-123/subagents");
+    });
+  });
+
+  describe("isExtensionOwnedArtifactDir", () => {
+    it("returns true for directory containing valid extension markers and folders", () => {
+      withTempDir((tDir) => {
+        const art = join(tDir, "art-owned");
+        mkdirSync(join(art, "subagents"), { recursive: true });
+        mkdirSync(join(art, "subagent-activity"), { recursive: true });
+        mkdirSync(join(art, "subagent-scripts"), { recursive: true });
+        mkdirSync(join(art, "context"), { recursive: true });
+        mkdirSync(join(art, "subagent-resume"), { recursive: true });
+        writeFileSync(join(art, "subagent-registry.json"), "{}");
+        writeArtifactOwnershipMarker(art, "parent-123");
+
+        assert.equal(isExtensionOwnedArtifactDir(art), true);
+        assert.equal(hasArtifactOwnershipMarker(art), true);
+      });
+    });
+
+    it("returns false for empty directory or directories with only arbitrary dotfiles", () => {
+      withTempDir((tDir) => {
+        const art = join(tDir, "art-empty");
+        mkdirSync(art, { recursive: true });
+        assert.equal(isExtensionOwnedArtifactDir(art), false);
+
+        writeFileSync(join(art, ".some-dotfile"), "secret");
+        assert.equal(isExtensionOwnedArtifactDir(art), false);
+      });
+    });
+
+    it("returns false for non-existent directory", () => {
+      assert.equal(isExtensionOwnedArtifactDir("/non-existent/dir"), false);
+    });
+  });
+
+  describe("isExtensionContextFile", () => {
+    it("recognizes extension task files and sysprompt files", () => {
+      assert.equal(isExtensionContextFile("subagent-2026-08-28T10-09-42.md"), true);
+      assert.equal(isExtensionContextFile("worker-sysprompt-2026-08-28T10-09-42.md"), true);
+      assert.equal(isExtensionContextFile("scout-sysprompt-2026-08-28T10-09-42-123.md"), true);
+    });
+
+    it("rejects non-extension and user files", () => {
+      assert.equal(isExtensionContextFile("user-notes.txt"), false);
+      assert.equal(isExtensionContextFile("custom-prompt.md"), false);
+      assert.equal(isExtensionContextFile("notes-2026.md"), false);
+      assert.equal(isExtensionContextFile("subagent-2026-08-28T10-09-42.md.bak"), false);
+      assert.equal(isExtensionContextFile("subagent-2026-08-28T10-09-42-extra-text.md"), false);
+      assert.equal(isExtensionContextFile("subagent-2026-08-28T10-09-42_random.md"), false);
+    });
+  });
+
+  describe("isParentSessionConclusivelyAbsent", () => {
+    it("returns false when parent session file exists by header or filename in sessionDir", () => {
+      withTempDir((tDir) => {
+        const parentId = "019f-parent-test";
+        createSessionFile(tDir, [{ type: "session", version: 3, id: parentId, cwd: tDir }]);
+        assert.equal(isParentSessionConclusivelyAbsent(parentId, tDir), false);
+      });
+    });
+
+    it("returns false when activeSessionIds contains the sessionId", () => {
+      withTempDir((tDir) => {
+        const parentId = "019f-active";
+        assert.equal(
+          isParentSessionConclusivelyAbsent(parentId, tDir, { activeSessionIds: new Set([parentId]) }),
+          false,
+        );
+      });
+    });
+
+    it("returns false when a running subagent sessionFile references the artifact path", () => {
+      withTempDir((tDir) => {
+        const parentId = "019f-running-parent";
+        assert.equal(
+          isParentSessionConclusivelyAbsent(parentId, tDir, {
+            runningSessionFiles: [`/some/path/artifacts/${parentId}/subagents/child.jsonl`],
+          }),
+          false,
+        );
+      });
+    });
+
+    it("returns true when parent session file is completely absent from sessionDir", () => {
+      withTempDir((tDir) => {
+        const parentId = "019f-deleted-parent";
+        // Create an unrelated session
+        createSessionFile(tDir, [{ type: "session", version: 3, id: "unrelated-id", cwd: tDir }]);
+        assert.equal(isParentSessionConclusivelyAbsent(parentId, tDir), true);
+      });
+    });
+  });
+
+  describe("findOrphanArtifactDirs / cleanOrphanArtifactDirs", () => {
+    it("detects orphan artifact directories when parent is absent and ignores active/recent ones", () => {
+      withTempDir((tDir) => {
+        const parentAliveId = "parent-alive";
+        const parentDeadId = "parent-dead";
+
+        // Alive parent session
+        createSessionFile(tDir, [{ type: "session", version: 3, id: parentAliveId, cwd: tDir }]);
+
+        // Artifact dir for alive parent
+        const artAlive = join(tDir, "artifacts", parentAliveId);
+        mkdirSync(join(artAlive, "subagents"), { recursive: true });
+        writeFileSync(join(artAlive, "subagent-registry.json"), "{}");
+        writeArtifactOwnershipMarker(artAlive, parentAliveId);
+
+        // Artifact dir for dead parent
+        const artDead = join(tDir, "artifacts", parentDeadId);
+        mkdirSync(join(artDead, "subagents"), { recursive: true });
+        writeFileSync(join(artDead, "subagent-registry.json"), "{}");
+        writeArtifactOwnershipMarker(artDead, parentDeadId);
+
+        const orphans = findOrphanArtifactDirs(tDir, { minAgeMs: 0 });
+        assert.equal(orphans.length, 1);
+        assert.equal(orphans[0].sessionId, parentDeadId);
+
+        // Dry-run clean
+        const dryResult = cleanOrphanArtifactDirs(tDir, { dryRun: true, minAgeMs: 0 });
+        assert.equal(dryResult.orphanCount, 1);
+        assert.equal(dryResult.cleanedDirs.length, 0);
+        assert.ok(existsSync(artDead));
+
+        // Applied clean
+        const applyResult = cleanOrphanArtifactDirs(tDir, { dryRun: false, minAgeMs: 0 });
+        assert.equal(applyResult.orphanCount, 1);
+        assert.equal(applyResult.cleanedDirs.length, 1);
+        assert.equal(existsSync(artDead), false);
+        assert.equal(existsSync(artAlive), true);
+      });
+    });
+
+    it("preserves foreign files and hidden custom content in orphan artifact directories", () => {
+      withTempDir((tDir) => {
+        const parentDeadId = "parent-with-foreign-data";
+        const artDead = join(tDir, "artifacts", parentDeadId);
+
+        // Extension files
+        mkdirSync(join(artDead, "subagents"), { recursive: true });
+        writeFileSync(join(artDead, "subagents", "child.jsonl"), '{"type":"session"}\n');
+        writeFileSync(join(artDead, "subagents", "child.jsonl.loadout.json"), '{}');
+        mkdirSync(join(artDead, "context"), { recursive: true });
+        writeFileSync(join(artDead, "context", "worker-2026-08-28T10-09-42.md"), "Task");
+        writeFileSync(join(artDead, "subagent-registry.json"), "{}");
+        writeArtifactOwnershipMarker(artDead, parentDeadId);
+
+        // Foreign files (user notes in context, custom file in root, foreign hidden file)
+        writeFileSync(join(artDead, "context", "user-notes.txt"), "Important user notes!");
+        writeFileSync(join(artDead, "custom-report.csv"), "col1,col2");
+        writeFileSync(join(artDead, ".custom-hidden-config"), "key=val");
+
+        // Execute cleaning
+        const result = cleanOrphanArtifactDirs(tDir, { minAgeMs: 0 });
+        assert.equal(result.orphanCount, 1);
+        assert.equal(result.cleanedFilesCount >= 4, true); // extension files cleaned
+
+        // The artifact directory itself must NOT be deleted because foreign content remains
+        assert.ok(existsSync(artDead));
+        assert.ok(existsSync(join(artDead, "context", "user-notes.txt")));
+        assert.ok(existsSync(join(artDead, "custom-report.csv")));
+        assert.ok(existsSync(join(artDead, ".custom-hidden-config")));
+
+        // But extension files inside it were deleted
+        assert.equal(existsSync(join(artDead, "subagents", "child.jsonl")), false);
+        assert.equal(existsSync(join(artDead, "context", "worker-2026-08-28T10-09-42.md")), false);
+        assert.equal(existsSync(join(artDead, "subagent-registry.json")), false);
+      });
+    });
+
+    it("skips unmarked, mismatched, and non-extension artifact directories", () => {
+      withTempDir((tDir) => {
+        const unmarked = join(tDir, "artifacts", "parent-unmarked");
+        mkdirSync(join(unmarked, "subagents"), { recursive: true });
+        writeFileSync(join(unmarked, "subagents", "child.jsonl"), "{}\n");
+        writeFileSync(join(unmarked, "subagent-registry.json"), "{}");
+
+        const mismatched = join(tDir, "artifacts", "parent-mismatched");
+        writeArtifactOwnershipMarker(mismatched, "some-other-parent");
+
+        const foreign = join(tDir, "artifacts", "parent-foreign");
+        mkdirSync(foreign, { recursive: true });
+        writeFileSync(join(foreign, "custom-unrecognized.dat"), "123");
+
+        const orphans = findOrphanArtifactDirs(tDir, { minAgeMs: 0 });
+        assert.equal(orphans.length, 0);
+      });
+    });
+  });
+
 });
 
 describe("status.ts", () => {
@@ -1866,6 +2077,82 @@ describe("commands", () => {
     (subagentsModule as any).default(api);
     assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+  });
+
+  it("/subagents provides status and explicit orphan cleanup", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagentsCmd = registeredCommands.find((c) => c.name === "subagents");
+    assert.ok(subagentsCmd, "expected /subagents to be registered");
+
+    // Check argument completions
+    const completionsAll = subagentsCmd.getArgumentCompletions("");
+    assert.ok(completionsAll.some((c: any) => c.value === "status"));
+    assert.ok(completionsAll.some((c: any) => c.value === "cleanup-orphans"));
+    assert.equal(completionsAll.some((c: any) => c.value === "gc"), false);
+
+    const cleanupCompletions = subagentsCmd.getArgumentCompletions("cleanup-orphans");
+    assert.ok(cleanupCompletions.some((c: any) => c.value === "cleanup-orphans --apply"));
+
+    // Test handler execution with mock UI context
+    await withTempDir(async (tDir) => {
+      const parentId = "test-parent-session";
+      const parentFile = join(tDir, `${parentId}.jsonl`);
+      writeFileSync(parentFile, JSON.stringify({ type: "session", version: 3, id: parentId, cwd: tDir }) + "\n");
+      const notifications: string[] = [];
+      const mockCtx = {
+        hasUI: true,
+        sessionManager: {
+          getSessionDir: () => tDir,
+          getSessionId: () => parentId,
+          getSessionFile: () => parentFile,
+        },
+        ui: {
+          notify: (msg: string) => notifications.push(msg),
+        },
+      };
+
+      // 1. Status command
+      subagentsCmd.handler("status", mockCtx);
+      assert.ok(notifications.some((n) => n.includes("Subagents Status")));
+
+      // 2. Cleanup preview (dry-run)
+      notifications.length = 0;
+      await subagentsCmd.handler("cleanup-orphans", mockCtx);
+      assert.ok(notifications.some((n) => n.includes("Orphan cleanup preview")));
+
+      // 3. Cleanup apply with rejection (confirm: false)
+      const orphanArt = join(tDir, "artifacts", "orphan-1");
+      mkdirSync(join(orphanArt, "subagents"), { recursive: true });
+      writeFileSync(join(orphanArt, "subagent-registry.json"), "{}");
+      writeArtifactOwnershipMarker(orphanArt, "orphan-1");
+
+      notifications.length = 0;
+      const rejectMockCtx = {
+        ...mockCtx,
+        ui: {
+          notify: (msg: string) => notifications.push(msg),
+          confirm: async () => false,
+        },
+      };
+      await subagentsCmd.handler("cleanup-orphans --apply", rejectMockCtx);
+      assert.ok(notifications.some((n) => n.includes("cancelled")));
+      assert.ok(existsSync(orphanArt)); // preserved
+
+      // 4. Cleanup apply with acceptance (confirm: true)
+      notifications.length = 0;
+      const acceptMockCtx = {
+        ...mockCtx,
+        ui: {
+          notify: (msg: string) => notifications.push(msg),
+          confirm: async () => true,
+        },
+      };
+      await subagentsCmd.handler("cleanup-orphans --apply", acceptMockCtx);
+      assert.ok(notifications.some((n) => n.includes("Orphan cleanup")));
+      assert.equal(existsSync(orphanArt), false); // cleaned
+    });
   });
 });
 
