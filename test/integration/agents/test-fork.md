@@ -1,7 +1,7 @@
 ---
 name: test-fork
 description: Integration test agent — runs with inherited parent context
-model: anthropic/claude-haiku-4-5
+model: openrouter/meta-llama/llama-3.3-70b-instruct:free
 tools: read, bash, write, edit
 session-mode: fork
 spawning: false

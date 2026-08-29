@@ -1,7 +1,7 @@
 ---
 name: test-question
 description: Integration test agent — asks its parent a question and continues after the reply
-model: anthropic/claude-haiku-4-5
+model: openrouter/meta-llama/llama-3.3-70b-instruct:free
 tools: read, bash, write, edit
 spawning: false
 auto-exit: true
