@@ -373,6 +373,15 @@ describe("session.ts", () => {
       assert.deepEqual(readSubagentLoadout(sf), sample);
     });
 
+    it("serializes every resolved thinking override without changing it", () => {
+      for (const thinking of ["off", "xhigh", "max", "32768"]) {
+        const sf = join(dir, `thinking-${thinking}.jsonl`);
+        const loadout = { ...sample, thinking };
+        writeSubagentLoadout(sf, loadout);
+        assert.deepEqual(readSubagentLoadout(sf), loadout);
+      }
+    });
+
     it("returns null when the sidecar is absent", () => {
       assert.equal(readSubagentLoadout(join(dir, "missing.jsonl")), null);
     });
@@ -1571,6 +1580,67 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("resolves an explicit thinking parameter over the agent default", () => {
+    assert.deepEqual(
+      testApi.resolveEffectiveModelAndThinking(
+        { agent: "worker", task: "T", thinking: "high" },
+        { model: "provider/model", thinking: "low" },
+      ),
+      { model: "provider/model", thinking: "high" },
+    );
+  });
+
+  it("normalizes explicit off/none overrides and does not fall back to the agent default", () => {
+    for (const thinking of ["off", "none"]) {
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T", thinking },
+          { model: "provider/model", thinking: "high" },
+        ),
+        { model: "provider/model", thinking: "off" },
+      );
+    }
+  });
+
+  it("preserves extended thinking levels and numeric token budgets", () => {
+    for (const thinking of ["xhigh", "max", "32768"]) {
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T", thinking },
+          { model: "provider/model", thinking: "medium" },
+        ),
+        { model: "provider/model", thinking },
+      );
+    }
+  });
+
+  it("separates an inline model thinking suffix and lets an explicit parameter override it", () => {
+    assert.deepEqual(
+      testApi.resolveEffectiveModelAndThinking(
+        { agent: "worker", task: "T", model: "provider/model:low" },
+        { thinking: "high" },
+      ),
+      { model: "provider/model", thinking: "low" },
+    );
+    assert.deepEqual(
+      testApi.resolveEffectiveModelAndThinking(
+        { agent: "worker", task: "T", model: "provider/model:low", thinking: "max" },
+        { thinking: "high" },
+      ),
+      { model: "provider/model", thinking: "max" },
+    );
+  });
+
+  it("preserves a colon that is part of a model id rather than a thinking suffix", () => {
+    assert.deepEqual(
+      testApi.resolveEffectiveModelAndThinking(
+        { agent: "worker", task: "T", model: "ollama/llama3.1:8b" },
+        null,
+      ),
+      { model: "ollama/llama3.1:8b", thinking: undefined },
+    );
+  });
+
   it("buildSubagentToolAllowlist preserves requested tools and adds child control tools", () => {
     assert.equal(
       testApi.buildSubagentToolAllowlist("read,bash,web_search"),
@@ -1617,6 +1687,36 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts serializes disabled, extended, and budget thinking overrides", () => {
+    withTempDir((d) => {
+      for (const requestedThinking of ["off", "none", "xhigh", "max", "32768"]) {
+        const resolved = testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T", thinking: requestedThinking },
+          { model: "provider/model", thinking: "medium" },
+        );
+        const parts: string[] = [];
+        testApi.applySandboxToParts(
+          parts,
+          {
+            agent: "worker",
+            toolAllowlist: null,
+            model: resolved.model ?? null,
+            thinking: resolved.thinking ?? null,
+            systemPromptMode: null,
+            identity: null,
+            spawnable: null,
+            autoExit: true,
+            cwd: null,
+            agentDir: null,
+          },
+          { artifactDir: d, name: "worker" },
+        );
+        const expectedThinking = requestedThinking === "none" ? "off" : requestedThinking;
+        assert.deepEqual(parts, ["--model", `'provider/model:${expectedThinking}'`]);
+      }
     });
   });
 
@@ -2330,7 +2430,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes agent+task as required and name/model/thinking/cwd as optional", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -2340,8 +2440,8 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "cwd", "model", "name", "task", "thinking"],
+      "only agent/task/name/model/thinking/cwd should remain",
     );
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
@@ -2350,6 +2450,7 @@ describe("tool registration", () => {
     );
     // `name` is now optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
+    assert.match(props.thinking.description, /reasoning level override/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);

@@ -109,6 +109,12 @@ const SubagentParams = Type.Object({
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  thinking: Type.Optional(
+    Type.String({
+      description:
+        "Thinking / reasoning level override (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', or token budget)",
+    }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -377,6 +383,63 @@ function resolveSubagentPaths(
     : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   return { effectiveCwd, localAgentDir };
+}
+
+function normalizeThinking(thinking: string | undefined): string | undefined {
+  if (thinking === undefined) return undefined;
+  const normalized = thinking.trim();
+  if (!normalized) return undefined;
+  const namedLevel = normalized.toLowerCase();
+  if (namedLevel === "none") return "off";
+  return NAMED_THINKING_LEVELS.has(namedLevel) ? namedLevel : normalized;
+}
+
+const NAMED_THINKING_LEVELS = new Set([
+  "off",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+]);
+
+/**
+ * Split Pi's optional `:thinking` suffix without mistaking model-id colons
+ * (for example Ollama's `llama3.1:8b`) for a reasoning level.
+ */
+function splitModelThinking(model: string | undefined): {
+  model: string | undefined;
+  thinking: string | undefined;
+} {
+  if (model === undefined) return { model: undefined, thinking: undefined };
+
+  const lastColon = model.lastIndexOf(":");
+  if (lastColon === -1) return { model, thinking: undefined };
+
+  const suffix = model.slice(lastColon + 1).trim();
+  const isNamedLevel = NAMED_THINKING_LEVELS.has(suffix.toLowerCase());
+  const isTokenBudget = /^\d+$/.test(suffix);
+  if (!isNamedLevel && !isTokenBudget) return { model, thinking: undefined };
+
+  return {
+    model: model.slice(0, lastColon),
+    thinking: normalizeThinking(suffix),
+  };
+}
+
+/** Resolve model and thinking together so the loadout always stores a bare model id. */
+function resolveEffectiveModelAndThinking(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): { model: string | undefined; thinking: string | undefined } {
+  const resolvedModel = splitModelThinking(params.model ?? agentDefs?.model);
+  const thinking = params.thinking !== undefined
+    ? normalizeThinking(params.thinking)
+    : resolvedModel.thinking ?? normalizeThinking(agentDefs?.thinking);
+
+  return { model: resolvedModel.model, thinking };
 }
 
 function resolveEffectiveSessionMode(
@@ -1230,6 +1293,7 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveEffectiveModelAndThinking,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1281,10 +1345,10 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const { model: effectiveModel, thinking: effectiveThinking } =
+    resolveEffectiveModelAndThinking(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
