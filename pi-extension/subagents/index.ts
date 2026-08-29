@@ -2384,9 +2384,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagents command — inspect subagents and manually clean orphaned artifacts
-  pi.registerCommand("subagents", {
-    description: "Manage subagent sessions: /subagents [status|cleanup-orphans|help] [--apply]",
+  // /subagent-sessions command — inspect subagents and manually clean orphaned artifacts
+  pi.registerCommand("subagent-sessions", {
+    description: "Manage subagent sessions: /subagent-sessions [status|cleanup-orphans|help] [--apply]",
     getArgumentCompletions: (prefix: string) => {
       const subcommands = ["status", "list", "cleanup-orphans", "help"];
       const trimmed = prefix.trim();
@@ -2416,7 +2416,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const regEntries = Object.entries(registry);
 
         const lines: string[] = [];
-        lines.push(`Subagents Status:`);
+        lines.push(`Subagent Sessions Status:`);
         lines.push(`• Active running: ${runningList.length}`);
         for (const r of runningList) {
           lines.push(`  - ${r.name} (${r.agent ?? "agent"}) [${r.id}] — surface: ${r.surface}`);
@@ -2477,7 +2477,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             (c) => `• ${basename(c.dir)} (${c.fileCount} files, ${Math.round(c.sizeBytes / 1024)} KB)`,
           );
           const msg = preview.candidates.length > 0
-            ? `Orphan cleanup preview (${preview.candidates.length} candidate(s)):\n${candidateLines.join("\n")}\nRun '/subagents cleanup-orphans --apply' to remove.`
+            ? `Orphan cleanup preview (${preview.candidates.length} candidate(s)):\n${candidateLines.join("\n")}\nRun '/subagent-sessions cleanup-orphans --apply' to remove.`
             : `Orphan cleanup preview: No orphan artifact directories found.`;
           if (ctx.hasUI) ctx.ui.notify(msg, "info");
         }
@@ -2486,10 +2486,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       // Help
       const help = [
-        `Subagents Management (/subagents):`,
-        `  /subagents status       - Show active and registered subagents`,
-        `  /subagents cleanup-orphans           - Preview orphaned subagent artifacts`,
-        `  /subagents cleanup-orphans --apply   - Remove marked orphan artifacts`,
+        `Subagent Sessions Management (/subagent-sessions):`,
+        `  /subagent-sessions status       - Show active and registered subagents`,
+        `  /subagent-sessions cleanup-orphans           - Preview orphaned subagent artifacts`,
+        `  /subagent-sessions cleanup-orphans --apply   - Remove marked orphan artifacts`,
       ].join("\n");
       if (ctx.hasUI) ctx.ui.notify(help, "info");
     },

@@ -34,7 +34,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent> <task>` command for spawning directly, and `/subagents` for session inspection and explicit orphan cleanup.
+There is also a `/subagent <agent> <task>` command for spawning directly, and `/subagent-sessions` for session inspection and explicit orphan cleanup.
 
 ### Spawning
 
@@ -202,22 +202,22 @@ Sub-agent session transcripts (`.jsonl`) and their sandbox loadout sidecars (`.l
 
 ### Explicit Orphan Cleanup
 
-Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the `/subagents cleanup-orphans` command when you want to inspect and remove them.
+Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the `/subagent-sessions cleanup-orphans` command when you want to inspect and remove them.
 
 - **Marker-Only Ownership**: Cleanup considers only directories with a valid extension ownership marker matching the parent session ID. Familiar filenames alone are not treated as proof of ownership.
 - **Preview First**: Cleanup defaults to a read-only, directory-level summary. It reports candidate directories, total stored file counts, and approximate sizes; it does not enumerate every file that will be removed.
 - **Explicit Apply**: Deletion requires both `--apply` and interactive confirmation. Before confirming, ensure no child process from the deleted parent is still running in another Pi process; cross-process liveness is not inferred from session files.
 - **Foreign Data Preservation**: Only recognized extension files are removed; unrelated files in the same artifact directory are preserved.
 
-### Management Command (`/subagents`)
+### Management Command (`/subagent-sessions`)
 
-The `/subagents` command provides interactive session inspection and cleanup:
+The `/subagent-sessions` command provides interactive session inspection and cleanup:
 
 | Command | Description |
 | --- | --- |
-| `/subagents status` (or `/subagents list`) | Show active running subagents and registered subagent sessions for this session |
-| `/subagents cleanup-orphans` | Preview marked artifact directories whose parent sessions were deleted |
-| `/subagents cleanup-orphans --apply` | Clean marked orphan artifacts after confirmation |
+| `/subagent-sessions status` (or `/subagent-sessions list`) | Show active running subagents and registered subagent sessions for this session |
+| `/subagent-sessions cleanup-orphans` | Preview marked artifact directories whose parent sessions were deleted |
+| `/subagent-sessions cleanup-orphans --apply` | Clean marked orphan artifacts after confirmation |
 
 ## Requirements
 

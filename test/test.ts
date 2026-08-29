@@ -2079,12 +2079,14 @@ describe("commands", () => {
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
   });
 
-  it("/subagents provides status and explicit orphan cleanup", async () => {
+  it("/subagent-sessions provides status and explicit orphan cleanup", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const subagentsCmd = registeredCommands.find((c) => c.name === "subagents");
-    assert.ok(subagentsCmd, "expected /subagents to be registered");
+    const subagentsCmd = registeredCommands.find((c) => c.name === "subagent-sessions");
+    assert.ok(subagentsCmd, "expected /subagent-sessions to be registered");
+    assert.equal(registeredCommands.find((c) => c.name === "subagents"), undefined);
+    assert.equal(registeredCommands.find((c) => c.name === "subagent-session"), undefined);
 
     // Check argument completions
     const completionsAll = subagentsCmd.getArgumentCompletions("");
@@ -2115,7 +2117,7 @@ describe("commands", () => {
 
       // 1. Status command
       subagentsCmd.handler("status", mockCtx);
-      assert.ok(notifications.some((n) => n.includes("Subagents Status")));
+      assert.ok(notifications.some((n) => n.includes("Subagent Sessions Status")));
 
       // 2. Cleanup preview (dry-run)
       notifications.length = 0;
