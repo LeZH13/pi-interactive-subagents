@@ -22,8 +22,18 @@ export interface StatusConfig {
   lineLimit: number;
 }
 
+export interface StatusTelemetry {
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  contextTokens?: number;
+  cost?: number;
+}
+
 export type StatusObservation =
-  | {
+  | ({
       snapshot: "present";
       updatedAt: number;
       sequence: number;
@@ -34,13 +44,13 @@ export type StatusObservation =
       waitingSince?: number;
       latestEvent?: string;
       activityLabel?: string;
-    }
+    } & StatusTelemetry)
   | {
       snapshot: "missing" | "invalid" | "wrong-id";
       snapshotError?: string;
     };
 
-export interface SubagentStatusState {
+export interface SubagentStatusState extends StatusTelemetry {
   source: SubagentStatusSource;
   startTimeMs: number;
   firstObservationAtMs: number | null;
@@ -61,7 +71,7 @@ export interface SubagentStatusState {
   currentKind: SubagentStatusKind;
 }
 
-export interface StatusSnapshot {
+export interface StatusSnapshot extends StatusTelemetry {
   kind: SubagentStatusKind;
   elapsedMs: number;
   elapsedText: string;
@@ -279,6 +289,13 @@ export function observeStatus(
     phase,
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
+    model: observation.model,
+    inputTokens: observation.inputTokens,
+    outputTokens: observation.outputTokens,
+    cacheReadTokens: observation.cacheReadTokens,
+    cacheWriteTokens: observation.cacheWriteTokens,
+    contextTokens: observation.contextTokens,
+    cost: observation.cost,
     snapshotState: "present",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -339,9 +356,19 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
 export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
+  const telemetry: StatusTelemetry = {
+    model: state.model,
+    inputTokens: state.inputTokens,
+    outputTokens: state.outputTokens,
+    cacheReadTokens: state.cacheReadTokens,
+    cacheWriteTokens: state.cacheWriteTokens,
+    contextTokens: state.contextTokens,
+    cost: state.cost,
+  };
 
   if (state.source === "claude") {
     return {
+      ...telemetry,
       kind: "running",
       elapsedMs,
       elapsedText,
@@ -393,6 +420,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     : formatElapsedDuration(now - state.snapshotProblemSinceMs);
 
   return {
+    ...telemetry,
     kind,
     elapsedMs,
     elapsedText,

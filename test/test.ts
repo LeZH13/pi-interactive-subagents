@@ -65,6 +65,8 @@ import {
   shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
   runningChildrenCount,
+  telemetryFromContext,
+  telemetryFromMessage,
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
@@ -1012,6 +1014,36 @@ describe("status.ts", () => {
     assert.equal(snapshot.activeDurationText, "3m");
   });
 
+  it("carries telemetry from observations into classified snapshots", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      model: "gpt-5.6-sol",
+      inputTokens: 39_200,
+      outputTokens: 1_600,
+      cacheReadTokens: 12_400,
+      cacheWriteTokens: 200,
+      contextTokens: 39_200,
+      cost: 0.042,
+    }, 10_000);
+
+    // Transient IPC loss retains the last healthy telemetry snapshot.
+    state = observeStatus(state, { snapshot: "missing" }, 11_000);
+    const snapshot = classifyStatus(state, 12_000);
+    assert.equal(snapshot.model, "gpt-5.6-sol");
+    assert.equal(snapshot.inputTokens, 39_200);
+    assert.equal(snapshot.outputTokens, 1_600);
+    assert.equal(snapshot.cacheReadTokens, 12_400);
+    assert.equal(snapshot.cacheWriteTokens, 200);
+    assert.equal(snapshot.contextTokens, 39_200);
+    assert.equal(snapshot.cost, 0.042);
+  });
+
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
@@ -1772,6 +1804,109 @@ describe("subagent-done.ts", () => {
     });
   });
 
+  describe("telemetry extraction", () => {
+    it("extracts assistant model, usage, context, and total cost", () => {
+      assert.deepEqual(telemetryFromMessage({
+        role: "assistant",
+        model: "gpt-5.6-sol",
+        usage: {
+          input: 39_200,
+          output: 1_600,
+          cacheRead: 12_400,
+          cacheWrite: 200,
+          totalTokens: 39_200,
+          cost: { total: 0.042 },
+        },
+      }), {
+        model: "gpt-5.6-sol",
+        inputTokens: 39_200,
+        outputTokens: 1_600,
+        cacheReadTokens: 12_400,
+        cacheWriteTokens: 200,
+        contextTokens: 39_200,
+        cost: 0.042,
+      });
+      assert.equal(telemetryFromMessage({ role: "user", content: "hello" }), undefined);
+    });
+
+    it("reads model and context usage from lifecycle context", () => {
+      assert.deepEqual(telemetryFromContext({
+        model: { id: "claude-sonnet-4-6" },
+        getContextUsage: () => ({ tokens: 32_000, contextWindow: 200_000, percent: 16 }),
+      }), {
+        model: "claude-sonnet-4-6",
+        contextTokens: 32_000,
+      });
+    });
+
+    it("wires lifecycle event telemetry into the activity IPC snapshot", () => {
+      withTempDir((dir) => {
+        const activityFile = getSubagentActivityFile(dir, "event-child");
+        const saved = {
+          id: process.env.PI_SUBAGENT_ID,
+          activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
+          autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        };
+        process.env.PI_SUBAGENT_ID = "event-child";
+        process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+        process.env.PI_SUBAGENT_AUTO_EXIT = "0";
+
+        const handlers = new Map<string, Array<(...args: any[]) => void>>();
+        const api = {
+          on(event: string, handler: (...args: any[]) => void) {
+            if (!handlers.has(event)) handlers.set(event, []);
+            handlers.get(event)!.push(handler);
+          },
+          registerTool() {}, registerShortcut() {}, getAllTools() { return []; },
+        } as any;
+        const ctx = {
+          model: { id: "gpt-5.6-sol" },
+          getContextUsage: () => ({ tokens: 10_000, contextWindow: 200_000, percent: 5 }),
+          ui: { setWidget() {} },
+          shutdown() {},
+        } as any;
+        const emit = (event: string, payload: any = {}) =>
+          (handlers.get(event) ?? []).forEach((handler) => handler(payload, ctx));
+        const assistant = {
+          role: "assistant",
+          model: "gpt-5.6-sol",
+          usage: {
+            input: 8_000,
+            output: 1_000,
+            cacheRead: 2_000,
+            cacheWrite: 100,
+            totalTokens: 10_000,
+            cost: { total: 0.025 },
+          },
+        };
+
+        try {
+          subagentDoneExtension(api);
+          emit("session_start");
+          emit("agent_start");
+          emit("turn_start", { turnIndex: 0 });
+          emit("after_provider_response", { status: 200, headers: {} });
+          emit("message_update", { message: assistant, assistantMessageEvent: { type: "done" } });
+          emit("turn_end", { turnIndex: 0, message: assistant, toolResults: [] });
+          emit("agent_end", { messages: [assistant] });
+
+          const read = readSubagentActivityFile(activityFile, "event-child");
+          assert.ok(read.ok);
+          assert.equal(read.activity.phase, "waiting");
+          assert.equal(read.activity.model, "gpt-5.6-sol");
+          assert.equal(read.activity.inputTokens, 8_000);
+          assert.equal(read.activity.outputTokens, 1_000);
+          assert.equal(read.activity.contextTokens, 10_000);
+          assert.equal(read.activity.cost, 0.025);
+        } finally {
+          restoreEnvVar("PI_SUBAGENT_ID", saved.id);
+          restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", saved.activityFile);
+          restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        }
+      });
+    });
+  });
+
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
@@ -2356,6 +2491,12 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        { model: "bad\nmodel" },
+        { inputTokens: -1 },
+        { outputTokens: 1.5 },
+        { cacheReadTokens: "many" },
+        { contextTokens: -1 },
+        { cost: -0.01 },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -2367,6 +2508,67 @@ describe("subagent activity snapshots", () => {
         assert.equal(read.ok, false);
         assert.equal((read as { ok: false; reason: string }).reason, "invalid");
       }
+    });
+  });
+
+  it("records live telemetry cumulatively without double-counting agent_end", () => {
+    withTempDir((dir) => {
+      let currentNow = 1_000;
+      const activityFile = getSubagentActivityFile(dir, "child-telemetry");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-telemetry",
+        activityFile,
+        now: () => currentNow,
+      });
+
+      recorder.sessionStart();
+      recorder.agentStart();
+      recorder.turnStart(0);
+      currentNow = 2_000;
+      recorder.messageUpdate("text_delta", {
+        model: "gpt-5.6-sol",
+        inputTokens: 1_000,
+        outputTokens: 100,
+        cacheReadTokens: 400,
+        cacheWriteTokens: 20,
+        contextTokens: 1_500,
+        cost: 0.01,
+      });
+      currentNow = 3_000;
+      recorder.turnEnd(0, {
+        model: "gpt-5.6-sol",
+        inputTokens: 1_200,
+        outputTokens: 150,
+        cacheReadTokens: 500,
+        cacheWriteTokens: 25,
+        contextTokens: 1_875,
+        cost: 0.012,
+      });
+
+      recorder.turnStart(1);
+      currentNow = 4_000;
+      const finalTurn = {
+        model: "gpt-5.6-sol",
+        inputTokens: 300,
+        outputTokens: 50,
+        cacheReadTokens: 100,
+        cacheWriteTokens: 5,
+        contextTokens: 2_330,
+        cost: 0.004,
+      };
+      recorder.turnEnd(1, finalTurn);
+      currentNow = 5_000;
+      recorder.agentEndWaiting(finalTurn);
+
+      const read = readSubagentActivityFile(activityFile, "child-telemetry");
+      assert.ok(read.ok);
+      assert.equal(read.activity.model, "gpt-5.6-sol");
+      assert.equal(read.activity.inputTokens, 1_500);
+      assert.equal(read.activity.outputTokens, 200);
+      assert.equal(read.activity.cacheReadTokens, 600);
+      assert.equal(read.activity.cacheWriteTokens, 30);
+      assert.equal(read.activity.contextTokens, 2_330);
+      assert.equal(read.activity.cost, 0.016);
     });
   });
 
@@ -2883,6 +3085,84 @@ describe("subagents widget rendering", () => {
     }
   });
 
+  it("renders detailed two-line identity and telemetry blocks", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = 1_000_000;
+    let statusState = createStatusState({ source: "pi", startTimeMs: now - 144_000 });
+    statusState = observeStatus(statusState, {
+      snapshot: "present",
+      updatedAt: now - 12_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      activeSince: now - 12_000,
+      activityLabel: "streaming",
+      model: "gpt-5.6-sol",
+      inputTokens: 39_200,
+      outputTokens: 1_600,
+      cacheReadTokens: 12_400,
+      contextTokens: 39_200,
+      cost: 0.042,
+    }, now - 12_000);
+
+    const lines = withMockedNow(now, () => testApi.renderSubagentWidgetLines([{
+      id: "a1",
+      name: "cleanup-design",
+      agent: "worker",
+      task: "",
+      surface: "s1",
+      startTime: now - 144_000,
+      sessionFile: "sess1",
+      statusState,
+    }], 100));
+    const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+    const plain = lines.map(stripAnsi);
+
+    assert.equal(lines.length, 4);
+    assert.match(plain[1], /⟳ 02:24  cleanup-design \(worker\)/);
+    assert.match(plain[1], /active · streaming 12s/);
+    assert.match(plain[2], /^│ {10}↳ ↑39k↓1\.6k  R12k  \$0\.042/);
+    assert.match(plain[2], /gpt-5\.6-sol · 19\.6%\/200k/);
+    assert.match(lines[2], /\x1b\[38;2;128;128;128m↳/);
+    assert.match(lines[2], /\x1b\[38;2;126;186;103m19\.6%\/200k/);
+    assert.deepEqual(lines.map((line: string) => visibleWidth(line)), [100, 100, 100, 100]);
+  });
+
+  it("keeps telemetry blocks within narrow terminal widths", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = Date.now();
+    const statusState = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: now - 5_000 }),
+      {
+        snapshot: "present",
+        updatedAt: now,
+        sequence: 1,
+        phase: "active",
+        model: "gpt-5.6-sol",
+        inputTokens: 999_999,
+        outputTokens: 888_888,
+        contextTokens: 190_000,
+        cost: 12.345,
+      },
+      now,
+    );
+
+    for (const width of [0, 1, 2, 8, 16]) {
+      const lines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "long-running-agent-name",
+        task: "",
+        surface: "s1",
+        startTime: now - 5_000,
+        sessionFile: "sess1",
+        statusState,
+      }], width);
+      assert.equal(lines.length, 4);
+      for (const line of lines) assert.ok(visibleWidth(line) <= width);
+    }
+  });
+
   it("truncates the right-hand status instead of overflowing when it alone is too wide", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
@@ -2936,6 +3216,7 @@ describe("subagent display helpers", () => {
   describe("contextWindowFor", () => {
     it("maps known model families and returns undefined otherwise", () => {
       assert.equal(testApi.contextWindowFor("claude-sonnet-4-6"), 200_000);
+      assert.equal(testApi.contextWindowFor("gpt-5.6-sol"), 200_000);
       assert.equal(testApi.contextWindowFor("gemini-2.5-pro"), 1_000_000);
       assert.equal(testApi.contextWindowFor("some-unknown-model"), undefined);
       assert.equal(testApi.contextWindowFor(null), undefined);
@@ -2982,6 +3263,46 @@ describe("subagent display helpers", () => {
         }),
         [],
       );
+    });
+  });
+
+  describe("formatWidgetTelemetryClusters", () => {
+    it("groups paired I/O tokens without spacing and separates cache/cost with double spaces", () => {
+      const clusters = testApi.formatWidgetTelemetryClusters({
+        inputTokens: 39_200,
+        outputTokens: 1_600,
+        cacheReadTokens: 12_400,
+        cost: 0.042,
+      });
+      assert.deepEqual(clusters, ["↑39k↓1.6k", "R12k", "$0.042"]);
+    });
+
+    it("handles zero cache and single directions cleanly", () => {
+      assert.deepEqual(
+        testApi.formatWidgetTelemetryClusters({ inputTokens: 4_100, outputTokens: 420, cost: 0.008 }),
+        ["↑4.1k↓420", "$0.008"],
+      );
+      assert.deepEqual(
+        testApi.formatWidgetTelemetryClusters({ inputTokens: 14_100, outputTokens: 420, cost: 0.008 }),
+        ["↑14k↓420", "$0.008"],
+      );
+      assert.deepEqual(
+        testApi.formatWidgetTelemetryClusters({ inputTokens: 5_000 }),
+        ["↑5.0k"],
+      );
+    });
+  });
+
+  describe("formatWidgetTelemetryLine", () => {
+    it("uses green, yellow, and red context gauge thresholds", () => {
+      const snapshot = (contextTokens: number) => ({
+        ...classifyStatus(createStatusState({ source: "pi", startTimeMs: 0 }), 0),
+        model: "gpt-5.6-sol",
+        contextTokens,
+      });
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(98_000)).right, /38;2;126;186;103m/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(100_000)).right, /38;2;214;181;94m/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(162_000)).right, /38;2;224;108;117m/);
     });
   });
 

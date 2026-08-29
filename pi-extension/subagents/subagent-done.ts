@@ -16,7 +16,78 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  createSubagentActivityRecorder,
+  type SubagentTelemetry,
+} from "./activity.ts";
+
+function finiteNonNegative(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** Extract the model and latest usage snapshot from an assistant message. */
+export function telemetryFromMessage(message: unknown): SubagentTelemetry | undefined {
+  if (message == null || typeof message !== "object" || (message as any).role !== "assistant") return undefined;
+  const assistant = message as Record<string, unknown>;
+  const telemetry: SubagentTelemetry = {};
+  const model = typeof assistant.model === "string" ? assistant.model.trim() : "";
+  if (model) telemetry.model = model;
+
+  const usage = assistant.usage;
+  if (usage != null && typeof usage === "object" && !Array.isArray(usage)) {
+    const values = usage as Record<string, unknown>;
+    telemetry.inputTokens = finiteNonNegative(values.input);
+    telemetry.outputTokens = finiteNonNegative(values.output);
+    telemetry.cacheReadTokens = finiteNonNegative(values.cacheRead);
+    telemetry.cacheWriteTokens = finiteNonNegative(values.cacheWrite);
+    telemetry.contextTokens = finiteNonNegative(values.totalTokens);
+    const cost = values.cost;
+    if (cost != null && typeof cost === "object" && !Array.isArray(cost)) {
+      telemetry.cost = finiteNonNegative((cost as Record<string, unknown>).total);
+    }
+  }
+
+  return Object.values(telemetry).some((value) => value != null) ? telemetry : undefined;
+}
+
+/** Fill model/context metadata from Pi's lifecycle context when available. */
+export function telemetryFromContext(ctx: unknown): SubagentTelemetry | undefined {
+  if (ctx == null || typeof ctx !== "object") return undefined;
+  const context = ctx as Record<string, any>;
+  const telemetry: SubagentTelemetry = {};
+  const model = typeof context.model?.id === "string" ? context.model.id.trim() : "";
+  if (model) telemetry.model = model;
+  if (typeof context.getContextUsage === "function") {
+    try {
+      const usage = context.getContextUsage();
+      const tokens = finiteNonNegative(usage?.tokens);
+      if (tokens != null) telemetry.contextTokens = tokens;
+    } catch {
+      // Telemetry is best effort and must never disrupt the subagent lifecycle.
+    }
+  }
+  return Object.values(telemetry).some((value) => value != null) ? telemetry : undefined;
+}
+
+function mergeTelemetry(
+  contextTelemetry: SubagentTelemetry | undefined,
+  messageTelemetry: SubagentTelemetry | undefined,
+): SubagentTelemetry | undefined {
+  if (!contextTelemetry && !messageTelemetry) return undefined;
+  return { ...contextTelemetry, ...messageTelemetry };
+}
+
+function lifecycleTelemetry(message: unknown, ctx: unknown): SubagentTelemetry | undefined {
+  return mergeTelemetry(telemetryFromContext(ctx), telemetryFromMessage(message));
+}
+
+function latestAssistantMessage(messages: unknown[] | undefined): unknown {
+  if (!messages) return undefined;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if ((messages[index] as any)?.role === "assistant") return messages[index];
+  }
+  return undefined;
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -225,6 +296,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
+    const telemetry = lifecycleTelemetry(latestAssistantMessage(messages), ctx);
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
@@ -263,12 +335,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      recorder.agentEndDone();
+      recorder.agentEndDone(telemetry);
       ctx.shutdown();
       return;
     }
 
-    recorder.agentEndWaiting();
+    recorder.agentEndWaiting(telemetry);
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
@@ -280,20 +352,26 @@ export default function (pi: ExtensionAPI) {
     recorder.turnStart((event as any).turnIndex);
   });
 
-  pi.on("turn_end", (event) => {
-    recorder.turnEnd((event as any).turnIndex);
+  pi.on("turn_end", (event, ctx) => {
+    recorder.turnEnd(
+      (event as any).turnIndex,
+      lifecycleTelemetry((event as any).message, ctx),
+    );
   });
 
   pi.on("before_provider_request", () => {
     recorder.beforeProviderRequest();
   });
 
-  pi.on("after_provider_response", () => {
-    recorder.afterProviderResponse();
+  pi.on("after_provider_response", (_event, ctx) => {
+    recorder.afterProviderResponse(telemetryFromContext(ctx));
   });
 
-  pi.on("message_update", (event) => {
-    recorder.messageUpdate((event as any).assistantMessageEvent?.type);
+  pi.on("message_update", (event, ctx) => {
+    recorder.messageUpdate(
+      (event as any).assistantMessageEvent?.type,
+      lifecycleTelemetry((event as any).message, ctx),
+    );
   });
 
   pi.on("tool_execution_start", (event) => {

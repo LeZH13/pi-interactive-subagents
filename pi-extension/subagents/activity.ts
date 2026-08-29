@@ -23,7 +23,17 @@ export type SubagentActivityEvent =
   | "ask_question"
   | "session_shutdown";
 
-export interface SubagentActivityState {
+export interface SubagentTelemetry {
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  contextTokens?: number;
+  cost?: number;
+}
+
+export interface SubagentActivityState extends SubagentTelemetry {
   version: 1;
   runningChildId: string;
   createdAt: number;
@@ -57,13 +67,13 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
-  agentEndWaiting(): void;
-  agentEndDone(): void;
+  agentEndWaiting(telemetry?: SubagentTelemetry): void;
+  agentEndDone(telemetry?: SubagentTelemetry): void;
   turnStart(turnIndex?: number): void;
-  turnEnd(turnIndex?: number): void;
+  turnEnd(turnIndex?: number, telemetry?: SubagentTelemetry): void;
   beforeProviderRequest(): void;
-  afterProviderResponse(): void;
-  messageUpdate(messageEventType?: string): void;
+  afterProviderResponse(telemetry?: SubagentTelemetry): void;
+  messageUpdate(messageEventType?: string, telemetry?: SubagentTelemetry): void;
   toolExecutionStart(toolCallId?: string, toolName?: string): void;
   toolCall(toolCallId?: string, toolName?: string): void;
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
@@ -125,6 +135,20 @@ function validateOptionalInteger(object: Record<string, unknown>, fieldName: str
   return value == null || Number.isInteger(value) ? null : `${fieldName} must be an integer when present`;
 }
 
+function validateOptionalNonNegativeInteger(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  return value == null || (Number.isInteger(value) && (value as number) >= 0)
+    ? null
+    : `${fieldName} must be a non-negative integer when present`;
+}
+
+function validateOptionalNonNegativeFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
+  const value = object[fieldName];
+  return value == null || (Number.isFinite(value) && (value as number) >= 0)
+    ? null
+    : `${fieldName} must be finite and non-negative when present`;
+}
+
 function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
   return typeof object[fieldName] === "boolean" ? null : `${fieldName} must be a boolean`;
 }
@@ -176,6 +200,13 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
+    validateOptionalActivityString(object, "model"),
+    validateOptionalNonNegativeInteger(object, "inputTokens"),
+    validateOptionalNonNegativeInteger(object, "outputTokens"),
+    validateOptionalNonNegativeInteger(object, "cacheReadTokens"),
+    validateOptionalNonNegativeInteger(object, "cacheWriteTokens"),
+    validateOptionalNonNegativeInteger(object, "contextTokens"),
+    validateOptionalNonNegativeFiniteNumber(object, "cost"),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -316,6 +347,105 @@ export function createSubagentActivityRecorder(params: {
   let failureCount = 0;
   let lastFlushAt = 0;
   let pendingFlush: ReturnType<typeof setTimeout> | null = null;
+  const committedUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    cost: 0,
+  };
+  let currentTurnUsage: typeof committedUsage | null = null;
+  let telemetryTurnOpen = false;
+
+  function normalizedTelemetry(telemetry: SubagentTelemetry | undefined): SubagentTelemetry | undefined {
+    if (!telemetry) return undefined;
+    const normalized: SubagentTelemetry = {};
+    const model = telemetry.model?.trim();
+    if (model && model.length <= MAX_ACTIVITY_STRING_LENGTH && !/\r|\n/.test(model)) normalized.model = model;
+
+    for (const field of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "contextTokens",
+    ] as const) {
+      const value = telemetry[field];
+      if (Number.isInteger(value) && (value as number) >= 0) normalized[field] = value;
+    }
+    if (Number.isFinite(telemetry.cost) && (telemetry.cost as number) >= 0) normalized.cost = telemetry.cost;
+    return normalized;
+  }
+
+  function hasTurnUsage(telemetry: SubagentTelemetry | undefined): boolean {
+    return telemetry != null && [
+      telemetry.inputTokens,
+      telemetry.outputTokens,
+      telemetry.cacheReadTokens,
+      telemetry.cacheWriteTokens,
+      telemetry.cost,
+    ].some((value) => value != null);
+  }
+
+  function applyTelemetry(current: SubagentActivityState, rawTelemetry?: SubagentTelemetry, includeTurnUsage = true): void {
+    const telemetry = normalizedTelemetry(rawTelemetry);
+    if (!telemetry) return;
+    if (telemetry.model != null) current.model = telemetry.model;
+    if (telemetry.contextTokens != null) current.contextTokens = telemetry.contextTokens;
+    if (!includeTurnUsage || !hasTurnUsage(telemetry)) return;
+
+    currentTurnUsage ??= {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      cost: 0,
+    };
+    for (const field of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "cost",
+    ] as const) {
+      if (telemetry[field] != null) currentTurnUsage[field] = telemetry[field];
+      current[field] = committedUsage[field] + currentTurnUsage[field];
+    }
+  }
+
+  function commitTurnTelemetry(current: SubagentActivityState): void {
+    if (!currentTurnUsage) return;
+    for (const field of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "cost",
+    ] as const) {
+      committedUsage[field] += currentTurnUsage[field];
+      current[field] = committedUsage[field];
+    }
+    currentTurnUsage = null;
+  }
+
+  function beginTelemetryTurn(current: SubagentActivityState): void {
+    if (telemetryTurnOpen) commitTurnTelemetry(current);
+    currentTurnUsage = null;
+    telemetryTurnOpen = true;
+  }
+
+  function finishTelemetryTurn(current: SubagentActivityState, telemetry?: SubagentTelemetry): void {
+    const hasCommittedUsage = Object.values(committedUsage).some((value) => value !== 0);
+    if (telemetryTurnOpen || (currentTurnUsage == null && hasTurnUsage(telemetry) && !hasCommittedUsage)) {
+      applyTelemetry(current, telemetry);
+      commitTurnTelemetry(current);
+    } else {
+      // turn_end already committed this assistant message; agent_end may repeat
+      // it, so only refresh model/context metadata here to avoid double-counting.
+      applyTelemetry(current, telemetry, false);
+    }
+    telemetryTurnOpen = false;
+  }
 
   function clearPendingFlush(): void {
     if (!pendingFlush) return;
@@ -402,29 +532,39 @@ export function createSubagentActivityRecorder(params: {
     agentStart() {
       record("agent_start", (current, observedAt) => {
         current.agentActive = true;
+        telemetryTurnOpen = true;
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEndWaiting() {
+    agentEndWaiting(telemetry) {
       record("agent_end", (current, observedAt) => {
+        finishTelemetryTurn(current, telemetry);
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
       }, "immediate");
     },
-    agentEndDone() {
-      markDone("agent_end");
+    agentEndDone(telemetry) {
+      record("agent_end", (current) => {
+        finishTelemetryTurn(current, telemetry);
+        current.phase = "done";
+        clearActiveState(current);
+        delete current.waitingSince;
+      }, "immediate");
+      disable();
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
         current.agentActive = true;
         current.turnActive = true;
+        beginTelemetryTurn(current);
         if (turnIndex != null) current.turnIndex = turnIndex;
         markActive(current, current.toolActive || current.providerActive ? current.activeScope ?? "turn" : "turn", observedAt);
       }, "immediate");
     },
-    turnEnd(turnIndex) {
+    turnEnd(turnIndex, telemetry) {
       record("turn_end", (current) => {
+        finishTelemetryTurn(current, telemetry);
         current.turnActive = false;
         current.providerActive = false;
         current.toolActive = false;
@@ -438,16 +578,20 @@ export function createSubagentActivityRecorder(params: {
         markActive(current, "provider", observedAt, true);
       }, "immediate");
     },
-    afterProviderResponse() {
+    afterProviderResponse(telemetry) {
       record("after_provider_response", (current) => {
+        if (hasTurnUsage(telemetry)) telemetryTurnOpen = true;
+        applyTelemetry(current, telemetry);
         current.providerActive = false;
         refreshActiveScope(current);
       }, "immediate");
     },
-    messageUpdate(messageEventType) {
+    messageUpdate(messageEventType, telemetry) {
       record("message_update", (current, observedAt) => {
         current.agentActive = true;
         current.turnActive = true;
+        telemetryTurnOpen = true;
+        applyTelemetry(current, telemetry);
         current.messageEventType = messageEventType;
         if (!current.toolActive) markActive(current, "streaming", observedAt);
       }, "throttled");

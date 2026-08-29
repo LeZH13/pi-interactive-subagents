@@ -460,6 +460,7 @@ function contextWindowFor(model: string | null | undefined): number | undefined 
   if (!model) return undefined;
   const m = model.toLowerCase();
   if (m.includes("claude")) return 200_000;
+  if (m.includes("gpt-5")) return 200_000;
   if (m.includes("gpt-4.1") || m.includes("gpt-4o")) return 128_000;
   if (m.includes("gemini")) return 1_000_000;
   return undefined;
@@ -742,6 +743,78 @@ function borderBottom(width: number): string {
   return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
 }
 
+function formatWidgetTelemetryClusters(stats: {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cost?: number;
+}): string[] {
+  const clusters: string[] = [];
+
+  let io = "";
+  if (stats.inputTokens) io += `↑${formatTokens(stats.inputTokens)}`;
+  if (stats.outputTokens) io += `↓${formatTokens(stats.outputTokens)}`;
+  if (io) clusters.push(io);
+
+  let cache = "";
+  if (stats.cacheReadTokens) cache += `R${formatTokens(stats.cacheReadTokens)}`;
+  if (stats.cacheWriteTokens) cache += `W${formatTokens(stats.cacheWriteTokens)}`;
+  if (cache) clusters.push(cache);
+
+  if (stats.cost) clusters.push(`$${stats.cost.toFixed(3)}`);
+
+  return clusters;
+}
+
+function formatWidgetTelemetryLine(
+  snapshot: StatusSnapshot,
+): { left: string; right: string } | null {
+  const hasTelemetry = [
+    snapshot.model,
+    snapshot.inputTokens,
+    snapshot.outputTokens,
+    snapshot.cacheReadTokens,
+    snapshot.cacheWriteTokens,
+    snapshot.contextTokens,
+    snapshot.cost,
+  ].some((value) => value != null);
+  if (!hasTelemetry) return null;
+
+  const usageClusters = formatWidgetTelemetryClusters({
+    inputTokens: snapshot.inputTokens ?? 0,
+    outputTokens: snapshot.outputTokens ?? 0,
+    cacheReadTokens: snapshot.cacheReadTokens ?? 0,
+    cacheWriteTokens: snapshot.cacheWriteTokens ?? 0,
+    cost: snapshot.cost ?? 0,
+  });
+  const telemetryText = usageClusters.length > 0
+    ? `↳ ${usageClusters.join("  ")}`
+    : "↳ starting…";
+  const left = `          ${ICON_DIM}${telemetryText}${RST} `;
+
+  const rightSegments: string[] = [];
+  if (snapshot.model) rightSegments.push(`${ICON_DIM}${snapshot.model}${RST}`);
+  if (snapshot.contextTokens != null && snapshot.contextTokens > 0) {
+    const contextWindow = contextWindowFor(snapshot.model);
+    const contextText = formatContextUsage(snapshot.contextTokens, contextWindow);
+    const percent = contextWindow ? (snapshot.contextTokens / contextWindow) * 100 : null;
+    const color = percent == null
+      ? ICON_DIM
+      : percent > 80
+        ? ICON_RED
+        : percent >= 50
+          ? ICON_YELLOW
+          : ICON_GREEN;
+    rightSegments.push(`${color}${contextText}${RST}`);
+  }
+  const right = rightSegments.length > 0
+    ? ` ${rightSegments.join(`${ICON_DIM} · ${RST}`)} `
+    : "";
+
+  return { left, right };
+}
+
 function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const count = agents.length;
   const title = "Subagents";
@@ -762,6 +835,9 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
         : " starting… ";
 
     lines.push(borderLine(left, right, width));
+
+    const telemetryLine = formatWidgetTelemetryLine(snapshot);
+    if (telemetryLine) lines.push(borderLine(telemetryLine.left, telemetryLine.right, width));
   }
 
   lines.push(borderBottom(width));
@@ -950,6 +1026,13 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       waitingSince: read.activity.waitingSince,
       latestEvent: read.activity.latestEvent,
       activityLabel: activityLabel(read.activity),
+      model: read.activity.model,
+      inputTokens: read.activity.inputTokens,
+      outputTokens: read.activity.outputTokens,
+      cacheReadTokens: read.activity.cacheReadTokens,
+      cacheWriteTokens: read.activity.cacheWriteTokens,
+      contextTokens: read.activity.contextTokens,
+      cost: read.activity.cost,
     }, observedAt);
     return;
   }
@@ -1169,6 +1252,8 @@ export const __test__ = {
   formatContextUsage,
   contextWindowFor,
   formatUsageSegments,
+  formatWidgetTelemetryClusters,
+  formatWidgetTelemetryLine,
   widgetIcon,
 };
 

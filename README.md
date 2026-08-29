@@ -9,10 +9,12 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux p
 `subagent()` returns immediately. The sub-agent runs in its own tmux pane, split from the parent pi pane without stealing keyboard focus. Square and landscape windows split to the right; portrait windows split downward. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
-╭─ Subagents ──────────────────────────── 2 running ─╮
-│ 00:23  scout      active · bash 7m                 │
-│ 00:45  scout-2    waiting 2m                       │
-╰────────────────────────────────────────────────────╯
+╭─ Subagents ───────────────────────────────────────────────────────────── 2 running ─╮
+│ ⟳ 00:23  scout (scout)                                             active · bash 7s │
+│          ↳ ↑14k↓420  $0.008                            gemini-3.7-flash · 7.1%/1M │
+│ ○ 00:45  cleanup-design (worker)                                  waiting 2m · done │
+│          ↳ ↑39k↓1.6k  R12k  $0.042                        gpt-5.6-sol · 19.6%/200k │
+╰─────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
@@ -165,7 +167,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 
