@@ -68,7 +68,7 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used by both orchestrators and child agents. Override with PI_TEST_MODEL. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/meta-llama/llama-3.3-70b-instruct:free";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/deepseek/deepseek-v4-flash-073";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");

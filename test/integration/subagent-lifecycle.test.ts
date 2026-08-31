@@ -12,7 +12,7 @@
  *   tmux new 'npm run test:integration'
  *
  * Configuration:
- *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/meta-llama/llama-3.3-70b-instruct:free)
+ *   PI_TEST_MODEL     — model for all pi sessions (default: openrouter/deepseek/deepseek-v4-flash-073)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
 import { describe, it, before, after } from "node:test";

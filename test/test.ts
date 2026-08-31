@@ -2717,17 +2717,24 @@ describe("commands", () => {
       subagentsCmd.handler("status", mockCtx);
       assert.ok(notifications.some((n) => n.includes("Subagent Sessions Status")));
 
-      // 2. Cleanup preview (dry-run)
+      // 2. Cleanup preview (dry-run when empty)
       notifications.length = 0;
       await subagentsCmd.handler("cleanup-orphans", mockCtx);
-      assert.ok(notifications.some((n) => n.includes("Orphan cleanup preview")));
+      assert.ok(notifications.some((n) => n.includes("No orphan artifact directories found")));
 
-      // 3. Cleanup apply with rejection (confirm: false)
+      // 3. Setup orphan artifact directory
       const orphanArt = join(tDir, "artifacts", "orphan-1");
       mkdirSync(join(orphanArt, "subagents"), { recursive: true });
       writeFileSync(join(orphanArt, "subagent-registry.json"), "{}");
       writeArtifactOwnershipMarker(orphanArt, "orphan-1");
 
+      // 4. Cleanup preview (dry-run with orphan candidate — exercises basename)
+      notifications.length = 0;
+      await subagentsCmd.handler("cleanup-orphans", mockCtx);
+      assert.ok(notifications.some((n) => n.includes("Orphan cleanup preview (1 candidate(s))")));
+      assert.ok(notifications.some((n) => n.includes("• orphan-1")));
+
+      // 5. Cleanup apply with rejection (confirm: false)
       notifications.length = 0;
       const rejectMockCtx = {
         ...mockCtx,
@@ -2740,7 +2747,7 @@ describe("commands", () => {
       assert.ok(notifications.some((n) => n.includes("cancelled")));
       assert.ok(existsSync(orphanArt)); // preserved
 
-      // 4. Cleanup apply with acceptance (confirm: true)
+      // 6. Cleanup apply with acceptance (confirm: true)
       notifications.length = 0;
       const acceptMockCtx = {
         ...mockCtx,
