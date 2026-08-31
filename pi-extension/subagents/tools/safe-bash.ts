@@ -9,9 +9,8 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createBashTool } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
-const DANGEROUS_PATTERNS = [
-	/\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
-	/\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
+export const DANGEROUS_PATTERNS = [
+	/\brm\s+(-[a-zA-Z]+\s+)*(\/|~)/,
 	/\bsudo\b/,
 	/\bmkfs\b/,
 	/\bdd\s+if=/,
@@ -28,7 +27,7 @@ const DANGEROUS_PATTERNS = [
 	/\bkillall\b/,
 ];
 
-function isDangerous(command: string): string | null {
+export function isDangerous(command: string): string | null {
 	const normalized = command.replace(/\\\n/g, " ");
 	for (const pattern of DANGEROUS_PATTERNS) {
 		if (pattern.test(normalized)) {

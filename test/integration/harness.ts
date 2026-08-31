@@ -208,10 +208,15 @@ export function startPi(
   surface: string,
   testDir: string,
   task: string,
-  opts?: { model?: string; extraArgs?: string },
+  opts?: { model?: string; extraArgs?: string; env?: Record<string, string> },
 ): void {
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
+  const envPrefix = opts?.env
+    ? Object.entries(opts.env)
+        .map(([k, v]) => `${k}=${shellEscape(v)}`)
+        .join(" ") + " "
+    : "";
 
   // Force pi to load the working-tree extension (not an installed pi-package
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
@@ -219,7 +224,7 @@ export function startPi(
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
-    `pi`,
+    `${envPrefix}pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,

@@ -17,7 +17,7 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   getAvailableBackends,
@@ -102,6 +102,92 @@ for (const backend of backends) {
         assert.equal(header.type, "session", "First entry should be session header");
         assert.ok(header.id, "Session header should have an id");
       }
+    });
+
+    // ── Background / no-mux mode ──
+
+    it("spawns a subagent in silent background mode when multiplexing is disabled", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-bg-${id}.txt`;
+      trackTempFile(env, markerFile);
+
+      const surface = createTrackedSurface(env, `bg-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "BgEcho-${id}"`,
+        `  agent: "test-echo"`,
+        `  task: "Run this bash command: echo 'BG_PASS_${id}' > '${markerFile}'"`,
+        `Do not do anything else. Just call the subagent tool once.`,
+        `After you receive the subagent result, say BG_INTEGRATION_COMPLETE.`,
+      ].join("\n");
+
+      // Pass PI_SUBAGENT_DISABLE_TMUX=1 to force silent background process mode
+      startPi(surface, env.dir, task, {
+        env: { PI_SUBAGENT_DISABLE_TMUX: "1" },
+      });
+
+      // Verify: subagent created the marker file in background
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /BG_PASS/);
+      assert.ok(
+        content.includes(`BG_PASS_${id}`),
+        `Marker file should contain BG_PASS_${id}. Got: ${content.trim()}`,
+      );
+
+      // Verify: outer pi received the subagent result
+      const screen = await waitForScreen(
+        surface,
+        /BG_INTEGRATION_COMPLETE|completed|Sub-agent.*"BgEcho/i,
+        PI_TIMEOUT,
+      );
+      assert.ok(
+        /BG_INTEGRATION_COMPLETE|completed/i.test(screen),
+        `Outer pi should complete after receiving background subagent result`,
+      );
+    });
+
+    // ── Failure and non-zero exit handling ──
+
+    it("handles subagent failure and surfaces non-zero exit to parent", async () => {
+      const id = uniqueId();
+      const failAgentFile = join(env.dir, ".pi", "agents", `test-fail-${id}.md`);
+      writeFileSync(
+        failAgentFile,
+        [
+          "---",
+          `name: test-fail-${id}`,
+          "model: non-existent-provider/invalid-model-id",
+          "auto-exit: true",
+          "---",
+          "",
+          "You are a failing agent.",
+        ].join("\n"),
+      );
+
+      const surface = createTrackedSurface(env, `fail-${id}`);
+      await sleep(1000);
+
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Fail-${id}"`,
+        `  agent: "test-fail-${id}"`,
+        `  task: "Do something impossible"`,
+        `Do not do anything else. Just call the subagent tool once.`,
+        `After you receive the subagent result (even if it failed), say FAILURE_HANDLED.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task);
+
+      const screen = await waitForScreen(
+        surface,
+        /FAILURE_HANDLED|failed \(exit code|Sub-agent.*"Fail-/i,
+        PI_TIMEOUT,
+      );
+      assert.ok(
+        /FAILURE_HANDLED|failed \(exit code/i.test(screen),
+        `Outer pi should receive subagent failure notification`,
+      );
     });
 
     // ── In-progress activity snapshots ──

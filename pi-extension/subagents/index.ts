@@ -1295,11 +1295,11 @@ function resolveRunningByName(name: string):
 function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string, options?: { sessionFile?: string }) => void = sendCommand,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
-    send(running.surface, flattened);
+    send(running.surface, flattened, { sessionFile: running.sessionFile });
     return { ok: true };
   } catch (error: any) {
     return {
@@ -1520,7 +1520,11 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent";
   const logFile = join(artifactDir, "subagent-logs", `${safeLogName}-${id}.log`);
-  const surface = options?.surface ?? createSurface(params.name, { id, logPath: logFile });
+  const surface = options?.surface ?? createSurface(params.name, {
+    id,
+    logPath: logFile,
+    sessionFile: subagentSessionFile,
+  });
   if (!surfacePreCreated && !surface.startsWith("bg:")) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
@@ -2490,6 +2494,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const surface = createSurface(name, {
           id,
           logPath: join(parentArtifactDir, "subagent-logs", `${resumeLogName}-${id}.log`),
+          sessionFile: sessionPath,
         });
         if (!surface.startsWith("bg:")) {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));

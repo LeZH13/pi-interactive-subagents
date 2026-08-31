@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   createSubagentActivityRecorder,
   type SubagentTelemetry,
@@ -276,6 +276,30 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let steerInterval: ReturnType<typeof setInterval> | null = null;
+
+  function checkPendingSteerMessage(): void {
+    const sessionFile = process.env.PI_SUBAGENT_SESSION;
+    if (!sessionFile) return;
+    const steerFile = `${sessionFile}.steer`;
+    if (!existsSync(steerFile)) return;
+    let message = "";
+    try {
+      message = readFileSync(steerFile, "utf8").trim();
+      unlinkSync(steerFile);
+    } catch {}
+    if (message) {
+      pi.sendMessage(
+        {
+          customType: "subagent_steer",
+          content: message,
+          display: true,
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    }
+  }
+
   // Set when ask_question is called; suppresses auto-exit so the session stays
   // open while it waits for the orchestrator's reply. Cleared when the reply
   // lands — on `input` (covers a reply steered into the current run) and on
@@ -290,6 +314,13 @@ export default function (pi: ExtensionAPI) {
     denied = parseDeniedTools(deniedToolsValue);
 
     renderWidget(ctx, null);
+
+    if (!steerInterval) {
+      steerInterval = setInterval(checkPendingSteerMessage, 500);
+      if (typeof steerInterval?.unref === "function") {
+        steerInterval.unref();
+      }
+    }
   });
 
   pi.on("input", () => {
@@ -422,6 +453,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    if (steerInterval) {
+      clearInterval(steerInterval);
+      steerInterval = null;
+    }
     recorder.sessionShutdown((event as any).reason);
   });
 

@@ -220,6 +220,7 @@ interface BackgroundSurface {
   child: ChildProcess | null;
   exitCode: number | null;
   logPath: string;
+  sessionFile?: string;
 }
 
 const backgroundSurfaces = new Map<string, BackgroundSurface>();
@@ -235,14 +236,14 @@ function isBackgroundSurface(surface: string): boolean {
  */
 export function createSurface(
   name: string,
-  options?: { id?: string; logPath?: string },
+  options?: { id?: string; logPath?: string; sessionFile?: string },
 ): string {
   if (!isMultiplexingActive()) {
     const id = options?.id ?? `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
     const surface = `bg:${id}`;
     const logPath = options?.logPath ?? join(tmpdir(), "pi-subagent-logs", `${name}-${id}.log`);
     mkdirSync(dirname(logPath), { recursive: true });
-    backgroundSurfaces.set(surface, { child: null, exitCode: null, logPath });
+    backgroundSurfaces.set(surface, { child: null, exitCode: null, logPath, sessionFile: options?.sessionFile });
     return surface;
   }
   const target = process.env.TMUX_PANE;
@@ -290,16 +291,25 @@ export function createSurfaceSplit(
  * Typed literally (`-l`) so special characters are not interpreted as keys,
  * then submitted with Enter.
  */
-export function sendCommand(surface: string, command: string): void {
+export function sendCommand(
+  surface: string,
+  command: string,
+  options?: { sessionFile?: string },
+): void {
   if (isBackgroundSurface(surface)) {
     const record = backgroundSurfaces.get(surface);
-    if (!record?.child?.stdin || record.child.stdin.destroyed) {
-      throw new Error(`Background surface ${surface} is not accepting input`);
+    const sessionFile = options?.sessionFile ?? record?.sessionFile;
+    if (sessionFile) {
+      writeFileSync(`${sessionFile}.steer`, command + "\n", "utf8");
     }
-    record.child.stdin.write(command + "\n");
     return;
   }
   requireTmux();
+  if (options?.sessionFile) {
+    try {
+      writeFileSync(`${options.sessionFile}.steer`, command + "\n", "utf8");
+    } catch {}
+  }
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
 }
@@ -344,7 +354,7 @@ export function sendLongCommand(
     if (!record) throw new Error(`Unknown background surface: ${surface}`);
     const logFd = openSync(record.logPath, "a");
     const child = spawn("bash", [scriptPath], {
-      stdio: ["pipe", logFd, logFd],
+      stdio: ["ignore", logFd, logFd],
     });
     closeSync(logFd);
     record.child = child;

@@ -6,7 +6,7 @@
  * No LLM calls — fast and free.
  *
  * Run inside tmux:
- *   tmux new 'npm run test:integration'
+ *   tmux new 'npm run test:tmux'
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
