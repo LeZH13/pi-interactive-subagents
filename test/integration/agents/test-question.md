@@ -1,7 +1,7 @@
 ---
 name: test-question
 description: Integration test agent — asks its parent a question and continues after the reply
-model: openrouter/deepseek/deepseek-v4-flash-073
+model: openrouter/deepseek/deepseek-v4-flash-0731
 tools: read, bash, write, edit
 spawning: false
 auto-exit: true

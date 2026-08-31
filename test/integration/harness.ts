@@ -23,7 +23,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
-  isMuxAvailable,
+  isTmuxAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -68,7 +68,7 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used by both orchestrators and child agents. Override with PI_TEST_MODEL. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/deepseek/deepseek-v4-flash-073";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/deepseek/deepseek-v4-flash-0731";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
@@ -80,7 +80,7 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
  * Returns ["tmux"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  return isTmuxAvailable() ? ["tmux"] : [];
 }
 
 export function focusSurface(surface: string): void {

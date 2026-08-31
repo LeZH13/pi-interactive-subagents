@@ -166,6 +166,33 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
+## Multiplexing & Background Mode
+
+By default, subagents run in dedicated tmux split panes when running inside tmux. You can switch to running subagents silently in the background:
+
+### Toggle Command (`/subagent-mux`)
+
+| Command | Description |
+| --- | --- |
+| `/subagent-mux` (or `/subagent-mux toggle`) | Toggle multiplexing on/off for the active session |
+| `/subagent-mux off` | Disable pane splits; run subagents as silent background processes |
+| `/subagent-mux on` | Enable tmux pane splitting (when inside tmux) |
+| `/subagent-mux status` | Display the current multiplexing state and tmux detection |
+
+- **Automatic Fallback**: If pi is started outside of tmux, subagents automatically run in silent background mode without erroring.
+- **Log Files**: When running in the background, subagent output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.log`.
+
+### Configuration
+
+Configure defaults via `config.json` (or environment variables `PI_SUBAGENT_MULTIPLEX=0|1` and `PI_SUBAGENT_DISABLE_TMUX=1`):
+
+```json
+{
+  "status": { "enabled": true },
+  "multiplexing": { "enabled": true }
+}
+```
+
 ## Status widget & configuration
 
 The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.

@@ -10,11 +10,20 @@
  * the parent pi's pane (`$TMUX_PANE`) so they follow the agent rather than
  * the user's focus.
  */
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 
@@ -47,12 +56,91 @@ export function isTmuxAvailable(): boolean {
   return !!process.env.TMUX && hasCommand("tmux");
 }
 
+export interface MultiplexingConfig {
+  enabled: boolean;
+}
+
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
+
+export function parseMultiplexingConfig(raw: unknown, source = "config.json"): MultiplexingConfig {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`Invalid subagent multiplexing config in ${source}: root must be an object`);
+  }
+  const multiplexing = (raw as Record<string, unknown>).multiplexing;
+  if (multiplexing === undefined) return { enabled: true };
+  if (multiplexing == null || typeof multiplexing !== "object" || Array.isArray(multiplexing)) {
+    throw new Error(`Invalid subagent multiplexing config in ${source}: multiplexing must be an object`);
+  }
+  const keys = Object.keys(multiplexing as Record<string, unknown>);
+  const unsupported = keys.filter((key) => key !== "enabled");
+  if (unsupported.length) {
+    throw new Error(`Invalid subagent multiplexing config in ${source}: multiplexing has unsupported key(s): ${unsupported.join(", ")}`);
+  }
+  const enabled = (multiplexing as Record<string, unknown>).enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error(`Invalid subagent multiplexing config in ${source}: multiplexing.enabled must be a boolean`);
+  }
+  return { enabled };
+}
+
+export function loadMultiplexingConfig(
+  configPath = DEFAULT_CONFIG_PATH,
+  examplePath = EXAMPLE_CONFIG_PATH,
+): MultiplexingConfig {
+  let source = configPath;
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    source = examplePath;
+    raw = readFileSync(examplePath, "utf8");
+  }
+  try {
+    return parseMultiplexingConfig(JSON.parse(raw), source);
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error(`Invalid JSON in subagent config ${source}: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
+export function resolveMultiplexingEnabled(
+  configured: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (env.PI_SUBAGENT_DISABLE_TMUX === "1") return false;
+  if (env.PI_SUBAGENT_MULTIPLEX === "0") return false;
+  if (env.PI_SUBAGENT_MULTIPLEX === "1") return true;
+  return configured;
+}
+
+let multiplexingEnabled =
+  resolveMultiplexingEnabled(loadMultiplexingConfig().enabled) && isTmuxAvailable();
+
+/** The requested session setting. Effective pane use also requires tmux. */
+export function isMultiplexingEnabled(): boolean {
+  return multiplexingEnabled;
+}
+
+export function setMultiplexingEnabled(enabled: boolean): void {
+  multiplexingEnabled = enabled;
+}
+
+export function isMultiplexingActive(): boolean {
+  return multiplexingEnabled && isTmuxAvailable();
+}
+
+/** A process-backed surface is always available, even outside tmux. */
 export function isMuxAvailable(): boolean {
-  return isTmuxAvailable();
+  return true;
 }
 
 export function muxSetupHint(): string {
-  return "Start pi inside tmux (`tmux new -A -s pi 'pi'`).";
+  return "Start pi inside tmux (`tmux new -A -s pi 'pi'`) or use silent background mode.";
 }
 
 function requireTmux(): void {
@@ -128,16 +216,35 @@ function rebalanceSurfaces(hintPane?: string): void {
 
 // ── Surface primitives ──
 
+interface BackgroundSurface {
+  child: ChildProcess | null;
+  exitCode: number | null;
+  logPath: string;
+}
+
+const backgroundSurfaces = new Map<string, BackgroundSurface>();
+
+function isBackgroundSurface(surface: string): boolean {
+  return surface.startsWith("bg:");
+}
+
 /**
- * Create a new pane for a subagent. Square/landscape windows split to the
- * right; portrait windows split downward. New panes follow the parent pi pane
- * rather than the user's focus.
- * See https://github.com/HazAT/pi-interactive-subagents/issues/12
- *
- * Returns the new pane id (e.g. `%12`).
+ * Create a pane when multiplexing is active, otherwise allocate a process
+ * surface. Process surfaces are launched by sendLongCommand once its script
+ * has been written.
  */
-export function createSurface(name: string): string {
-  void name; // tmux panes are not named; the pi process inside shows its own title.
+export function createSurface(
+  name: string,
+  options?: { id?: string; logPath?: string },
+): string {
+  if (!isMultiplexingActive()) {
+    const id = options?.id ?? `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    const surface = `bg:${id}`;
+    const logPath = options?.logPath ?? join(tmpdir(), "pi-subagent-logs", `${name}-${id}.log`);
+    mkdirSync(dirname(logPath), { recursive: true });
+    backgroundSurfaces.set(surface, { child: null, exitCode: null, logPath });
+    return surface;
+  }
   const target = process.env.TMUX_PANE;
   const direction = target && windowLayout(target) === "even-vertical" ? "down" : "right";
   return createSurfaceSplit(name, direction, target);
@@ -184,6 +291,14 @@ export function createSurfaceSplit(
  * then submitted with Enter.
  */
 export function sendCommand(surface: string, command: string): void {
+  if (isBackgroundSurface(surface)) {
+    const record = backgroundSurfaces.get(surface);
+    if (!record?.child?.stdin || record.child.stdin.destroyed) {
+      throw new Error(`Background surface ${surface} is not accepting input`);
+    }
+    record.child.stdin.write(command + "\n");
+    return;
+  }
   requireTmux();
   execFileSync("tmux", ["send-keys", "-t", surface, "-l", command], { encoding: "utf8" });
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { encoding: "utf8" });
@@ -223,7 +338,28 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+
+  if (isBackgroundSurface(surface)) {
+    const record = backgroundSurfaces.get(surface);
+    if (!record) throw new Error(`Unknown background surface: ${surface}`);
+    const logFd = openSync(record.logPath, "a");
+    const child = spawn("bash", [scriptPath], {
+      stdio: ["pipe", logFd, logFd],
+    });
+    closeSync(logFd);
+    record.child = child;
+    child.once("exit", (code) => {
+      record.exitCode = code ?? 1;
+    });
+    child.once("error", (error) => {
+      record.exitCode = 1;
+      try {
+        writeFileSync(record.logPath, `Failed to launch background subagent: ${error.message}\n`, { flag: "a" });
+      } catch {}
+    });
+  } else {
+    sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  }
   return scriptPath;
 }
 
@@ -232,6 +368,11 @@ export function sendLongCommand(
  * callers can match logical output even when a pane is narrow.
  */
 export function readScreen(surface: string, lines = 50): string {
+  if (isBackgroundSurface(surface)) {
+    const record = backgroundSurfaces.get(surface);
+    if (!record || !existsSync(record.logPath)) return "";
+    return readFileSync(record.logPath, "utf8").split("\n").slice(-Math.max(1, lines) - 1).join("\n");
+  }
   requireTmux();
   return execFileSync(
     "tmux",
@@ -246,6 +387,7 @@ export function readScreen(surface: string, lines = 50): string {
  * Read the screen contents of a pane (async), joining terminal-wrapped rows.
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
+  if (isBackgroundSurface(surface)) return readScreen(surface, lines);
   requireTmux();
   const { stdout } = await execFileAsync(
     "tmux",
@@ -259,9 +401,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  * Close a pane.
  */
 export function closeSurface(surface: string): void {
+  if (isBackgroundSurface(surface)) {
+    const record = backgroundSurfaces.get(surface);
+    if (record?.child && record.exitCode === null && record.child.exitCode === null) {
+      record.child.kill("SIGTERM");
+    }
+    backgroundSurfaces.delete(surface);
+    return;
+  }
   requireTmux();
   execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
   rebalanceSurfaces();
+}
+
+export function getBackgroundSurfaceLogPath(surface: string): string | undefined {
+  return backgroundSurfaces.get(surface)?.logPath;
+}
+
+export function closeAllBackgroundSurfaces(): void {
+  for (const surface of [...backgroundSurfaces.keys()]) closeSurface(surface);
 }
 
 // ── Exit polling ──
@@ -340,7 +498,7 @@ export async function pollForExit(
       } catch {}
     }
 
-    // Slow path: read terminal screen for sentinel (crash detection)
+    // Slow path: read terminal/log output for the shell sentinel.
     try {
       const screen = await readScreenAsync(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
@@ -358,6 +516,16 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+    }
+
+    // A background child can terminate before writing any sidecar or sentinel
+    // (for example, if bash itself cannot start the command).
+    if (isBackgroundSurface(surface)) {
+      const record = backgroundSurfaces.get(surface);
+      const exitCode = record?.exitCode ?? record?.child?.exitCode;
+      if (exitCode !== null && exitCode !== undefined) {
+        return { reason: "sentinel", exitCode };
       }
     }
 

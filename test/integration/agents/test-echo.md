@@ -1,7 +1,7 @@
 ---
 name: test-echo
 description: Integration test agent — completes simple file-writing tasks
-model: openrouter/deepseek/deepseek-v4-flash-073
+model: openrouter/deepseek/deepseek-v4-flash-0731
 tools: read, bash, write, edit
 spawning: false
 auto-exit: true

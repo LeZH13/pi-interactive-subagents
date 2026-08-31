@@ -41,7 +41,21 @@ import {
   isExtensionContextFile,
 } from "../pi-extension/subagents/session.ts";
 
-import { layoutForDimensions, shellEscape } from "../pi-extension/subagents/tmux.ts";
+import {
+  closeSurface,
+  createSurface,
+  getBackgroundSurfaceLogPath,
+  isMultiplexingEnabled,
+  layoutForDimensions,
+  loadMultiplexingConfig,
+  parseMultiplexingConfig,
+  pollForExit,
+  readScreen,
+  resolveMultiplexingEnabled,
+  sendLongCommand,
+  setMultiplexingEnabled,
+  shellEscape,
+} from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -2472,6 +2486,31 @@ describe("tmux.ts interpretExitSidecar", () => {
 describe("commands", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("registers /subagent-mux with completions and toggles session state", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const command = registeredCommands.find((item) => item.name === "subagent-mux");
+    assert.ok(command);
+    assert.deepEqual(command.getArgumentCompletions("").map((item: any) => item.value), [
+      "on", "off", "status", "toggle",
+    ]);
+
+    const notices: string[] = [];
+    const ctx = { ui: { notify(message: string) { notices.push(message); } } };
+    const previous = isMultiplexingEnabled();
+    try {
+      await command.handler("off", ctx);
+      assert.equal(isMultiplexingEnabled(), false);
+      assert.equal(notices.at(-1), "Subagent multiplexing: OFF (silent background)");
+      await command.handler("toggle", ctx);
+      assert.equal(isMultiplexingEnabled(), true);
+      await command.handler("status", ctx);
+      assert.match(notices.at(-1)!, /tmux detected: (YES|NO)/);
+    } finally {
+      setMultiplexingEnabled(previous);
+    }
+  });
+
   it("/subagent completes agent names for empty and partial prefixes", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -3790,6 +3829,57 @@ describe("subagent display helpers", () => {
 });
 
 describe("tmux.ts", () => {
+  describe("multiplexing configuration", () => {
+    it("parses config and applies environment overrides", () => {
+      assert.deepEqual(parseMultiplexingConfig({ status: { enabled: true } }), { enabled: true });
+      assert.deepEqual(parseMultiplexingConfig({ multiplexing: { enabled: false } }), { enabled: false });
+      assert.equal(resolveMultiplexingEnabled(true, { PI_SUBAGENT_MULTIPLEX: "0" }), false);
+      assert.equal(resolveMultiplexingEnabled(false, { PI_SUBAGENT_MULTIPLEX: "1" }), true);
+      assert.equal(resolveMultiplexingEnabled(true, {
+        PI_SUBAGENT_MULTIPLEX: "1",
+        PI_SUBAGENT_DISABLE_TMUX: "1",
+      }), false);
+      assert.throws(
+        () => parseMultiplexingConfig({ multiplexing: { enabled: "yes" } }),
+        /multiplexing\.enabled must be a boolean/,
+      );
+    });
+
+    it("loads multiplexing from config files", () => {
+      withTempDir((dir) => {
+        const configPath = join(dir, "config.json");
+        const examplePath = join(dir, "config.json.example");
+        writeFileSync(examplePath, JSON.stringify({ multiplexing: { enabled: true } }));
+        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: true });
+        writeFileSync(configPath, JSON.stringify({ multiplexing: { enabled: false } }));
+        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: false });
+      });
+    });
+
+    it("runs and logs a process-backed surface", async () => {
+      await withTempDir(async (dir) => {
+        const previous = isMultiplexingEnabled();
+        setMultiplexingEnabled(false);
+        const logPath = join(dir, "artifacts", "session", "subagent-logs", "worker-test.log");
+        const surface = createSurface("worker", { id: "test", logPath });
+        try {
+          assert.equal(surface, "bg:test");
+          assert.equal(getBackgroundSurfaceLogPath(surface), logPath);
+          sendLongCommand(surface, "echo BACKGROUND_OK; exit 0", {
+            scriptPath: join(dir, "launch.sh"),
+          });
+          const result = await pollForExit(surface, new AbortController().signal, { interval: 10 });
+          assert.equal(result.exitCode, 0);
+          assert.match(readScreen(surface), /BACKGROUND_OK/);
+          assert.match(readFileSync(logPath, "utf8"), /BACKGROUND_OK/);
+        } finally {
+          closeSurface(surface);
+          setMultiplexingEnabled(previous);
+        }
+      });
+    });
+  });
+
   describe("layoutForDimensions", () => {
     it("uses equal columns for physically landscape windows", () => {
       assert.equal(layoutForDimensions(240, 90), "even-horizontal");

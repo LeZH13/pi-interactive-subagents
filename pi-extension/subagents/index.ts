@@ -17,6 +17,10 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
+  isTmuxAvailable,
+  isMultiplexingEnabled,
+  isMultiplexingActive,
+  setMultiplexingEnabled,
   createSurface,
   sendCommand,
   sendLongCommand,
@@ -24,6 +28,8 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  getBackgroundSurfaceLogPath,
+  closeAllBackgroundSurfaces,
 } from "./tmux.ts";
 
 import {
@@ -815,6 +821,7 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  logFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -1281,7 +1288,7 @@ function resolveRunningByName(name: string):
 }
 
 /**
- * Type a follow-up message into a running subagent's live pane. Newlines are
+ * Type a follow-up message into a running subagent's live surface. Newlines are
  * collapsed to spaces because each newline submits a turn in the child's TUI
  * editor; a multi-line message would otherwise fire as several partial turns.
  */
@@ -1297,7 +1304,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}": ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1506,8 +1513,15 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  const safeLogName = (params.name || "subagent")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "subagent";
+  const logFile = join(artifactDir, "subagent-logs", `${safeLogName}-${id}.log`);
+  const surface = options?.surface ?? createSurface(params.name, { id, logPath: logFile });
+  if (!surfacePreCreated && !surface.startsWith("bg:")) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -1601,6 +1615,7 @@ async function launchSubagent(
       startTime,
       sessionFile: subagentSessionFile,
       launchScriptFile,
+      logFile: getBackgroundSurfaceLogPath(surface),
       cli: "claude",
       sentinelFile,
       interactive: effectiveInteractive,
@@ -1743,6 +1758,7 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    logFile: getBackgroundSurfaceLogPath(surface),
     activityFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
@@ -1975,7 +1991,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (moduleAbort) moduleAbort.abort();
     for (const [_id, agent] of runningSubagents) {
       agent.abortController?.abort();
+      try { closeSurface(agent.surface); } catch {}
     }
+    closeAllBackgroundSurfaces();
     runningSubagents.clear();
   });
 
@@ -2196,6 +2214,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
+            ...(running.logFile ? { logFile: running.logFile } : {}),
             status: "started",
           },
         };
@@ -2462,8 +2481,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        const resumeLogName = name
+          .toLowerCase()
+          .replace(/[^a-z0-9\s-]/g, "")
+          .replace(/\s+/g, "-")
+          .replace(/-+/g, "-")
+          .replace(/^-|-$/g, "") || "resume";
+        const surface = createSurface(name, {
+          id,
+          logPath: join(parentArtifactDir, "subagent-logs", `${resumeLogName}-${id}.log`),
+        });
+        if (!surface.startsWith("bg:")) {
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        }
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(sessionPath)];
@@ -2556,6 +2586,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           startTime,
           sessionFile: sessionPath,
           launchScriptFile,
+          logFile: getBackgroundSurfaceLogPath(surface),
           activityFile,
           interactive,
           statusState: createStatusState({
@@ -2627,11 +2658,52 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             sessionId: resumedSessionId,
             sessionFile: sessionPath,
             launchScriptFile,
+            ...(running.logFile ? { logFile: running.logFile } : {}),
             status: "started",
           },
         };
       },
     });
+
+  // /subagent-mux — switch between tmux panes and silent process surfaces.
+  pi.registerCommand("subagent-mux", {
+    description: "Control subagent multiplexing: /subagent-mux [on|off|status|toggle]",
+    getArgumentCompletions: (prefix: string) => {
+      const choices = ["on", "off", "status", "toggle"];
+      const value = prefix.trim().toLowerCase();
+      return choices
+        .filter((choice) => choice.startsWith(value))
+        .map((choice) => ({ value: choice, label: choice }));
+    },
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase() || "toggle";
+      if (!["on", "off", "status", "toggle"].includes(action)) {
+        ctx.ui.notify("Usage: /subagent-mux [on|off|status|toggle]", "warning");
+        return;
+      }
+
+      if (action === "status") {
+        const active = isMultiplexingActive();
+        ctx.ui.notify(
+          `Subagent multiplexing: ${active ? "ON (tmux panes)" : "OFF (silent background)"}\n` +
+            `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
+            `session preference: ${isMultiplexingEnabled() ? "ON" : "OFF"}`,
+          "info",
+        );
+        return;
+      }
+
+      if (action === "on") setMultiplexingEnabled(true);
+      else if (action === "off") setMultiplexingEnabled(false);
+      else setMultiplexingEnabled(!isMultiplexingEnabled());
+
+      const active = isMultiplexingActive();
+      ctx.ui.notify(
+        `Subagent multiplexing: ${active ? "ON (tmux panes)" : "OFF (silent background)"}`,
+        "info",
+      );
+    },
+  });
 
   // /subagent command — spawn a subagent by name with optional model/thinking overrides
   pi.registerCommand("subagent", {
