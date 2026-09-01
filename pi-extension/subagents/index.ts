@@ -1535,6 +1535,7 @@ async function launchSubagent(
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
       parentSessionFile: sessionFile,
+      parentLeafId: ctx.sessionManager.getLeafId(),
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
     });

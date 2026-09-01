@@ -29,40 +29,87 @@ export interface MessageEntry extends SessionEntry {
   message: {
     role: "user" | "assistant" | "toolResult";
     content: Array<{ type: string; text?: string; [key: string]: unknown }>;
+    toolCallId?: string;
   };
 }
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
-function getForkContentLines(parentSessionFile: string): string[] {
-  const raw = readFileSync(parentSessionFile, "utf8");
-  const lines = raw.split("\n").filter((line) => line.trim());
+function getForkContentLines(parentSessionFile: string, parentLeafId: string | null): string[] {
+  const entries = readFileSync(parentSessionFile, "utf8")
+    .split("\n")
+    .filter((line) => line.trim())
+    .map((line) => JSON.parse(line) as SessionEntry)
+    .filter((entry) => entry.type !== "session");
 
-  let truncateAt = lines.length;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    try {
-      const entry = JSON.parse(lines[i]);
-      if (entry.type === "message" && entry.message?.role === "user") {
-        truncateAt = i;
-        break;
-      }
-    } catch {
-      // ignore malformed lines
+  if (parentLeafId === null) return [];
+
+  const byId = new Map(entries.map((entry) => [entry.id, entry]));
+  const branch: SessionEntry[] = [];
+  const visited = new Set<string>();
+  let cursor: string | null | undefined = parentLeafId;
+
+  while (cursor) {
+    if (visited.has(cursor)) {
+      throw new Error(`Cycle detected in parent session branch at ${cursor}`);
     }
+    visited.add(cursor);
+
+    const entry = byId.get(cursor);
+    if (!entry) {
+      throw new Error(`Parent session leaf or ancestor not found: ${cursor}`);
+    }
+    branch.unshift(entry);
+    cursor = entry.parentId;
   }
 
-  return lines.slice(0, truncateAt).filter((line) => {
-    try {
-      return JSON.parse(line).type !== "session";
-    } catch {
-      return true;
+  // The spawning assistant message is already persisted before tool execution,
+  // but its subagent call (and any parallel siblings) have no tool results yet.
+  // Providers reject those orphan calls. Preserve every completed call in the
+  // resolved branch and strip only calls that do not yet have a result.
+  const completedToolCallIds = new Set(
+    branch
+      .filter((entry): entry is MessageEntry => entry.type === "message")
+      .filter((entry) => entry.message.role === "toolResult")
+      .map((entry) => entry.message.toolCallId)
+      .filter((id): id is string => typeof id === "string"),
+  );
+
+  const removedParents = new Map<string, string | null | undefined>();
+  const sanitized: SessionEntry[] = [];
+
+  for (const entry of branch) {
+    let next = structuredClone(entry);
+    if (next.type === "message") {
+      const messageEntry = next as MessageEntry;
+      if (messageEntry.message.role === "assistant") {
+        messageEntry.message.content = messageEntry.message.content.filter(
+          (block) =>
+            block.type !== "toolCall" ||
+            (typeof block.id === "string" && completedToolCallIds.has(block.id)),
+        );
+        if (messageEntry.message.content.length === 0) {
+          removedParents.set(next.id, next.parentId);
+          continue;
+        }
+      }
     }
-  });
+
+    let parentId = next.parentId;
+    while (parentId && removedParents.has(parentId)) {
+      parentId = removedParents.get(parentId);
+    }
+    next = { ...next, parentId };
+    sanitized.push(next);
+  }
+
+  return sanitized.map((entry) => JSON.stringify(entry));
 }
 
 export function seedSubagentSessionFile(params: {
   mode: SeededSubagentSessionMode;
   parentSessionFile: string;
+  parentLeafId: string | null;
   childSessionFile: string;
   childCwd: string;
 }): void {
@@ -75,7 +122,7 @@ export function seedSubagentSessionFile(params: {
     parentSession: params.parentSessionFile,
   };
   const contentLines =
-    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+    params.mode === "fork" ? getForkContentLines(params.parentSessionFile, params.parentLeafId) : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });

@@ -594,6 +594,7 @@ describe("session.ts", () => {
       seedSubagentSessionFile({
         mode: "lineage-only",
         parentSessionFile: parentFile,
+        parentLeafId: ASSISTANT_MSG.id,
         childSessionFile: childFile,
         childCwd: "/tmp/child-cwd",
       });
@@ -607,13 +608,33 @@ describe("session.ts", () => {
       assert.equal(header.cwd, "/tmp/child-cwd");
     });
 
-    it("creates a forked child session with copied context before the triggering user turn", () => {
-      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+    it("creates a forked child session from the complete active branch", () => {
+      const abandonedUser = {
+        type: "message",
+        id: "user-abandoned",
+        parentId: ASSISTANT_MSG.id,
+        message: { role: "user", content: [{ type: "text", text: "Abandoned branch" }] },
+      };
+      const activeUser = {
+        type: "message",
+        id: "user-active",
+        parentId: ASSISTANT_MSG.id,
+        message: { role: "user", content: [{ type: "text", text: "Active branch" }] },
+      };
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+        abandonedUser,
+        activeUser,
+      ]);
       const childFile = join(dir, "fork-child.jsonl");
 
       seedSubagentSessionFile({
         mode: "fork",
         parentSessionFile: parentFile,
+        parentLeafId: activeUser.id,
         childSessionFile: childFile,
         childCwd: "/tmp/fork-child-cwd",
       });
@@ -622,13 +643,120 @@ describe("session.ts", () => {
         .trim()
         .split("\n")
         .map((line) => JSON.parse(line));
-      assert.equal(entries.length, 2);
       assert.equal(entries[0].type, "session");
       assert.equal(entries[0].parentSession, parentFile);
       assert.equal(entries[0].cwd, "/tmp/fork-child-cwd");
-      assert.equal(entries[1].type, "model_change");
-      assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
-      assert.equal(entries.some((entry) => entry.type === "message"), false);
+      assert.deepEqual(
+        entries.slice(1).map((entry) => entry.id),
+        [MODEL_CHANGE.id, USER_MSG.id, ASSISTANT_MSG.id, activeUser.id],
+      );
+      assert.equal(entries.some((entry) => entry.id === abandonedUser.id), false);
+    });
+
+    it("keeps current-turn tool answers while stripping unresolved spawning calls", () => {
+      const questionCall = {
+        type: "message",
+        id: "asst-question",
+        parentId: USER_MSG.id,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Choose the review mode." },
+            { type: "toolCall", id: "question-call", name: "ask_user_question", arguments: {} },
+          ],
+        },
+      };
+      const questionResult = {
+        type: "message",
+        id: "question-result",
+        parentId: questionCall.id,
+        message: {
+          role: "toolResult",
+          toolCallId: "question-call",
+          toolName: "ask_user_question",
+          content: [{ type: "text", text: "User selected fork mode." }],
+        },
+      };
+      const spawningAssistant = {
+        type: "message",
+        id: "asst-spawning",
+        parentId: questionResult.id,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "Consult the advisor." },
+            { type: "toolCall", id: "spawn-call", name: "subagent", arguments: {} },
+            { type: "toolCall", id: "sibling-call", name: "read", arguments: {} },
+          ],
+        },
+      };
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        questionCall,
+        questionResult,
+        spawningAssistant,
+      ]);
+      const childFile = join(dir, "fork-current-turn.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        parentLeafId: spawningAssistant.id,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-current-turn",
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      const copiedQuestion = entries.find((entry) => entry.id === questionCall.id);
+      const copiedSpawn = entries.find((entry) => entry.id === spawningAssistant.id);
+
+      assert.ok(entries.some((entry) => entry.id === USER_MSG.id), "current user turn should be copied");
+      assert.ok(entries.some((entry) => entry.id === questionResult.id), "current-turn tool result should be copied");
+      assert.deepEqual(copiedQuestion.message.content.map((block: any) => block.type), ["text", "toolCall"]);
+      assert.deepEqual(copiedSpawn.message.content.map((block: any) => block.type), ["thinking"]);
+      assert.equal(
+        entries.some((entry) =>
+          entry.message?.content?.some((block: any) => block.id === "spawn-call" || block.id === "sibling-call"),
+        ),
+        false,
+      );
+    });
+
+    it("drops an assistant turn containing only unresolved calls", () => {
+      const spawningAssistant = {
+        type: "message",
+        id: "asst-only-spawn",
+        parentId: USER_MSG.id,
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "spawn-only-call", name: "subagent", arguments: {} }],
+        },
+      };
+      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, spawningAssistant]);
+      const childFile = join(dir, "fork-empty-spawn.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        parentLeafId: spawningAssistant.id,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-empty-spawn",
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.deepEqual(
+        entries.slice(1).map((entry) => entry.id),
+        [MODEL_CHANGE.id, USER_MSG.id],
+      );
+      assert.equal(entries.at(-1).id, USER_MSG.id);
     });
   });
 
