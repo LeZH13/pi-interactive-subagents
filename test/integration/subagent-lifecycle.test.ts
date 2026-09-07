@@ -32,26 +32,32 @@ import {
   trackTempFile,
   readScreen,
   PI_TIMEOUT,
+  setSurfaceBackendPreference,
   type TestEnv,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping subagent lifecycle integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  neither tmux nor Herdr is available — skipping subagent lifecycle integration tests");
+  console.log("   Run inside tmux or Herdr to enable these tests.");
 }
 
 for (const backend of backends) {
   describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
     let env: TestEnv;
+    const oldBackend = process.env.PI_SUBAGENT_BACKEND;
 
     before(() => {
+      process.env.PI_SUBAGENT_BACKEND = backend;
+      setSurfaceBackendPreference(backend as any);
       env = createTestEnv();
     });
 
-    after(() => {
-      cleanupTestEnv(env);
+    after(async () => {
+      if (oldBackend !== undefined) process.env.PI_SUBAGENT_BACKEND = oldBackend;
+      else delete process.env.PI_SUBAGENT_BACKEND;
+      await cleanupTestEnv(env);
     });
 
     // ── Basic spawn + completion ──
@@ -61,7 +67,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-echo-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `echo-${id}`);
+      const surface = await createTrackedSurface(env, `echo-${id}`);
       await sleep(1000);
 
       const task = [
@@ -73,7 +79,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
@@ -111,7 +117,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-bg-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `bg-${id}`);
+      const surface = await createTrackedSurface(env, `bg-${id}`);
       await sleep(1000);
 
       const task = [
@@ -124,7 +130,7 @@ for (const backend of backends) {
       ].join("\n");
 
       // Pass PI_SUBAGENT_DISABLE_TMUX=1 to force silent background process mode
-      startPi(surface, env.dir, task, {
+      await startPi(surface, env.dir, task, {
         env: { PI_SUBAGENT_DISABLE_TMUX: "1" },
       });
 
@@ -165,7 +171,7 @@ for (const backend of backends) {
         ].join("\n"),
       );
 
-      const surface = createTrackedSurface(env, `fail-${id}`);
+      const surface = await createTrackedSurface(env, `fail-${id}`);
       await sleep(1000);
 
       const task = [
@@ -177,7 +183,7 @@ for (const backend of backends) {
         `After you receive the subagent result (even if it failed), say FAILURE_HANDLED.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       const screen = await waitForScreen(
         surface,
@@ -199,7 +205,7 @@ for (const backend of backends) {
       trackTempFile(env, startFile);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `status-${id}`);
+      const surface = await createTrackedSurface(env, `status-${id}`);
       await sleep(1000);
 
       const task = [
@@ -211,7 +217,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
       assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
@@ -220,7 +226,7 @@ for (const backend of backends) {
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
-      const watchdogScreen = readScreen(surface, 300);
+      const watchdogScreen = await readScreen(surface, 300);
       assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
@@ -232,7 +238,7 @@ for (const backend of backends) {
         PI_TIMEOUT,
         300,
       );
-      assert.ok(/STATUS_TEST_DONE|completed/i.test(completionScreen));
+      assert.ok(/STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i.test(completionScreen));
     });
 
     // ── Parallel subagent spawn ──
@@ -244,7 +250,7 @@ for (const backend of backends) {
       trackTempFile(env, fileA);
       trackTempFile(env, fileB);
 
-      const surface = createTrackedSurface(env, `parallel-${id}`);
+      const surface = await createTrackedSurface(env, `parallel-${id}`);
       await sleep(1000);
 
       const task = [
@@ -263,7 +269,7 @@ for (const backend of backends) {
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       // Both marker files should appear
       const [contentA, contentB] = await Promise.all([
@@ -284,7 +290,7 @@ for (const backend of backends) {
       trackTempFile(env, markerFile);
       trackTempFile(env, sessionPointerFile);
 
-      const surface = createTrackedSurface(env, `fork-${id}`);
+      const surface = await createTrackedSurface(env, `fork-${id}`);
       await sleep(1000);
 
       const childCommand =
@@ -299,7 +305,7 @@ for (const backend of backends) {
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
       assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
@@ -325,7 +331,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-question-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `question-${id}`);
+      const surface = await createTrackedSurface(env, `question-${id}`);
       await sleep(1000);
 
       const task = [
@@ -342,7 +348,7 @@ for (const backend of backends) {
         `Do not write ${markerFile} yourself.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /QUESTION_OK/);
       assert.ok(
@@ -358,7 +364,7 @@ for (const backend of backends) {
       const markerFile = `/tmp/pi-integ-discovery-${id}.txt`;
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `discovery-${id}`);
+      const surface = await createTrackedSurface(env, `discovery-${id}`);
       await sleep(1000);
 
       // Use subagents_list to verify test agents are discoverable,
@@ -372,7 +378,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
@@ -387,7 +393,7 @@ for (const backend of backends) {
       const markerFile = join(env.dir, relativeMarker);
       trackTempFile(env, markerFile);
 
-      const surface = createTrackedSurface(env, `cwd-${id}`);
+      const surface = await createTrackedSurface(env, `cwd-${id}`);
       await sleep(1000);
 
       const task = [
@@ -399,7 +405,7 @@ for (const backend of backends) {
         `Do not do anything else. Just call the subagent tool once.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      await startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /CWD_OK/);
       assert.ok(content.includes(`CWD_OK_${id}`), `cwd marker should exist in the requested directory`);

@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -52,10 +52,14 @@ import {
   pollForExit,
   readScreen,
   resolveMultiplexingEnabled,
+  resolveSurfaceBackend,
+  setSurfaceBackendPreference,
+  getSurfaceBackendPreference,
+  __surfaceTest__,
   sendLongCommand,
   setMultiplexingEnabled,
   shellEscape,
-} from "../pi-extension/subagents/tmux.ts";
+} from "../pi-extension/subagents/surface.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -85,7 +89,7 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import safeBashExtension, { isDangerous, DANGEROUS_PATTERNS } from "../pi-extension/subagents/tools/safe-bash.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/surface.ts";
 
 // --- Helpers ---
 
@@ -165,9 +169,17 @@ function withMockedNow<T>(now: number, fn: () => T): T {
   const originalNow = Date.now;
   Date.now = () => now;
   try {
-    return fn();
-  } finally {
+    const res = fn();
+    if (res && typeof (res as any).then === "function") {
+      return (res as any).finally(() => {
+        Date.now = originalNow;
+      });
+    }
     Date.now = originalNow;
+    return res;
+  } catch (err) {
+    Date.now = originalNow;
+    throw err;
   }
 }
 
@@ -2668,6 +2680,44 @@ describe("tmux.ts interpretExitSidecar", () => {
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
   });
 });
+
+describe("run-scoped completion records", () => {
+  it("ignores stale and malformed completion records until the matching run is published", async () => {
+    await withTempDir(async (dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const completionFile = `${sessionFile}.complete`;
+      const startedAt = Date.now();
+      writeFileSync(completionFile, JSON.stringify({ type: "completion", runId: "old", completedAt: startedAt }));
+      setTimeout(() => writeFileSync(completionFile, JSON.stringify({
+        type: "completion", runId: "run-new", completedAt: Date.now(), exitCode: 0,
+      })), 5);
+      const result = await pollForExit("bg:not-registered", new AbortController().signal, {
+        interval: 10, sessionFile, completionFile, runId: "run-new", startedAt,
+      });
+      assert.deepEqual(result, { reason: "done", exitCode: 0 });
+    });
+  });
+
+  it("prefers a matching rich error record over clean shutdown completion", async () => {
+    await withTempDir(async (dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      const startedAt = Date.now();
+      writeFileSync(`${sessionFile}.complete`, JSON.stringify({
+        type: "completion", runId: "run-error", completedAt: startedAt, exitCode: 0,
+      }));
+      writeFileSync(`${sessionFile}.exit`, JSON.stringify({
+        type: "error", runId: "run-error", createdAt: startedAt,
+        errorMessage: "provider unavailable", stopReason: "error",
+      }));
+      const result = await pollForExit("bg:not-registered", new AbortController().signal, {
+        interval: 5, sessionFile, completionFile: `${sessionFile}.complete`, runId: "run-error", startedAt,
+      });
+      assert.equal(result.reason, "error");
+      assert.equal(result.errorMessage, "provider unavailable");
+    });
+  });
+});
+
 describe("commands", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -2677,7 +2727,7 @@ describe("commands", () => {
     const command = registeredCommands.find((item) => item.name === "subagent-mux");
     assert.ok(command);
     assert.deepEqual(command.getArgumentCompletions("").map((item: any) => item.value), [
-      "on", "off", "status", "toggle",
+      "auto", "tmux", "herdr", "background", "on", "off", "status", "toggle",
     ]);
 
     const notices: string[] = [];
@@ -2686,11 +2736,12 @@ describe("commands", () => {
     try {
       await command.handler("off", ctx);
       assert.equal(isMultiplexingEnabled(), false);
-      assert.equal(notices.at(-1), "Subagent multiplexing: OFF (silent background)");
+      assert.match(notices.at(-1)!, /backend preference: background/);
       await command.handler("toggle", ctx);
       assert.equal(isMultiplexingEnabled(), true);
       await command.handler("status", ctx);
       assert.match(notices.at(-1)!, /tmux detected: (YES|NO)/);
+      assert.match(notices.at(-1)!, /Herdr detected: (YES|NO)/);
     } finally {
       setMultiplexingEnabled(previous);
     }
@@ -3566,13 +3617,26 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("queues rapid Pi steers as distinct atomic messages", () => {
+    const testApi = (subagentsModule as any).__test__;
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "child.jsonl");
+      testApi.enqueueSteerMessage(sessionFile, "first");
+      testApi.enqueueSteerMessage(sessionFile, "second");
+      const queueDir = `${sessionFile}.steer.d`;
+      const files = readdirSync(queueDir).sort();
+      assert.equal(files.length, 2);
+      assert.deepEqual(files.map((file: string) => JSON.parse(readFileSync(join(queueDir, file), "utf8")).message), ["first", "second"]);
+    });
+  });
+
+  it("steers a running subagent by typing into its pane (newlines flattened)", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
+    const result = await testApi.steerSubagent(running, "do this\nthen that", (surface: string, text: string) => {
       sentSurface = surface;
       sentText = text;
     });
@@ -3582,18 +3646,18 @@ describe("subagent interruption", () => {
     assert.equal(sentText, "do this then that");
   });
 
-  it("returns an explicit error when steering delivery fails", () => {
+  it("returns an explicit error when steering delivery fails", async () => {
     const testApi = (subagentsModule as any).__test__;
     const running = makeRunning();
 
-    const result = testApi.steerSubagent(running, "hi", () => {
+    const result = await testApi.steerSubagent(running, "hi", () => {
       throw new Error("mux write failed");
     });
 
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -3618,8 +3682,8 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
+      const result = await withMockedNow(20_000, async () =>
+        await testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
           sentSurface = surface;
           sentText = text;
         }),
@@ -3637,20 +3701,20 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -3673,8 +3737,8 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
+      const result = await withMockedNow(20_000, async () =>
+        await testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
           throw new Error("mux write failed");
         }),
       );
@@ -4126,8 +4190,9 @@ describe("subagent display helpers", () => {
 describe("tmux.ts", () => {
   describe("multiplexing configuration", () => {
     it("parses config and applies environment overrides", () => {
-      assert.deepEqual(parseMultiplexingConfig({ status: { enabled: true } }), { enabled: true });
-      assert.deepEqual(parseMultiplexingConfig({ multiplexing: { enabled: false } }), { enabled: false });
+      assert.deepEqual(parseMultiplexingConfig({ status: { enabled: true } }), { enabled: true, backend: "auto" });
+      assert.deepEqual(parseMultiplexingConfig({ multiplexing: { enabled: false } }), { enabled: false, backend: "background" });
+      assert.deepEqual(parseMultiplexingConfig({ multiplexing: { backend: "herdr" } }), { enabled: true, backend: "herdr" });
       assert.equal(resolveMultiplexingEnabled(true, { PI_SUBAGENT_MULTIPLEX: "0" }), false);
       assert.equal(resolveMultiplexingEnabled(false, { PI_SUBAGENT_MULTIPLEX: "1" }), true);
       assert.equal(resolveMultiplexingEnabled(true, {
@@ -4138,6 +4203,25 @@ describe("tmux.ts", () => {
         () => parseMultiplexingConfig({ multiplexing: { enabled: "yes" } }),
         /multiplexing\.enabled must be a boolean/,
       );
+      assert.throws(
+        () => parseMultiplexingConfig({ multiplexing: { backend: "zellij" } }),
+        /backend must be auto, tmux, herdr, or background/,
+      );
+    });
+
+    it("resolves auto deterministically and rejects ambiguous nested environments", () => {
+      assert.equal(resolveSurfaceBackend("auto", {}, { tmux: false, herdr: false }), "background");
+      assert.equal(resolveSurfaceBackend("auto", { TMUX: "x" }, { tmux: true, herdr: false }), "tmux");
+      assert.equal(resolveSurfaceBackend("auto", { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, { tmux: false, herdr: true }), "herdr");
+      assert.throws(
+        () => resolveSurfaceBackend("auto", { TMUX: "x", HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, { tmux: true, herdr: true }),
+        /Ambiguous nested terminal environment/,
+      );
+      assert.throws(
+        () => resolveSurfaceBackend("auto", { TMUX: "x", HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }, { tmux: false, herdr: false }),
+        /Ambiguous nested terminal environment/,
+      );
+      assert.equal(resolveSurfaceBackend("background", { TMUX: "x", HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1" }), "background");
     });
 
     it("loads multiplexing from config files", () => {
@@ -4145,9 +4229,52 @@ describe("tmux.ts", () => {
         const configPath = join(dir, "config.json");
         const examplePath = join(dir, "config.json.example");
         writeFileSync(examplePath, JSON.stringify({ multiplexing: { enabled: true } }));
-        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: true });
+        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: true, backend: "auto" });
         writeFileSync(configPath, JSON.stringify({ multiplexing: { enabled: false } }));
-        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: false });
+        assert.deepEqual(loadMultiplexingConfig(configPath, examplePath), { enabled: false, backend: "background" });
+      });
+    });
+
+    it("uses the documented Herdr CLI contract with explicit parent/no-focus and owned cleanup", async () => {
+      await withTempDir(async (dir) => {
+        const binDir = join(dir, "bin");
+        const log = join(dir, "args.log");
+        mkdirSync(binDir);
+        const cli = join(binDir, "herdr");
+        writeFileSync(cli, `#!/bin/sh\necho "$*" >> '${log}'\ncase "$1 $2" in\n  "pane split") echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;\n  "pane read") printf 'HERDR_OUTPUT\\n' ;;\n  *) echo '{"result":{}}' ;;\nesac\n`);
+        chmodSync(cli, 0o755);
+        const oldPath = process.env.PATH;
+        const oldEnv = process.env.HERDR_ENV;
+        const oldPane = process.env.HERDR_PANE_ID;
+        const oldPref = getSurfaceBackendPreference();
+        try {
+          process.env.PATH = `${binDir}:${oldPath}`;
+          process.env.HERDR_ENV = "1";
+          process.env.HERDR_PANE_ID = "w1:p1";
+          __surfaceTest__.resetCommandAvailability();
+          setSurfaceBackendPreference("herdr");
+          const surface = await createSurface("worker");
+          assert.equal(surface, "herdr:w1:p9");
+          await sendLongCommand(surface, "echo hello", { scriptPath: join(dir, "launch.sh") });
+          assert.match(await readScreen(surface), /HERDR_OUTPUT/);
+          await closeSurface(surface);
+          await closeSurface(surface); // idempotent: only an owned live pane is closed
+          const calls = readFileSync(log, "utf8").trim().split("\n");
+          assert.equal(calls[0], "pane split w1:p1 --direction right --no-focus");
+          assert.ok(calls.some((line) => line.startsWith("pane run w1:p9 bash ")));
+          assert.equal(calls.filter((line) => line === "pane close w1:p9").length, 1);
+          assert.equal(__surfaceTest__.cliTimeoutMs, 5_000);
+
+          writeFileSync(cli, "#!/bin/sh\necho 'not-json'\n");
+          chmodSync(cli, 0o755);
+          await assert.rejects(async () => await createSurface("bad-response"), /returned invalid JSON/);
+        } finally {
+          process.env.PATH = oldPath;
+          restoreEnvVar("HERDR_ENV", oldEnv);
+          restoreEnvVar("HERDR_PANE_ID", oldPane);
+          setSurfaceBackendPreference(oldPref);
+          __surfaceTest__.resetCommandAvailability();
+        }
       });
     });
 
@@ -4156,19 +4283,19 @@ describe("tmux.ts", () => {
         const previous = isMultiplexingEnabled();
         setMultiplexingEnabled(false);
         const logPath = join(dir, "artifacts", "session", "subagent-logs", "worker-test.log");
-        const surface = createSurface("worker", { id: "test", logPath });
+        const surface = await createSurface("worker", { id: "test", logPath });
         try {
           assert.equal(surface, "bg:test");
           assert.equal(getBackgroundSurfaceLogPath(surface), logPath);
-          sendLongCommand(surface, "echo BACKGROUND_OK; exit 0", {
+          await sendLongCommand(surface, "echo BACKGROUND_OK; exit 0", {
             scriptPath: join(dir, "launch.sh"),
           });
           const result = await pollForExit(surface, new AbortController().signal, { interval: 10 });
           assert.equal(result.exitCode, 0);
-          assert.match(readScreen(surface), /BACKGROUND_OK/);
+          assert.match(await readScreen(surface), /BACKGROUND_OK/);
           assert.match(readFileSync(logPath, "utf8"), /BACKGROUND_OK/);
         } finally {
-          closeSurface(surface);
+          await closeSurface(surface);
           setMultiplexingEnabled(previous);
         }
       });

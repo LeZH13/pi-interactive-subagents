@@ -1,12 +1,10 @@
 # pi-interactive-subagents
 
-Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
-
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux or [Herdr](https://herdr.dev/) panes, with a headless background mode. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own tmux pane, split from the parent pi pane without stealing keyboard focus. Square and landscape windows split to the right; portrait windows split downward. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs on the selected surface backend without stealing keyboard focus. tmux chooses a right/down split from window dimensions. Herdr uses a right split with the parent process's explicit `HERDR_PANE_ID` and `--no-focus` (never implicit focus or `--current`). A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ───────────────────────────────────────────────────────────── 2 running ─╮
@@ -166,32 +164,33 @@ subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipe
 
 Set a per-agent default with `cwd:` in frontmatter.
 
-## Multiplexing & Background Mode
+## Surface backends & background mode
 
-By default, subagents run in dedicated tmux split panes when running inside tmux. You can switch to running subagents silently in the background:
-
-### Toggle Command (`/subagent-mux`)
-
-| Command | Description |
-| --- | --- |
-| `/subagent-mux` (or `/subagent-mux toggle`) | Toggle multiplexing on/off for the active session |
-| `/subagent-mux off` | Disable pane splits; run subagents as silent background processes |
-| `/subagent-mux on` | Enable tmux pane splitting (when inside tmux) |
-| `/subagent-mux status` | Display the current multiplexing state and tmux detection |
-
-- **Automatic Fallback**: If pi is started outside of tmux, subagents automatically run in silent background mode without erroring.
-- **Log Files**: When running in the background, subagent output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.log`.
-
-### Configuration
-
-Configure defaults via `config.json` (or environment variables `PI_SUBAGENT_MULTIPLEX=0|1` and `PI_SUBAGENT_DISABLE_TMUX=1`):
+Choose `auto`, `tmux`, `herdr`, or `background` in `config.json`:
 
 ```json
 {
   "status": { "enabled": true },
-  "multiplexing": { "enabled": true }
+  "multiplexing": { "backend": "auto" }
 }
 ```
+
+`auto` selects Herdr when the process has `HERDR_ENV=1` plus `HERDR_PANE_ID`, tmux when it has `TMUX`, and otherwise background mode. If both nested environments are present, `auto` refuses to guess; explicitly select the intended backend. The effective choice is exported to children as `PI_SUBAGENT_BACKEND`, so nested subagents do not re-detect a different multiplexer.
+
+`PI_SUBAGENT_BACKEND=auto|tmux|herdr|background` overrides config. Legacy `{ "multiplexing": { "enabled": false } }`, `PI_SUBAGENT_MULTIPLEX=0|1`, and `PI_SUBAGENT_DISABLE_TMUX=1` remain supported; the disable variable always forces background mode.
+
+### Backend command (`/subagent-mux`)
+
+| Command | Description |
+| --- | --- |
+| `/subagent-mux auto|tmux|herdr|background` | Select the active session's backend preference |
+| `/subagent-mux on` / `off` | Backward-compatible aliases for `auto` / `background` |
+| `/subagent-mux toggle` | Toggle between `auto` and `background` |
+| `/subagent-mux status` | Show preference, effective backend, and environment detection |
+
+Herdr support is CLI-first and requires `herdr` on `PATH` while Pi runs in a Herdr pane. It uses only default split layout: `herdr pane split "$HERDR_PANE_ID" --direction right --no-focus`. No plugin, socket client, tabs, or advanced layout configuration is required. Herdr management CLI calls are bounded, but subagent task duration is not timed out.
+
+Background output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.log`.
 
 ## Status widget & configuration
 
@@ -252,11 +251,13 @@ The `/subagent-sessions` command provides interactive session inspection and cle
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- [tmux](https://github.com/tmux/tmux)
+- At least one execution surface: [tmux](https://github.com/tmux/tmux), [Herdr](https://herdr.dev/docs/cli-reference/), or built-in background mode
 
 ```bash
-tmux new -A -s pi 'pi'
+tmux new -A -s pi 'pi'   # tmux example
 ```
+
+Do not install a Herdr integration/plugin for this extension; the standard Herdr CLI is sufficient.
 
 ## Acknowledgements
 

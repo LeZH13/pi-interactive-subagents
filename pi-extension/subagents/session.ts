@@ -793,7 +793,10 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
             entry.name.endsWith(".jsonl") ||
             entry.name.endsWith(".loadout.json") ||
             entry.name.endsWith(".ask") ||
-            entry.name.endsWith(".exit")
+            entry.name.endsWith(".exit") ||
+            entry.name.endsWith(".complete") ||
+            entry.name.includes(".complete.tmp-") ||
+            entry.name.endsWith(".steer")
           ) {
             try {
               result.cleanedBytes += statSync(full).size;
@@ -801,6 +804,22 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
               result.cleanedFilesCount++;
             } catch {}
           }
+        } else if (entry.isDirectory() && entry.name.endsWith(".steer.d")) {
+          // Per-message steer queues are extension-owned and contain only
+          // atomically published JSON messages/temp files.
+          try {
+            const queued = readdirSync(full, { withFileTypes: true });
+            for (const item of queued) {
+              if (!item.isFile() || (!item.name.endsWith(".json") && !item.name.includes(".tmp-"))) continue;
+              const queuedPath = join(full, item.name);
+              try {
+                result.cleanedBytes += statSync(queuedPath).size;
+                unlinkSync(queuedPath);
+                result.cleanedFilesCount++;
+              } catch {}
+            }
+            if (readdirSync(full).length === 0) rmSync(full, { recursive: true, force: true });
+          } catch {}
         } else if (entry.isDirectory() && entry.name === "artifacts") {
           // Nested artifacts
           try {

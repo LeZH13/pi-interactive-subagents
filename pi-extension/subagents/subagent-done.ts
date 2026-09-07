@@ -15,7 +15,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import {
   createSubagentActivityRecorder,
   type SubagentTelemetry,
@@ -278,26 +278,48 @@ export default function (pi: ExtensionAPI) {
   let agentStarted = false;
   let steerInterval: ReturnType<typeof setInterval> | null = null;
 
+  function deliverSteer(message: string): void {
+    if (!message) return;
+    pi.sendMessage(
+      { customType: "subagent_steer", content: message, display: true },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  }
+
   function checkPendingSteerMessage(): void {
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if (!sessionFile) return;
+
+    // Backwards compatibility with writers from older parent processes.
     const steerFile = `${sessionFile}.steer`;
-    if (!existsSync(steerFile)) return;
-    let message = "";
-    try {
-      message = readFileSync(steerFile, "utf8").trim();
-      unlinkSync(steerFile);
-    } catch {}
-    if (message) {
-      pi.sendMessage(
-        {
-          customType: "subagent_steer",
-          content: message,
-          display: true,
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
+    if (existsSync(steerFile)) {
+      try {
+        const message = readFileSync(steerFile, "utf8").trim();
+        unlinkSync(steerFile);
+        deliverSteer(message);
+      } catch {}
     }
+
+    // New writers publish one atomic file per message so rapid steers cannot
+    // overwrite each other. Sorted names preserve enqueue order.
+    const queueDir = `${sessionFile}.steer.d`;
+    let files: string[] = [];
+    try { files = readdirSync(queueDir).filter((name) => name.endsWith(".json")).sort(); } catch {}
+    for (const file of files) {
+      const path = `${queueDir}/${file}`;
+      try {
+        const data = JSON.parse(readFileSync(path, "utf8"));
+        unlinkSync(path);
+        const runId = process.env.PI_SUBAGENT_RUN_ID;
+        if (
+          typeof data?.message === "string" &&
+          (typeof data.runId !== "string" || !runId || data.runId === runId)
+        ) deliverSteer(data.message.trim());
+      } catch {
+        try { unlinkSync(path); } catch {}
+      }
+    }
+    try { if (existsSync(queueDir) && readdirSync(queueDir).length === 0) rmSync(queueDir, { recursive: true }); } catch {}
   }
 
   // Set when ask_question is called; suppresses auto-exit so the session stays
@@ -385,6 +407,8 @@ export default function (pi: ExtensionAPI) {
               type: "error",
               errorMessage: errorInfo.errorMessage,
               stopReason: errorInfo.stopReason,
+              runId: process.env.PI_SUBAGENT_RUN_ID,
+              createdAt: Date.now(),
             }),
           );
         } catch {
@@ -458,6 +482,8 @@ export default function (pi: ExtensionAPI) {
       steerInterval = null;
     }
     recorder.sessionShutdown((event as any).reason);
+    // Completion authority belongs to the outer launch wrapper, which runs
+    // only after Pi and every awaited shutdown hook have actually exited.
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O
@@ -512,6 +538,8 @@ export default function (pi: ExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
+        runId: process.env.PI_SUBAGENT_RUN_ID,
+        createdAt: Date.now(),
       };
       writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
 

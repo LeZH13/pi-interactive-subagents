@@ -24,6 +24,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import {
   isTmuxAvailable,
+  isHerdrAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -32,10 +33,13 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+  setSurfaceBackendPreference,
+} from "../../pi-extension/subagents/surface.ts";
 
-// Re-export tmux primitives for tests
+// Re-export tmux/herdr primitives for tests
 export {
+  isTmuxAvailable,
+  isHerdrAvailable,
   createSurface,
   createSurfaceSplit,
   sendCommand,
@@ -44,6 +48,7 @@ export {
   readScreenAsync,
   closeSurface,
   shellEscape,
+  setSurfaceBackendPreference,
 };
 
 // ── Paths ──
@@ -76,11 +81,14 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Detect whether tmux or Herdr is available in the current environment.
+ * Returns ["tmux"], ["herdr"], ["tmux", "herdr"], or [].
  */
 export function getAvailableBackends(): string[] {
-  return isTmuxAvailable() ? ["tmux"] : [];
+  const backends: string[] = [];
+  if (isTmuxAvailable()) backends.push("tmux");
+  if (isHerdrAvailable()) backends.push("herdr");
+  return backends;
 }
 
 export function focusSurface(surface: string): void {
@@ -152,10 +160,10 @@ export function createTestEnv(): TestEnv {
 /**
  * Clean up all resources created during the test.
  */
-export function cleanupTestEnv(env: TestEnv): void {
+export async function cleanupTestEnv(env: TestEnv): Promise<void> {
   for (const surface of env.surfaces) {
     try {
-      closeSurface(surface);
+      await closeSurface(surface);
     } catch {}
   }
   for (const file of env.tempFiles) {
@@ -171,19 +179,19 @@ export function cleanupTestEnv(env: TestEnv): void {
 /**
  * Create a surface and register it for automatic cleanup.
  */
-export function createTrackedSurface(env: TestEnv, name: string): string {
-  const surface = createSurface(name);
+export async function createTrackedSurface(env: TestEnv, name: string): Promise<string> {
+  const surface = await createSurface(name);
   env.surfaces.push(surface);
   return surface;
 }
 
-export function createTrackedSurfaceSplit(
+export async function createTrackedSurfaceSplit(
   env: TestEnv,
   name: string,
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
-): string {
-  const surface = createSurfaceSplit(name, direction, fromSurface);
+): Promise<string> {
+  const surface = await createSurfaceSplit(name, direction, fromSurface);
   env.surfaces.push(surface);
   return surface;
 }
@@ -204,12 +212,12 @@ export function untrackSurface(env: TestEnv, surface: string): void {
  * The command ends with a sentinel so we can detect when pi exits:
  *   `pi ...; echo '__TEST_DONE_'$?'__'`
  */
-export function startPi(
+export async function startPi(
   surface: string,
   testDir: string,
   task: string,
   opts?: { model?: string; extraArgs?: string; env?: Record<string, string> },
-): void {
+): Promise<void> {
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
   const envPrefix = opts?.env
@@ -234,7 +242,7 @@ export function startPi(
     .filter(Boolean)
     .join(" ");
 
-  sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
+  await sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
 }

@@ -12,6 +12,8 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  renameSync,
+  rmSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -24,13 +26,20 @@ import {
   createSurface,
   sendCommand,
   sendLongCommand,
+  sendTerminalMessage,
   pollForExit,
   closeSurface,
   shellEscape,
   readScreen,
   getBackgroundSurfaceLogPath,
   closeAllBackgroundSurfaces,
-} from "./tmux.ts";
+  getSurfaceBackend,
+  getSurfaceBackendPreference,
+  isHerdrAvailable,
+  resolveSurfaceBackend,
+  setSurfaceBackendPreference,
+  type SurfaceBackendKind,
+} from "./surface.ts";
 
 import {
   countSessionEntryLines,
@@ -630,6 +639,32 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   return null;
 }
 
+function wrapCommandWithCompletion(command: string, completionFile: string, runId: string): string {
+  const writer = [
+    'const fs=require("node:fs")',
+    'const [target,runId,rawCode]=process.argv.slice(1)',
+    'const exitCode=Number(rawCode)',
+    'const tmp=`${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`',
+    'fs.writeFileSync(tmp,JSON.stringify({type:"completion",runId,completedAt:Date.now(),exitCode}))',
+    'fs.renameSync(tmp,target)',
+  ].join(";");
+  return [
+    "set +e",
+    command,
+    "__pi_subagent_code=$?",
+    `node -e ${shellEscape(writer)} ${shellEscape(completionFile)} ${shellEscape(runId)} "$__pi_subagent_code"`,
+    "__pi_completion_code=$?",
+    "if [ \"$__pi_completion_code\" -ne 0 ] && [ \"$__pi_subagent_code\" -eq 0 ]; then __pi_subagent_code=$__pi_completion_code; fi",
+    "echo '__SUBAGENT_DONE_'$__pi_subagent_code'__'",
+    "exit \"$__pi_subagent_code\"",
+  ].join("\n");
+}
+
+function clearRunSignals(sessionFile: string): void {
+  for (const suffix of [".complete", ".exit", ".ask", ".steer"]) rmSync(`${sessionFile}${suffix}`, { force: true });
+  rmSync(`${sessionFile}.steer.d`, { recursive: true, force: true });
+}
+
 function formatElapsed(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
@@ -814,6 +849,8 @@ interface SubagentResult {
  */
 interface RunningSubagent {
   id: string;
+  /** Unique invocation identity; changes on every resume of a session file. */
+  runId: string;
   name: string;
   task: string;
   agent?: string;
@@ -1292,14 +1329,28 @@ function resolveRunningByName(name: string):
  * collapsed to spaces because each newline submits a turn in the child's TUI
  * editor; a multi-line message would otherwise fire as several partial turns.
  */
-function steerSubagent(
+function enqueueSteerMessage(sessionFile: string, message: string, runId?: string): void {
+  const queueDir = `${sessionFile}.steer.d`;
+  mkdirSync(queueDir, { recursive: true });
+  const key = `${Date.now()}-${process.hrtime.bigint()}-${Math.random().toString(16).slice(2)}`;
+  const target = join(queueDir, `${key}.json`);
+  const tmp = `${target}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify({ message, createdAt: Date.now(), ...(runId ? { runId } : {}) }), "utf8");
+  renameSync(tmp, target);
+}
+
+async function steerSubagent(
   running: RunningSubagent,
   message: string,
-  send: (surface: string, command: string, options?: { sessionFile?: string }) => void = sendCommand,
+  send?: (surface: string, command: string, options?: { sessionFile?: string }) => void,
 ): { ok: true } | { error: string } {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
-    send(running.surface, flattened, { sessionFile: running.sessionFile });
+    // Pi consumes orchestration input through a sidecar queue. Sending the
+    // same text as terminal keys would submit every steer twice.
+    if (send) await send(running.surface, flattened);
+    else if (running.cli !== "claude") enqueueSteerMessage(running.sessionFile, flattened, running.runId);
+    else await sendTerminalMessage(running.surface, flattened);
     return { ok: true };
   } catch (error: any) {
     return {
@@ -1310,9 +1361,9 @@ function steerSubagent(
   }
 }
 
-function handleSubagentSteer(
+async function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send?: (surface: string, command: string) => void,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1332,7 +1383,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const steer = await steerSubagent(running, message, send);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1441,6 +1492,7 @@ export const __test__ = {
   resolveRunningByName,
   uniqueRunningName,
   reservedNames,
+  enqueueSteerMessage,
   steerSubagent,
   handleSubagentSteer,
   resolveResultPresentation,
@@ -1454,6 +1506,8 @@ export const __test__ = {
   formatWidgetTelemetryClusters,
   formatWidgetTelemetryLine,
   widgetIcon,
+  wrapCommandWithCompletion,
+  clearRunSignals,
 };
 
 function startWidgetRefresh() {
@@ -1478,6 +1532,7 @@ async function launchSubagent(
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
+  const runId = `${id}-${Math.random().toString(16).slice(2, 10)}`;
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const { model: effectiveModel, thinking: effectiveThinking } =
@@ -1520,15 +1575,16 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent";
   const logFile = join(artifactDir, "subagent-logs", `${safeLogName}-${id}.log`);
-  const surface = options?.surface ?? createSurface(params.name, {
+  const surface = options?.surface ?? await createSurface(params.name, {
     id,
     logPath: logFile,
     sessionFile: subagentSessionFile,
   });
-  if (!surfacePreCreated && !surface.startsWith("bg:")) {
+  if (!surfacePreCreated && getSurfaceBackend(surface) === "tmux") {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
+  try {
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1592,7 +1648,8 @@ async function launchSubagent(
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
-    const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+    clearRunSignals(subagentSessionFile);
+    const command = wrapCommandWithCompletion(`${cdPrefix}${cmdParts.join(" ")}`, `${subagentSessionFile}.complete`, runId);
 
     const launchScriptName = `${(params.name || "subagent")
       .toLowerCase()
@@ -1602,7 +1659,7 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
+    await sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
@@ -1613,6 +1670,7 @@ async function launchSubagent(
 
     const running: RunningSubagent = {
       id,
+      runId,
       name: params.name,
       task: params.task,
       agent: params.agent,
@@ -1697,6 +1755,8 @@ async function launchSubagent(
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+  envParts.push(`PI_SUBAGENT_RUN_ID=${shellEscape(runId)}`);
+  envParts.push(`PI_SUBAGENT_BACKEND=${shellEscape(getSurfaceBackend(surface))}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
@@ -1735,8 +1795,9 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
+  clearRunSignals(subagentSessionFile);
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = wrapCommandWithCompletion(piCommand, `${subagentSessionFile}.complete`, runId);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1744,7 +1805,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
+  await sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -1756,6 +1817,7 @@ async function launchSubagent(
 
   const running: RunningSubagent = {
     id,
+    runId,
     name: params.name,
     task: params.task,
     agent: params.agent,
@@ -1775,6 +1837,12 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+  } catch (error) {
+    // Once a split/process surface has been allocated, every setup failure must
+    // tear down exactly that owned surface. closeSurface is idempotent.
+    try { await closeSurface(surface); } catch {}
+    throw error;
+  }
 }
 
 /**
@@ -1823,6 +1891,8 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     unlinkSync(askFile);
   } catch {}
   if (!payload?.question) return;
+  if (payload.runId !== undefined && payload.runId !== running.runId) return;
+  if (payload.createdAt !== undefined && (!Number.isFinite(payload.createdAt) || payload.createdAt < running.startTime)) return;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -1856,6 +1926,9 @@ async function watchSubagent(
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
+      runId: running.runId,
+      startedAt: running.startTime,
+      completionFile: `${sessionFile}.complete`,
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
@@ -1875,7 +1948,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = readScreen(surface, 200)
+        summary = await readScreen(surface, 200)
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
@@ -1894,7 +1967,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      await closeSurface(surface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1922,7 +1995,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    await closeSurface(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1938,7 +2011,7 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      await closeSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1981,7 +2054,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", async (_event, _ctx) => {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1994,11 +2067,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-      try { closeSurface(agent.surface); } catch {}
-    }
-    closeAllBackgroundSurfaces();
+    const agents = [...runningSubagents.values()];
+    for (const agent of agents) agent.abortController?.abort();
+    // Pi awaits async session_shutdown hooks. Abort watchers before attempting
+    // bounded backend cleanup, and settle every owned surface independently.
+    await Promise.allSettled(agents.map(async (agent) => {
+      try { await closeSurface(agent.surface); } catch {}
+    }));
+    await closeAllBackgroundSurfaces();
     runningSubagents.clear();
   });
 
@@ -2432,6 +2508,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
+        const runId = `${id}-${Math.random().toString(16).slice(2, 10)}`;
 
         // Resolve the name to its session file via this session's registry.
         const parentArtifactDir = getArtifactDir(
@@ -2492,12 +2569,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .replace(/\s+/g, "-")
           .replace(/-+/g, "-")
           .replace(/^-|-$/g, "") || "resume";
-        const surface = createSurface(name, {
+        const surface = await createSurface(name, {
           id,
           logPath: join(parentArtifactDir, "subagent-logs", `${resumeLogName}-${id}.log`),
           sessionFile: sessionPath,
         });
-        if (!surface.startsWith("bg:")) {
+        try {
+        if (getSurfaceBackend(surface) === "tmux") {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
         }
 
@@ -2551,6 +2629,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_RUN_ID=${shellEscape(runId)}`);
+        resumeEnvParts.push(`PI_SUBAGENT_BACKEND=${shellEscape(getSurfaceBackend(surface))}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
@@ -2561,7 +2641,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        clearRunSignals(sessionPath);
+        const command = wrapCommandWithCompletion(`${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`, `${sessionPath}.complete`, runId);
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2572,7 +2653,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
+        await sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -2586,6 +2667,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
           id,
+          runId,
           name,
           task: message,
           surface,
@@ -2668,14 +2750,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
+        } catch (error) {
+          try { await closeSurface(surface); } catch {}
+          throw error;
+        }
       },
     });
 
-  // /subagent-mux — switch between tmux panes and silent process surfaces.
+  // /subagent-mux — select an explicit surface backend. on/off/toggle remain
+  // aliases for auto/background to preserve existing scripts and muscle memory.
   pi.registerCommand("subagent-mux", {
-    description: "Control subagent multiplexing: /subagent-mux [on|off|status|toggle]",
+    description: "Control subagent surfaces: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]",
     getArgumentCompletions: (prefix: string) => {
-      const choices = ["on", "off", "status", "toggle"];
+      const choices = ["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"];
       const value = prefix.trim().toLowerCase();
       return choices
         .filter((choice) => choice.startsWith(value))
@@ -2683,30 +2770,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       const action = args.trim().toLowerCase() || "toggle";
-      if (!["on", "off", "status", "toggle"].includes(action)) {
-        ctx.ui.notify("Usage: /subagent-mux [on|off|status|toggle]", "warning");
+      if (!["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"].includes(action)) {
+        ctx.ui.notify("Usage: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]", "warning");
         return;
       }
 
-      if (action === "status") {
-        const active = isMultiplexingActive();
-        ctx.ui.notify(
-          `Subagent multiplexing: ${active ? "ON (tmux panes)" : "OFF (silent background)"}\n` +
-            `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
-            `session preference: ${isMultiplexingEnabled() ? "ON" : "OFF"}`,
-          "info",
-        );
-        return;
+      if (action !== "status") {
+        if (action === "on") setSurfaceBackendPreference("auto");
+        else if (action === "off") setSurfaceBackendPreference("background");
+        else if (action === "toggle") {
+          setSurfaceBackendPreference(getSurfaceBackendPreference() === "background" ? "auto" : "background");
+        } else setSurfaceBackendPreference(action as SurfaceBackendKind);
       }
 
-      if (action === "on") setMultiplexingEnabled(true);
-      else if (action === "off") setMultiplexingEnabled(false);
-      else setMultiplexingEnabled(!isMultiplexingEnabled());
-
-      const active = isMultiplexingActive();
+      let effective: string;
+      try { effective = resolveSurfaceBackend(); }
+      catch (error: any) { effective = `error (${error?.message ?? error})`; }
       ctx.ui.notify(
-        `Subagent multiplexing: ${active ? "ON (tmux panes)" : "OFF (silent background)"}`,
-        "info",
+        `Subagent backend preference: ${getSurfaceBackendPreference()}\n` +
+          `effective backend: ${effective}\n` +
+          `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
+          `Herdr detected: ${isHerdrAvailable() ? "YES" : "NO"}`,
+        effective.startsWith("error") ? "warning" : "info",
       );
     },
   });

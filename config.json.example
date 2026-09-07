@@ -3,6 +3,6 @@
     "enabled": true
   },
   "multiplexing": {
-    "enabled": true
+    "backend": "auto"
   }
 }
