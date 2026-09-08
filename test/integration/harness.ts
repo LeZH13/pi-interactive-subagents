@@ -73,7 +73,7 @@ const EXTENSION_SOURCE = join(PROJECT_ROOT, "pi-extension", "subagents", "index.
 // ── Configuration ──
 
 /** Model used by both orchestrators and child agents. Override with PI_TEST_MODEL. */
-export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "openrouter/deepseek/deepseek-v4-flash-0731";
+export const TEST_MODEL = process.env.PI_TEST_MODEL ?? "wandb/deepseek-ai/DeepSeek-V4-Flash-0731";
 
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");

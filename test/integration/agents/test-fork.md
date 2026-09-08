@@ -1,7 +1,7 @@
 ---
 name: test-fork
 description: Integration test agent — runs with inherited parent context
-model: openrouter/deepseek/deepseek-v4-flash-0731
+model: wandb/deepseek-ai/DeepSeek-V4-Flash-0731
 tools: read, bash, write, edit
 session-mode: fork
 spawning: false
