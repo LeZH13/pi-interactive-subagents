@@ -31,26 +31,35 @@ import {
   trackTempFile,
   waitForFile,
   waitForScreen,
+  setSurfaceBackendPreference,
   type TestEnv,
 } from "./harness.ts";
 
-const backends = getAvailableBackends().filter((b) => b === "tmux");
+const backends = getAvailableBackends();
 const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS ?? "2500");
 
 if (backends.length === 0) {
-  console.log("⚠️  tmux is not available — skipping tmux-surface integration tests");
-  console.log("   Run inside tmux to enable these tests.");
+  console.log("⚠️  neither tmux nor Herdr is available — skipping surface integration tests");
+  console.log("   Run inside tmux or Herdr to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`tmux-surface [${backend}]`, { timeout: 60_000 }, () => {
+  describe(`surface [${backend}]`, { timeout: 60_000 }, () => {
     let env: TestEnv;
+    const oldBackend = process.env.PI_SUBAGENT_BACKEND;
 
     before(() => {
+      process.env.PI_SUBAGENT_BACKEND = backend;
+      setSurfaceBackendPreference(backend as any);
       env = createTestEnv();
     });
 
     after(async () => {
+      if (oldBackend !== undefined) process.env.PI_SUBAGENT_BACKEND = oldBackend;
+      else delete process.env.PI_SUBAGENT_BACKEND;
+      if (backend === "herdr" && process.env.HERDR_PANE_ID) {
+        try { await focusSurface(`herdr:${process.env.HERDR_PANE_ID}`); } catch {}
+      }
       await cleanupTestEnv(env);
     });
 
@@ -58,7 +67,7 @@ for (const backend of backends) {
       const anchor = await createTrackedSurfaceSplit(env, "focus-anchor", "right");
       await sleep(1000);
 
-      focusSurface(anchor);
+      await focusSurface(anchor);
       await waitForFocusedSurface(anchor, 10_000);
 
       const childA = await createTrackedSurface(env, "focus-child-a");
@@ -71,8 +80,8 @@ for (const backend of backends) {
 
       const markerA = uniqueId();
       const markerB = uniqueId();
-      sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
-      sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
+      await sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
+      await sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
 
       await Promise.all([
         waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
@@ -86,7 +95,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "MARKER_${marker}"`);
+      await sendCommand(surface, `echo "MARKER_${marker}"`);
       await sleep(1500);
 
       const screen = await readScreen(surface, 50);
@@ -105,7 +114,7 @@ for (const backend of backends) {
 
       const marker = uniqueId();
       // Single-quoted string — $ and " are literal inside single quotes
-      sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
+      await sendCommand(surface, `echo 'SPEC_${marker}_$HOME_"quotes"_done'`);
       await sleep(1500);
 
       const screen = await readScreen(surface, 50);
@@ -147,7 +156,7 @@ for (const backend of backends) {
       await sleep(1000);
 
       const marker = uniqueId();
-      sendCommand(surface, `echo "ASYNC_${marker}"`);
+      await sendCommand(surface, `echo "ASYNC_${marker}"`);
       await sleep(1500);
 
       const screen = await readScreenAsync(surface, 50);
@@ -164,8 +173,8 @@ for (const backend of backends) {
 
       const m1 = uniqueId();
       const m2 = uniqueId();
-      sendCommand(s1, `echo "S1_${m1}"`);
-      sendCommand(s2, `echo "S2_${m2}"`);
+      await sendCommand(s1, `echo "S1_${m1}"`);
+      await sendCommand(s2, `echo "S2_${m2}"`);
       await sleep(1500);
 
       const screen1 = await readScreen(s1, 50);
@@ -182,7 +191,7 @@ for (const backend of backends) {
       const marker = uniqueId();
       const filePath = `/tmp/pi-tmux-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      await sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
       const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));

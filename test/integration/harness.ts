@@ -9,6 +9,7 @@
  * - Clean up panes and temp files after tests
  */
 import { execFileSync } from "node:child_process";
+import { createConnection } from "node:net";
 import {
   mkdtempSync,
   mkdirSync,
@@ -91,11 +92,46 @@ export function getAvailableBackends(): string[] {
   return backends;
 }
 
-export function focusSurface(surface: string): void {
+export async function focusHerdrPane(paneId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const sockPath = process.env.HERDR_SOCKET ?? join(process.env.HOME ?? "", ".config", "herdr", "herdr.sock");
+    const sock = createConnection(sockPath);
+    let buf = "";
+    sock.on("connect", () => {
+      sock.write(JSON.stringify({ id: "focus", method: "pane.focus", params: { pane_id: paneId } }) + "\n");
+    });
+    sock.on("data", (d) => {
+      buf += d.toString();
+      try {
+        JSON.parse(buf);
+        sock.end();
+        resolve();
+      } catch {}
+    });
+    sock.on("error", reject);
+  });
+}
+
+export async function focusSurface(surface: string): Promise<void> {
+  if (surface.startsWith("herdr:")) {
+    const paneId = surface.slice("herdr:".length);
+    await focusHerdrPane(paneId);
+    return;
+  }
   execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
 }
 
 export function getFocusedSurface(): string | null {
+  if (process.env.HERDR_ENV === "1" && process.env.HERDR_PANE_ID) {
+    try {
+      const stdout = execFileSync("herdr", ["pane", "layout", "--pane", process.env.HERDR_PANE_ID], { encoding: "utf8" });
+      const data = JSON.parse(stdout);
+      const paneId = data?.result?.layout?.focused_pane_id;
+      return paneId ? `herdr:${paneId}` : null;
+    } catch {
+      return null;
+    }
+  }
   try {
     const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
       encoding: "utf8",
@@ -118,7 +154,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused surface ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }

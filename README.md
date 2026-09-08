@@ -1,5 +1,8 @@
 # pi-interactive-subagents
 
+[![Herdr](https://img.shields.io/badge/Herdr-v0.9.0%20tested-2b6cb0)](https://herdr.dev/)
+[![tmux](https://img.shields.io/badge/tmux-v3.7c%20tested-1bb954?logo=tmux&logoColor=white)](https://github.com/tmux/tmux)
+
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux or [Herdr](https://herdr.dev/) panes, with a headless background mode. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 ## How it works
@@ -188,7 +191,7 @@ Choose `auto`, `tmux`, `herdr`, or `background` in `config.json`:
 | `/subagent-mux toggle` | Toggle between `auto` and `background` |
 | `/subagent-mux status` | Show preference, effective backend, and environment detection |
 
-Herdr support is CLI-first and requires `herdr` on `PATH` while Pi runs in a Herdr pane. It uses only default split layout: `herdr pane split "$HERDR_PANE_ID" --direction right --no-focus`. No plugin, socket client, tabs, or advanced layout configuration is required. Herdr management CLI calls are bounded, but subagent task duration is not timed out.
+Herdr support is CLI-first and requires `herdr` on `PATH` while Pi runs in a Herdr pane. It uses only default split layout: `herdr pane split "$HERDR_PANE_ID" --direction right --no-focus`. No plugin, socket client, tabs, or advanced layout configuration is required. Herdr management CLI calls are bounded, but subagent task duration is not timed out. Tested against Herdr 0.9.0 (and tmux 3.7c).
 
 Background output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.log`.
 
@@ -251,7 +254,10 @@ The `/subagent-sessions` command provides interactive session inspection and cle
 ## Requirements
 
 - [pi](https://github.com/badlogic/pi-mono)
-- At least one execution surface: [tmux](https://github.com/tmux/tmux), [Herdr](https://herdr.dev/docs/cli-reference/), or built-in background mode
+- At least one execution surface:
+  - [tmux](https://github.com/tmux/tmux) (tested with `tmux 3.7c`)
+  - [Herdr](https://herdr.dev/docs/cli-reference/) (tested with `herdr 0.9.0`)
+  - Built-in background mode
 
 ```bash
 tmux new -A -s pi 'pi'   # tmux example
