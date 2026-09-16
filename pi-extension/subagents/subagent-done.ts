@@ -77,6 +77,8 @@ export function telemetryFromContext(ctx: unknown): SubagentTelemetry | undefine
   const telemetry: SubagentTelemetry = {};
   const model = typeof context.model?.id === "string" ? context.model.id.trim() : "";
   if (model) telemetry.model = model;
+  const thinking = typeof context.thinkingLevel === "string" ? context.thinkingLevel.trim() : "";
+  if (thinking) telemetry.thinking = thinking;
   if (typeof context.getContextUsage === "function") {
     try {
       const usage = context.getContextUsage();
@@ -454,6 +456,13 @@ export default function (pi: ExtensionAPI) {
       (event as any).assistantMessageEvent?.type,
       lifecycleTelemetry((event as any).message, ctx),
     );
+  });
+
+  pi.on("thinking_level_select", (event, ctx) => {
+    const level = (event as any)?.level;
+    const telemetry = telemetryFromContext(ctx) ?? {};
+    if (typeof level === "string" && level.trim()) telemetry.thinking = level.trim();
+    recorder.syncTelemetry(telemetry);
   });
 
   pi.on("tool_execution_start", (event) => {

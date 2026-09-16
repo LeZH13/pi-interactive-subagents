@@ -15,6 +15,7 @@ export type SubagentActivityEvent =
   | "before_provider_request"
   | "after_provider_response"
   | "message_update"
+  | "telemetry_update"
   | "tool_execution_start"
   | "tool_call"
   | "tool_execution_update"
@@ -25,6 +26,7 @@ export type SubagentActivityEvent =
 
 export interface SubagentTelemetry {
   model?: string;
+  thinking?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
@@ -74,6 +76,7 @@ export interface SubagentActivityRecorder {
   beforeProviderRequest(telemetry?: SubagentTelemetry): void;
   afterProviderResponse(telemetry?: SubagentTelemetry): void;
   messageUpdate(messageEventType?: string, telemetry?: SubagentTelemetry): void;
+  syncTelemetry(telemetry?: SubagentTelemetry): void;
   toolExecutionStart(toolCallId?: string, toolName?: string): void;
   toolCall(toolCallId?: string, toolName?: string): void;
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
@@ -98,6 +101,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "before_provider_request",
   "after_provider_response",
   "message_update",
+  "telemetry_update",
   "tool_execution_start",
   "tool_call",
   "tool_execution_update",
@@ -201,6 +205,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
     validateOptionalActivityString(object, "model"),
+    validateOptionalActivityString(object, "thinking"),
     validateOptionalNonNegativeInteger(object, "inputTokens"),
     validateOptionalNonNegativeInteger(object, "outputTokens"),
     validateOptionalNonNegativeInteger(object, "cacheReadTokens"),
@@ -363,6 +368,11 @@ export function createSubagentActivityRecorder(params: {
     const model = telemetry.model?.trim();
     if (model && model.length <= MAX_ACTIVITY_STRING_LENGTH && !/\r|\n/.test(model)) normalized.model = model;
 
+    const thinking = telemetry.thinking?.trim();
+    if (thinking && thinking.length <= MAX_ACTIVITY_STRING_LENGTH && !/\r|\n/.test(thinking)) {
+      normalized.thinking = thinking;
+    }
+
     for (const field of [
       "inputTokens",
       "outputTokens",
@@ -393,6 +403,7 @@ export function createSubagentActivityRecorder(params: {
     const telemetry = normalizedTelemetry(rawTelemetry);
     if (!telemetry) return;
     if (telemetry.model != null) current.model = telemetry.model;
+    if (telemetry.thinking != null) current.thinking = telemetry.thinking;
     if (telemetry.contextTokens != null && telemetry.contextTokens > 0) current.contextTokens = telemetry.contextTokens;
     if (!includeTurnUsage || !hasTurnUsage(telemetry)) return;
 
@@ -601,6 +612,11 @@ export function createSubagentActivityRecorder(params: {
         applyTelemetry(current, telemetry);
         current.messageEventType = messageEventType;
         if (!current.toolActive) markActive(current, "streaming", observedAt);
+      }, "throttled");
+    },
+    syncTelemetry(telemetry) {
+      record("telemetry_update", (current) => {
+        applyTelemetry(current, telemetry, false);
       }, "throttled");
     },
     toolExecutionStart(toolCallId, toolName) {

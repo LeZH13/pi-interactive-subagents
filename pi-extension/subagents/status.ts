@@ -24,6 +24,7 @@ export interface StatusConfig {
 
 export interface StatusTelemetry {
   model?: string;
+  thinking?: string;
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
@@ -212,6 +213,7 @@ export function createStatusState(params: {
   source: SubagentStatusSource;
   startTimeMs: number;
   model?: string;
+  thinking?: string;
 }): SubagentStatusState {
   const initialKind = params.source === "claude" ? "running" : "starting";
   return {
@@ -230,6 +232,7 @@ export function createStatusState(params: {
     latestEvent: null,
     activityLabel: null,
     model: params.model,
+    thinking: params.thinking,
     snapshotState: params.source === "claude" ? "unseen" : "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
@@ -292,6 +295,7 @@ export function observeStatus(
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
     model: observation.model ?? state.model,
+    thinking: observation.thinking ?? state.thinking,
     inputTokens: observation.inputTokens ?? state.inputTokens,
     outputTokens: observation.outputTokens ?? state.outputTokens,
     cacheReadTokens: observation.cacheReadTokens ?? state.cacheReadTokens,
@@ -362,6 +366,7 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   const elapsedText = formatElapsedDuration(elapsedMs);
   const telemetry: StatusTelemetry = {
     model: state.model,
+    thinking: state.thinking,
     inputTokens: state.inputTokens,
     outputTokens: state.outputTokens,
     cacheReadTokens: state.cacheReadTokens,

@@ -1394,6 +1394,36 @@ describe("status.ts", () => {
     assert.equal(snapshot.contextTokens, 50_000);
   });
 
+  it("preserves thinking level across observations and initial state", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0, model: "gpt-5.6-sol", thinking: "high" });
+    assert.equal(classifyStatus(state, 0).thinking, "high");
+
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      model: "gpt-5.6-sol",
+    }, 10_000);
+
+    // Later observation omitting thinking preserves previous thinking
+    assert.equal(classifyStatus(state, 10_000).thinking, "high");
+
+    // Later observation with updated thinking overrides previous
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 11_000,
+      sequence: 2,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      thinking: "medium",
+    }, 11_000);
+    assert.equal(classifyStatus(state, 11_000).thinking, "medium");
+  });
+
   it("classifies waiting snapshots as healthy idle without becoming stalled", () => {
     let state = createStatusState({ source: "pi", startTimeMs: 0 });
     state = observeStatus(state, {
@@ -2399,6 +2429,18 @@ describe("subagent-done.ts", () => {
         getContextUsage: () => ({ tokens: 32_000, contextWindow: 200_000, percent: 16 }),
       }), {
         model: "claude-sonnet-4-6",
+        contextTokens: 32_000,
+      });
+    });
+
+    it("reads thinkingLevel from lifecycle context", () => {
+      assert.deepEqual(telemetryFromContext({
+        model: { id: "claude-sonnet-4-6" },
+        thinkingLevel: "high",
+        getContextUsage: () => ({ tokens: 32_000, contextWindow: 200_000, percent: 16 }),
+      }), {
+        model: "claude-sonnet-4-6",
+        thinking: "high",
         contextTokens: 32_000,
       });
     });
@@ -3522,6 +3564,32 @@ describe("subagent activity snapshots", () => {
     });
   });
 
+  it("syncTelemetry updates metadata without disturbing waiting phase or idle flags", () => {
+    withTempDir((dir) => {
+      let currentNow = 2_000;
+      const activityFile = getSubagentActivityFile(dir, "child-sync");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-sync",
+        activityFile,
+        now: () => currentNow,
+      });
+
+      recorder.sessionStart({ model: "claude-3-7-sonnet" });
+      recorder.agentEndWaiting();
+
+      currentNow = 3_000;
+      recorder.syncTelemetry({ thinking: "high" });
+
+      const read = readSubagentActivityFile(activityFile, "child-sync");
+      assert.ok(read.ok);
+      assert.equal(read.activity.thinking, "high");
+      assert.equal(read.activity.phase, "waiting");
+      assert.equal(read.activity.agentActive, false);
+      assert.equal(read.activity.turnActive, false);
+      assert.equal(read.activity.activeScope, undefined);
+    });
+  });
+
   it("rejects malformed activity fields used by classification and rendering", () => {
     withTempDir((dir) => {
       mkdirSync(join(dir, "subagent-activity"), { recursive: true });
@@ -3534,6 +3602,7 @@ describe("subagent activity snapshots", () => {
         { toolActive: "yes" },
         { toolName: "bad\nname" },
         { model: "bad\nmodel" },
+        { thinking: "bad\nthinking" },
         { inputTokens: -1 },
         { outputTokens: 1.5 },
         { cacheReadTokens: "many" },
@@ -4184,6 +4253,45 @@ describe("subagents widget rendering", () => {
     assert.deepEqual(lines.map((line: string) => visibleWidth(line)), [100, 100, 100, 100]);
   });
 
+  it("renders thinking activity label and colored model thinking suffix", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const now = 1_000_000;
+    let statusState = createStatusState({ source: "pi", startTimeMs: now - 60_000, thinking: "high" });
+    statusState = observeStatus(statusState, {
+      snapshot: "present",
+      updatedAt: now - 5_000,
+      sequence: 1,
+      phase: "active",
+      active: true,
+      activeScope: "streaming",
+      activeSince: now - 5_000,
+      activityLabel: "thinking",
+      model: "claude-3-7-sonnet",
+      thinking: "high",
+      inputTokens: 10_000,
+      outputTokens: 500,
+      contextTokens: 10_000,
+      cost: 0.015,
+    }, now - 5_000);
+
+    const lines = withMockedNow(now, () => testApi.renderSubagentWidgetLines([{
+      id: "a1",
+      name: "reasoner",
+      agent: "worker",
+      task: "",
+      surface: "s1",
+      startTime: now - 60_000,
+      sessionFile: "sess1",
+      statusState,
+    }], 100));
+    const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+    const plain = lines.map(stripAnsi);
+
+    assert.match(plain[1], /active · thinking 5s/);
+    assert.match(plain[2], /claude-3-7-sonnet:high · 5\.0%\/200k/);
+    assert.match(lines[2], /\x1b\[38;2;255;0;255m:high/);
+  });
+
   it("keeps telemetry blocks within narrow terminal widths", () => {
     const testApi = (subagentsModule as any).__test__;
     const now = Date.now();
@@ -4358,6 +4466,80 @@ describe("subagent display helpers", () => {
       assert.match(testApi.formatWidgetTelemetryLine(snapshot(98_000)).right, /38;2;126;186;103m/);
       assert.match(testApi.formatWidgetTelemetryLine(snapshot(100_000)).right, /38;2;214;181;94m/);
       assert.match(testApi.formatWidgetTelemetryLine(snapshot(162_000)).right, /38;2;224;108;117m/);
+    });
+
+    it("formats model thinking suffix with semantic color when configured", () => {
+      const snapshot = (thinking?: string) => ({
+        ...classifyStatus(createStatusState({ source: "pi", startTimeMs: 0 }), 0),
+        model: "claude-3-7-sonnet",
+        thinking,
+        inputTokens: 100,
+      });
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot("high")).right, /\x1b\[38;2;255;0;255m:high/);
+      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot("off")).right, /:off/);
+      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot(undefined)).right, /:/);
+    });
+  });
+
+  describe("formatModelWithThinking", () => {
+    it("hides thinking suffix when unset, off, or none", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol")), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "off")), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "none")), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol:off")), "gpt-5.6-sol");
+    });
+
+    it("applies semantic ANSI colors to thinking levels", () => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "low"), /\x1b\[38;2;0;170;255m:low/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "minimal"), /\x1b\[38;2;0;170;255m:minimal/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "medium"), /\x1b\[38;2;0;255;255m:medium/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "high"), /\x1b\[38;2;255;0;255m:high/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "xhigh"), /\x1b\[38;2;255;0;0m:xhigh/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "max"), /\x1b\[38;2;255;0;136m:max/);
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "16k"), /\x1b\[38;2;214;181;94m:16k/);
+    });
+
+    it("parses inline model thinking suffix and honors explicit overrides", () => {
+      const testApi = (subagentsModule as any).__test__;
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high")), "claude-3-7:high");
+      assert.match(testApi.formatModelWithThinking("claude-3-7:high"), /\x1b\[38;2;255;0;255m:high/);
+      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high", "off")), "claude-3-7");
+      assert.match(testApi.formatModelWithThinking("claude-3-7:high", "medium"), /\x1b\[38;2;0;255;255m:medium/);
+    });
+  });
+
+  describe("activityLabel", () => {
+    it("differentiates thinking vs streaming activity", () => {
+      const testApi = (subagentsModule as any).__test__;
+      assert.equal(testApi.activityLabel({
+        phase: "active",
+        activeScope: "streaming",
+        messageEventType: "thinking_delta",
+      }), "thinking");
+      assert.equal(testApi.activityLabel({
+        phase: "active",
+        activeScope: "streaming",
+        messageEventType: "thinking_start",
+      }), "thinking");
+      assert.equal(testApi.activityLabel({
+        phase: "active",
+        activeScope: "streaming",
+        messageEventType: "thinking_end",
+      }), "streaming");
+      assert.equal(testApi.activityLabel({
+        phase: "active",
+        activeScope: "streaming",
+        messageEventType: "text_delta",
+      }), "streaming");
+      assert.equal(testApi.activityLabel({
+        phase: "active",
+        activeScope: "tool",
+        toolName: "read",
+      }), "read");
     });
   });
 
