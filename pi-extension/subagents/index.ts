@@ -2826,45 +2826,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // /subagent-mux — select an explicit surface backend. on/off/toggle remain
-  // aliases for auto/background to preserve existing scripts and muscle memory.
-  pi.registerCommand("subagent-mux", {
-    description: "Control subagent surfaces: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]",
-    getArgumentCompletions: (prefix: string) => {
-      const choices = ["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"];
-      const value = prefix.trim().toLowerCase();
-      return choices
-        .filter((choice) => choice.startsWith(value))
-        .map((choice) => ({ value: choice, label: choice }));
-    },
-    handler: async (args, ctx) => {
-      const action = args.trim().toLowerCase() || "toggle";
-      if (!["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"].includes(action)) {
-        ctx.ui.notify("Usage: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]", "warning");
-        return;
-      }
-
-      if (action !== "status") {
-        if (action === "on") setSurfaceBackendPreference("auto");
-        else if (action === "off") setSurfaceBackendPreference("background");
-        else if (action === "toggle") {
-          setSurfaceBackendPreference(getSurfaceBackendPreference() === "background" ? "auto" : "background");
-        } else setSurfaceBackendPreference(action as SurfaceBackendKind);
-      }
-
-      let effective: string;
-      try { effective = resolveSurfaceBackend(); }
-      catch (error: any) { effective = `error (${error?.message ?? error})`; }
-      ctx.ui.notify(
-        `Subagent backend preference: ${getSurfaceBackendPreference()}\n` +
-          `effective backend: ${effective}\n` +
-          `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
-          `Herdr detected: ${isHerdrAvailable() ? "YES" : "NO"}`,
-        effective.startsWith("error") ? "warning" : "info",
-      );
-    },
-  });
-
   // /subagent command — request a model-owned tool call with optional overrides.
   // Explicit wording improves clarity; argument fidelity still depends on the model.
   pi.registerCommand("subagent", {
@@ -2904,6 +2865,45 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const toolCall =
         `${SUBAGENT_DISPATCH_PREFIX} Call subagent({ ${attributes.join(", ")} }) immediately. Do not check subagents_list.`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagent-mux — select an explicit surface backend. on/off/toggle remain
+  // aliases for auto/background to preserve existing scripts and muscle memory.
+  pi.registerCommand("subagent-mux", {
+    description: "Control subagent surfaces: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]",
+    getArgumentCompletions: (prefix: string) => {
+      const choices = ["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"];
+      const value = prefix.trim().toLowerCase();
+      return choices
+        .filter((choice) => choice.startsWith(value))
+        .map((choice) => ({ value: choice, label: choice }));
+    },
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase() || "toggle";
+      if (!["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"].includes(action)) {
+        ctx.ui.notify("Usage: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]", "warning");
+        return;
+      }
+
+      if (action !== "status") {
+        if (action === "on") setSurfaceBackendPreference("auto");
+        else if (action === "off") setSurfaceBackendPreference("background");
+        else if (action === "toggle") {
+          setSurfaceBackendPreference(getSurfaceBackendPreference() === "background" ? "auto" : "background");
+        } else setSurfaceBackendPreference(action as SurfaceBackendKind);
+      }
+
+      let effective: string;
+      try { effective = resolveSurfaceBackend(); }
+      catch (error: any) { effective = `error (${error?.message ?? error})`; }
+      ctx.ui.notify(
+        `Subagent backend preference: ${getSurfaceBackendPreference()}\n` +
+          `effective backend: ${effective}\n` +
+          `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
+          `Herdr detected: ${isHerdrAvailable() ? "YES" : "NO"}`,
+        effective.startsWith("error") ? "warning" : "info",
+      );
     },
   });
 

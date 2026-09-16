@@ -2949,6 +2949,19 @@ describe("run-scoped completion records", () => {
 describe("commands", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("registers /subagent before secondary subagent commands so prefix ties prioritize /subagent", () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentIndex = registeredCommands.findIndex((c) => c.name === "subagent");
+    const muxIndex = registeredCommands.findIndex((c) => c.name === "subagent-mux");
+    const sessionsIndex = registeredCommands.findIndex((c) => c.name === "subagent-sessions");
+    assert.ok(subagentIndex !== -1, "subagent command registered");
+    assert.ok(muxIndex !== -1, "subagent-mux command registered");
+    assert.ok(sessionsIndex !== -1, "subagent-sessions command registered");
+    assert.ok(subagentIndex < muxIndex, "/subagent should be registered before /subagent-mux");
+    assert.ok(subagentIndex < sessionsIndex, "/subagent should be registered before /subagent-sessions");
+  });
+
   it("registers /subagent-mux with completions and toggles session state", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
