@@ -52,6 +52,7 @@ import {
   registerName,
   resolveNameInRegistry,
   seedSubagentSessionFile,
+  SUBAGENT_DISPATCH_PREFIX,
   summarizeSessionStats,
   writeSubagentLoadout,
   writeArtifactOwnershipMarker,
@@ -602,6 +603,27 @@ function resolveLaunchBehavior(
     inheritsConversationContext,
     taskDelivery: inheritsConversationContext ? "direct" : "artifact",
   };
+}
+
+function buildSubagentTask(
+  task: string,
+  inheritsConversationContext: boolean,
+  agentDefs: AgentDefaults | null,
+): string {
+  if (inheritsConversationContext) {
+    return `Task dispatched to you by the orchestrator:\n\n${task}`;
+  }
+
+  const modeHint = agentDefs?.autoExit
+    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
+    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
+  const summaryInstruction = agentDefs?.autoExit
+    ? "Your FINAL assistant message should summarize what you accomplished."
+    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+  const identity = agentDefs?.body ?? null;
+  const identityInSystemPrompt = agentDefs?.systemPromptMode && identity;
+  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
+  return `${roleBlock}\n\n${modeHint}\n\n${task}\n\n${summaryInstruction}`;
 }
 
 /**
@@ -1486,6 +1508,7 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
+  buildSubagentTask,
   formatWidgetRightLabel,
   observeRunningSubagent,
   getToolExtensionPath,
@@ -1604,22 +1627,13 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
-    : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
   // An agent with a non-empty subagent_agents list is granted the spawning
   // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
   const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
-  const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
-    ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+  const fullTask = buildSubagentTask(params.task, inheritsConversationContext, agentDefs);
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -2796,7 +2810,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagent command — spawn a subagent by name with optional model/thinking overrides
+  // /subagent command — request a model-owned tool call with optional overrides.
+  // Explicit wording improves clarity; argument fidelity still depends on the model.
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent>[@<model>][:<thinking>] [task]",
     getArgumentCompletions: getSubagentArgumentCompletions,
@@ -2830,8 +2845,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       if (model) attributes.push(`model: ${JSON.stringify(model)}`);
       if (thinking) attributes.push(`thinking: ${JSON.stringify(thinking)}`);
       attributes.push(`name: ${JSON.stringify(displayName)}`);
+      attributes.push(`task: ${JSON.stringify(taskText)}`);
       const toolCall =
-        `Use subagent with ${attributes.join(", ")}, task: ${JSON.stringify(taskText)}`;
+        `${SUBAGENT_DISPATCH_PREFIX} Call subagent({ ${attributes.join(", ")} }) immediately. Do not check subagents_list.`;
       pi.sendUserMessage(toolCall);
     },
   });

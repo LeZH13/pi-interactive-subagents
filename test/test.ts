@@ -30,6 +30,7 @@ import {
   copySessionFile,
   mergeNewEntries,
   seedSubagentSessionFile,
+  SUBAGENT_DISPATCH_PREFIX,
   summarizeSessionStats,
   getSubagentSessionDir,
   isExtensionOwnedArtifactDir,
@@ -664,6 +665,161 @@ describe("session.ts", () => {
       );
       assert.equal(entries.some((entry) => entry.id === abandonedUser.id), false);
     });
+
+    it("strips dispatch-tagged user messages from forked branches and keeps untagged ones", () => {
+      const dispatchTagged = {
+        type: "message",
+        id: "user-dispatch",
+        parentId: ASSISTANT_MSG.id,
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: `${SUBAGENT_DISPATCH_PREFIX} Call subagent({ agent: "advisor", task: "hi" }) immediately. Do not check subagents_list.`,
+            },
+          ],
+        },
+      };
+      const taskUser = {
+        type: "message",
+        id: "user-task",
+        parentId: dispatchTagged.id,
+        message: { role: "user", content: [{ type: "text", text: "Please audit this plan." }] },
+      };
+      const parentFile = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+        dispatchTagged,
+        taskUser,
+      ]);
+      const childFile = join(dir, "fork-strip-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        parentLeafId: taskUser.id,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-strip-child-cwd",
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(entries[0].type, "session");
+      assert.equal(entries[0].parentSession, parentFile);
+      assert.equal(entries[0].cwd, "/tmp/fork-strip-child-cwd");
+      assert.deepEqual(
+        entries.slice(1).map((entry) => entry.id),
+        [MODEL_CHANGE.id, USER_MSG.id, ASSISTANT_MSG.id, taskUser.id],
+      );
+      assert.equal(entries.some((entry) => entry.id === dispatchTagged.id), false);
+      // The task message is relinked around the removed dispatch message.
+      const last = entries[entries.length - 1];
+      assert.equal(last.id, taskUser.id);
+      assert.equal(last.parentId, ASSISTANT_MSG.id);
+    });
+
+    for (const tagged of [false, true]) {
+      it(`${tagged ? "strips tagged" : "preserves untagged"} string-form user content when forking`, () => {
+        const user = {
+          type: "message",
+          id: "string-user",
+          parentId: ASSISTANT_MSG.id,
+          message: {
+            role: "user",
+            content: tagged
+              ? `${SUBAGENT_DISPATCH_PREFIX} Call subagent now.`
+              : `Please explain the reserved ${SUBAGENT_DISPATCH_PREFIX} tag.`,
+          },
+        };
+        const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG, user]);
+        const original = readFileSync(parentFile);
+        const childFile = join(dir, "fork-string-child.jsonl");
+        seedSubagentSessionFile({
+          mode: "fork",
+          parentSessionFile: parentFile,
+          parentLeafId: user.id,
+          childSessionFile: childFile,
+          childCwd: dir,
+        });
+        const entries = readFileSync(childFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+        assert.deepEqual(entries.slice(1).map((entry) => entry.id), [
+          MODEL_CHANGE.id, USER_MSG.id, ASSISTANT_MSG.id, ...(tagged ? [] : [user.id]),
+        ]);
+        if (!tagged) assert.deepEqual(entries.at(-1), user);
+        assert.deepEqual(readFileSync(parentFile), original, "parent file must remain byte-for-byte unchanged");
+      });
+    }
+
+    for (const atRoot of [false, true]) {
+      for (const keepAssistantText of [false, true]) {
+        it(`relinks consecutive dispatch removals ${atRoot ? "at the root" : "within a branch"} with ${keepAssistantText ? "mixed" : "tool-only"} spawning content`, () => {
+          const previousId = atRoot ? null : ASSISTANT_MSG.id;
+          const dispatch = {
+            type: "message",
+            id: "dispatch-one",
+            parentId: previousId,
+            message: { role: "user", content: `${SUBAGENT_DISPATCH_PREFIX} First dispatch.` },
+          };
+          const nextDispatch = {
+            type: "message",
+            id: "dispatch-two",
+            parentId: dispatch.id,
+            message: { role: "user", content: [{ type: "text", text: `${SUBAGENT_DISPATCH_PREFIX} Second dispatch.` }] },
+          };
+          const spawningAssistant = {
+            type: "message",
+            id: "spawning-assistant",
+            parentId: nextDispatch.id,
+            message: {
+              role: "assistant",
+              content: [
+                ...(keepAssistantText ? [{ type: "text", text: "Starting the review." }] : []),
+                { type: "toolCall", id: "unresolved-spawn", name: "subagent", arguments: { agent: "advisor", task: "Review the plan." } },
+              ],
+            },
+          };
+          const survivor = {
+            type: "message",
+            id: "surviving-user",
+            parentId: spawningAssistant.id,
+            message: { role: "user", content: "Please focus on correctness." },
+          };
+          const prefix = atRoot ? [] : [MODEL_CHANGE, USER_MSG, ASSISTANT_MSG];
+          const parentFile = createSessionFile(dir, [SESSION_HEADER, ...prefix, dispatch, nextDispatch, spawningAssistant, survivor]);
+          const original = readFileSync(parentFile);
+          const childFile = join(dir, "fork-dispatch-chain.jsonl");
+
+          // First seed at the actual launch leaf; then exercise a descendant
+          // whose parent chain crosses every removed entry.
+          for (const leaf of [spawningAssistant, survivor]) {
+            seedSubagentSessionFile({
+              mode: "fork",
+              parentSessionFile: parentFile,
+              parentLeafId: leaf.id,
+              childSessionFile: childFile,
+              childCwd: dir,
+            });
+            const entries = readFileSync(childFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+            const expected = [
+              ...prefix,
+              ...(keepAssistantText ? [{
+                ...spawningAssistant,
+                parentId: previousId,
+                message: { role: "assistant", content: [{ type: "text", text: "Starting the review." }] },
+              }] : []),
+              ...(leaf === survivor ? [{ ...survivor, parentId: keepAssistantText ? spawningAssistant.id : previousId }] : []),
+            ];
+            assert.deepEqual(entries.slice(1), expected);
+            assert.deepEqual(readFileSync(parentFile), original, "parent file must remain byte-for-byte unchanged");
+          }
+        });
+      }
+    }
 
     it("keeps current-turn tool answers while stripping unresolved spawning calls", () => {
       const questionCall = {
@@ -2021,6 +2177,36 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("delivers the framed fork task exactly once in direct launch arguments", () => {
+    const task = 'Review this plan.\nKeep "quoted text" and paths like /tmp/plan intact.';
+    for (const subagentAgents of [undefined, ["scout", "researcher"]]) {
+      const fullTask = testApi.buildSubagentTask(task, true, {
+        body: "Advisor identity",
+        systemPromptMode: "append",
+        autoExit: true,
+        subagentAgents,
+      });
+      const expected = `Task dispatched to you by the orchestrator:\n\n${task}`;
+      assert.equal(fullTask, expected);
+      assert.deepEqual(
+        testApi.buildPiPromptArgs({ effectiveSkills: "review", taskDelivery: "direct", taskArg: fullTask }),
+        ["/skill:review", expected],
+      );
+    }
+  });
+
+  it("keeps blank-session task wrappers unchanged", () => {
+    const task = "Review this plan.";
+    assert.equal(
+      testApi.buildSubagentTask(task, false, { body: "Advisor identity", autoExit: true }),
+      `\n\nAdvisor identity\n\nComplete your task autonomously. When you are finished, simply stop — your session ends automatically.\n\n${task}\n\nYour FINAL assistant message should summarize what you accomplished.`,
+    );
+    assert.equal(
+      testApi.buildSubagentTask(task, false, { body: "Advisor identity", systemPromptMode: "append" }),
+      `\n\nComplete your task. The user can interact with you at any time, and the session ends when the user exits the pane.\n\n${task}\n\nYour FINAL assistant message (before the user exits) should summarize what you accomplished.`,
+    );
+  });
+
   it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
     assert.deepEqual(
       testApi.buildPiPromptArgs({ effectiveSkills: "review,lint", taskDelivery: "artifact", taskArg: "@artifact.md" }),
@@ -2911,7 +3097,7 @@ describe("commands", () => {
     });
 
     assert.deepEqual(sentUserMessages, [
-      'Use subagent with agent: "scout", name: "Scout", task: "map the auth code"',
+      '[pi-subagent-dispatch] Call subagent({ agent: "scout", name: "Scout", task: "map the auth code" }) immediately. Do not check subagents_list.',
     ]);
   });
 
@@ -2926,7 +3112,7 @@ describe("commands", () => {
     });
 
     assert.deepEqual(sentUserMessages, [
-      'Use subagent with agent: "worker", model: "ollama/llama3.1:8b", thinking: "high", name: "Worker", task: "implement the fix"',
+      '[pi-subagent-dispatch] Call subagent({ agent: "worker", model: "ollama/llama3.1:8b", thinking: "high", name: "Worker", task: "implement the fix" }) immediately. Do not check subagents_list.',
     ]);
   });
 
@@ -2941,7 +3127,7 @@ describe("commands", () => {
     });
 
     assert.deepEqual(sentUserMessages, [
-      'Use subagent with agent: "worker", thinking: "high", name: "Worker", task: "inspect the failure"',
+      '[pi-subagent-dispatch] Call subagent({ agent: "worker", thinking: "high", name: "Worker", task: "inspect the failure" }) immediately. Do not check subagents_list.',
     ]);
   });
 

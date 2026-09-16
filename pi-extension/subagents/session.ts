@@ -24,16 +24,36 @@ export interface SessionEntry {
   [key: string]: unknown;
 }
 
+type MessageContentBlock = { type: string; text?: string; [key: string]: unknown };
+
 export interface MessageEntry extends SessionEntry {
   type: "message";
-  message: {
-    role: "user" | "assistant" | "toolResult";
-    content: Array<{ type: string; text?: string; [key: string]: unknown }>;
-    toolCallId?: string;
-  };
+  message: (
+    | { role: "user"; content: string | MessageContentBlock[] }
+    | { role: "assistant" | "toolResult"; content: MessageContentBlock[] }
+  ) & { toolCallId?: string };
 }
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
+
+/**
+ * Marker prefix for user messages this extension injects when a spawn is
+ * triggered from the `/subagent` command. The injected message exists to make
+ * the parent model emit the actual `subagent` tool call; it is orchestration
+ * chatter, not conversation content. Fork seeding strips tagged messages
+ * because they address the parent, not the child, regardless of whether the
+ * child has spawning tools. This prefix is reserved: matching is text-based,
+ * not proof that the extension authored the message.
+ */
+export const SUBAGENT_DISPATCH_PREFIX = "[pi-subagent-dispatch]";
+
+function isDispatchMessage(entry: MessageEntry): boolean {
+  const content = entry.message.content;
+  const text = typeof content === "string"
+    ? content
+    : content.find((block) => block.type === "text")?.text;
+  return typeof text === "string" && text.startsWith(SUBAGENT_DISPATCH_PREFIX);
+}
 
 function getForkContentLines(parentSessionFile: string, parentLeafId: string | null): string[] {
   const entries = readFileSync(parentSessionFile, "utf8")
@@ -82,6 +102,13 @@ function getForkContentLines(parentSessionFile: string, parentLeafId: string | n
     let next = structuredClone(entry);
     if (next.type === "message") {
       const messageEntry = next as MessageEntry;
+      // Drop reserved-prefix dispatch directives addressed to the parent,
+      // rather than passing those orchestration instructions to the child.
+      // Relink descendants via the standard removedParents mechanism.
+      if (messageEntry.message.role === "user" && isDispatchMessage(messageEntry)) {
+        removedParents.set(next.id, next.parentId);
+        continue;
+      }
       if (messageEntry.message.role === "assistant") {
         messageEntry.message.content = messageEntry.message.content.filter(
           (block) =>

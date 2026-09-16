@@ -37,7 +37,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for spawning directly, and `/subagent-sessions` for session inspection and explicit orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
+There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and `/subagent-sessions` for session inspection and explicit orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
 ### Spawning
 
@@ -128,6 +128,10 @@ You are a specialized agent that does X...
 - `standalone` — fresh session, no lineage link to the caller (default)
 - `lineage-only` — fresh session with `parentSession` linkage for discovery/fork UX, but no copied turns
 - `fork` — child session seeded with the caller's conversation context
+
+In `fork` mode, the child inherits the caller's conversation branch with unresolved tool calls and `/subagent` dispatch directives removed at seed time. Dispatch directives address the parent, not the child—even when the child has spawning tools. `[pi-subagent-dispatch]` is a reserved prefix: a user message is stripped if its string content or first text block starts with that tag, regardless of authorship. Untagged natural user requests ("spin up an advisor to review this plan") are preserved, and the parent transcript is unchanged. The task is delivered with a `Task dispatched to you by the orchestrator:` header to distinguish the assignment from inherited context.
+
+The `/subagent` command sends an explicit tool-call request to the main model; it does not bypass the model. This improves dispatch clarity but does not guarantee immediate execution or verbatim tool arguments. Supply a meaningful task rather than relying on the model to elaborate it.
 
 ### auto-exit
 
