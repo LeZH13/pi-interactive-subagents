@@ -37,7 +37,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
-There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and `/subagent-sessions` for session inspection and explicit orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
+There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
 ### Spawning
 
@@ -51,8 +51,8 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | `agent` | string | required | Which agent to spawn (must be known and permitted) |
 | `task` | string | required | Task prompt |
 | `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
-| `model` | string | agent's model | Override the model for this spawn. May include a `:thinking` suffix (for example, `provider/model:high`) |
-| `thinking` | string | agent's thinking level | Override the thinking/reasoning level for this spawn (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget). `none` is normalized to `off`; an explicit value overrides a suffix in `model` |
+| `model` | string | page override, else agent's model | Persistent default for this spawn, set in `/subagent-settings`. May include a `:thinking` suffix (for example, `provider/model:high`) |
+| `thinking` | string | page override, else agent's thinking level | Persistent default for this spawn, set in `/subagent-settings` (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget). `none` is normalized to `off`; an explicit value overrides a suffix in `model` |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 
 ### Messaging
@@ -129,21 +129,30 @@ You are a specialized agent that does X...
 
 `model-fallback` is attempted once when the primary run reports a provider/agent error, exits non-zero, or exits without any non-whitespace assistant text. The failed child is retained in the parent's artifacts and a fresh child starts from the original task under the same display name. User cancellation never triggers fallback, and a fallback that resolves to the same model and thinking level is skipped.
 
-With `model-fallback: inherit`, nested agents inherit from their **immediate spawner**, not always from the top-level conversation. Fallback thinking resolves in this order: an explicit per-spawn/picker value, the agent's `thinking`, the spawner's live thinking level, then Pi's default. The fallback model and thinking are frozen in the retry's loadout, so later `subagent_message` resumes replay the same selection.
+With `model-fallback: inherit`, nested agents inherit from their **immediate spawner**, not always from the top-level conversation. Fallback thinking resolves in this order: an explicit per-spawn value, the settings-page override, the agent's `thinking`, the spawner's live thinking level, then Pi's default. The fallback model and thinking are frozen in the retry's loadout, so later `subagent_message` resumes replay the same selection.
 
-### Model picker
+## Configuration (`config.json` + `/subagent-settings`)
 
-Enable an interactive model and thinking picker for every new spawn:
+`config.json` in the package root is the single persisted store (`status`, `multiplexing.backend`, per-agent `agents` overrides). It is **local and gitignored** — `config.json.example` is the committed template; copy it to opt out of defaults. Every `/subagent-settings` change applies live and is written immediately (atomic write); overrides for deleted agents are pruned on save.
 
 ```json
 {
-  "picker": { "enabled": true }
+  "status": { "enabled": true },
+  "multiplexing": { "backend": "auto" },
+  "agents": { "worker": { "model": "openai/gpt-5", "thinking": "high" } }
 }
 ```
 
-`PI_SUBAGENT_PICKER=1` enables it and `PI_SUBAGENT_PICKER=0` disables it, overriding `config.json`. The picker defaults to off. It lists registered models with the agent's configured model first and supports live, case-insensitive regular-expression filtering over full `provider/model` ids. Explicit tool or `/subagent` overrides become the initial choice, but the human's selection wins.
+### Settings page (`/subagent-settings`)
 
-Nested interactive spawners show their own picker. Headless callers and `subagent_message` resumes do not prompt; resumes replay the stored loadout. An automatic fallback retry also does not prompt a second time.
+`/subagent-settings` opens a settings page (same style as pi's `/settings`) with four groups:
+
+- **Backend** — `auto | tmux | herdr | background` surface preference for new subagents. Applies live and persists.
+- **Status widget** — show or hide the live subagent widget above the editor.
+- **One row per agent** (`scout`, `researcher`, `worker`, plus custom agents) — each opens a submenu with **Model** (type-to-filter regex list over registered `provider/model` ids), **Thinking** (level list, locked to `off` for non-reasoning models), and **Reset to markdown**.
+- **Orphan cleanup** — shows `N orphans · X files · Y KB`; Enter previews candidate dirs, then a confirm dialog deletes.
+
+Model/thinking precedence is **explicit spawn args > settings-page override > agent markdown default**. The old `/subagent-mux` and `/subagent-sessions` commands are removed; explicit `/subagent agent@model:thinking` args still win for a single spawn.
 
 ### session-mode
 
@@ -195,46 +204,21 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Surface backends & background mode
 
-Choose `auto`, `tmux`, `herdr`, or `background` in `config.json`:
-
-```json
-{
-  "status": { "enabled": true },
-  "picker": { "enabled": false },
-  "multiplexing": { "backend": "auto" }
-}
-```
+Backend preference lives in `config.json` (`multiplexing.backend`) — see [Configuration](#configuration-configjson--subagent-settings) — or the `/subagent-settings` backend row.
 
 `auto` selects Herdr when the process has `HERDR_ENV=1` plus `HERDR_PANE_ID`, tmux when it has `TMUX`, and otherwise background mode. If both nested environments are present, `auto` refuses to guess; explicitly select the intended backend. The effective choice is exported to children as `PI_SUBAGENT_BACKEND`, so nested subagents do not re-detect a different multiplexer.
 
 `PI_SUBAGENT_BACKEND=auto|tmux|herdr|background` overrides config. Legacy `{ "multiplexing": { "enabled": false } }`, `PI_SUBAGENT_MULTIPLEX=0|1`, and `PI_SUBAGENT_DISABLE_TMUX=1` remain supported; the disable variable always forces background mode.
 
-### Backend command (`/subagent-mux`)
-
-| Command | Description |
-| --- | --- |
-| `/subagent-mux auto|tmux|herdr|background` | Select the active session's backend preference |
-| `/subagent-mux on` / `off` | Backward-compatible aliases for `auto` / `background` |
-| `/subagent-mux toggle` | Toggle between `auto` and `background` |
-| `/subagent-mux status` | Show preference, effective backend, and environment detection |
-
 Herdr support is CLI-first and requires `herdr` on `PATH` while Pi runs in a Herdr pane. It uses only default split layout: `herdr pane split "$HERDR_PANE_ID" --direction right --no-focus`. No plugin, socket client, tabs, or advanced layout configuration is required. Herdr management CLI calls are bounded, but subagent task duration is not timed out. Tested against Herdr 0.9.0 (and tmux 3.7c).
 
 Background output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.log`.
 
-## Status widget & configuration
+## Status widget
 
-The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`. Toggle the widget via the `/subagent-settings` status-widget row (persists to `config.json`).
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
-
-```json
-{
-  "status": { "enabled": true }
-}
-```
-
-## Session Storage & Management
+## Session Storage & Orphan Cleanup
 
 ### Parent-Scoped Storage
 
@@ -259,24 +243,14 @@ Sub-agent session transcripts (`.jsonl`) and their sandbox loadout sidecars (`.l
 - **Explicit Retention**: Completed child sessions remain alongside the parent and are retained even after parent deletion until orphan cleanup is explicitly applied.
 - **Existing History Unchanged**: Legacy top-level child sessions are not moved automatically; clean them up manually if desired.
 
-### Explicit Orphan Cleanup
+### Orphan cleanup
 
-Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the `/subagent-sessions cleanup-orphans` command when you want to inspect and remove them.
+Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the **Orphan cleanup** row in `/subagent-settings` when you want to inspect and remove them. The row shows a live `N orphans · X files · Y KB` summary; Enter previews the candidate dirs, then a confirm dialog deletes them.
 
 - **Marker-Only Ownership**: Cleanup considers only directories with a valid extension ownership marker matching the parent session ID. Familiar filenames alone are not treated as proof of ownership.
 - **Preview First**: Cleanup defaults to a read-only, directory-level summary. It reports candidate directories, total stored file counts, and approximate sizes; it does not enumerate every file that will be removed.
-- **Explicit Apply**: Deletion requires both `--apply` and interactive confirmation. Before confirming, ensure no child process from the deleted parent is still running in another Pi process; cross-process liveness is not inferred from session files.
+- **Explicit Confirm**: deletion requires interactive confirmation. Before confirming, ensure no child process from a deleted parent is still running in another Pi process; cross-process liveness is not inferred from session files.
 - **Foreign Data Preservation**: Only recognized extension files are removed; unrelated files in the same artifact directory are preserved.
-
-### Management Command (`/subagent-sessions`)
-
-The `/subagent-sessions` command provides interactive session inspection and cleanup:
-
-| Command | Description |
-| --- | --- |
-| `/subagent-sessions status` (or `/subagent-sessions list`) | Show active running subagents and registered subagent sessions for this session |
-| `/subagent-sessions cleanup-orphans` | Preview marked artifact directories whose parent sessions were deleted |
-| `/subagent-sessions cleanup-orphans --apply` | Clean marked orphan artifacts after confirmation |
 
 ## Requirements
 

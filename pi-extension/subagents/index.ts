@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -19,10 +19,6 @@ import { homedir } from "node:os";
 import {
   isMuxAvailable,
   muxSetupHint,
-  isTmuxAvailable,
-  isMultiplexingEnabled,
-  isMultiplexingActive,
-  setMultiplexingEnabled,
   createSurface,
   sendCommand,
   sendLongCommand,
@@ -34,11 +30,7 @@ import {
   getBackgroundSurfaceLogPath,
   closeAllBackgroundSurfaces,
   getSurfaceBackend,
-  getSurfaceBackendPreference,
-  isHerdrAvailable,
-  resolveSurfaceBackend,
   setSurfaceBackendPreference,
-  type SurfaceBackendKind,
 } from "./surface.ts";
 
 import {
@@ -56,17 +48,17 @@ import {
   summarizeSessionStats,
   writeSubagentLoadout,
   writeArtifactOwnershipMarker,
-  cleanOrphanArtifactDirs,
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
 import {
-  canShowSpawnPicker,
-  loadPickerConfig,
-  resolvePickerEnabled,
-  showSpawnPicker,
-} from "./picker.ts";
+  createSubagentsConfigState,
+  loadSubagentsConfig,
+  type SubagentsConfigState,
+} from "./config.ts";
+import { registerSubagentSettingsCommand } from "./settings.ts";
 import {
+  DEFAULT_STATUS_LINE_LIMIT,
   type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
@@ -77,7 +69,6 @@ import {
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -578,15 +569,33 @@ function parseSubagentSpec(spec: string): {
   };
 }
 
-/** Resolve model and thinking together so the loadout always stores a bare model id. */
+/**
+ * Resolve model and thinking together so the loadout always stores a bare model id.
+ *
+ * Precedence: explicit tool/`/subagent` args > `/subagent-settings` per-agent
+ * override > agent markdown default.
+ */
 function resolveEffectiveModelAndThinking(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): { model: string | undefined; thinking: string | undefined } {
-  const resolvedModel = splitModelThinking(params.model ?? agentDefs?.model);
+  const pageOverride = params.agent ? configState.get().agents[params.agent] : undefined;
+  const mergedDefs = agentDefs && pageOverride
+    ? {
+      ...agentDefs,
+      ...(pageOverride.model !== undefined ? { model: pageOverride.model } : {}),
+      ...(pageOverride.thinking !== undefined ? { thinking: pageOverride.thinking } : {}),
+    }
+    : (pageOverride
+      ? {
+        ...(pageOverride.model !== undefined ? { model: pageOverride.model } : {}),
+        ...(pageOverride.thinking !== undefined ? { thinking: pageOverride.thinking } : {}),
+      } as AgentDefaults
+      : agentDefs);
+  const resolvedModel = splitModelThinking(params.model ?? mergedDefs?.model);
   const thinking = params.thinking !== undefined
     ? normalizeThinking(params.thinking)
-    : resolvedModel.thinking ?? normalizeThinking(agentDefs?.thinking);
+    : resolvedModel.thinking ?? normalizeThinking(mergedDefs?.thinking);
 
   return { model: resolvedModel.model, thinking };
 }
@@ -877,8 +886,16 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
-const pickerConfig = loadPickerConfig();
+/**
+ * Unified live config state: status widget flag, backend preference, and
+ * per-agent model/thinking overrides. `/subagent-settings` mutates it live
+ * (persisting each change to config.json); spawn/resume resolution reads it.
+ * The surface backend preference mirrors into surface.ts so live
+ * createSurface() calls follow page changes without a restart.
+ */
+const configState: SubagentsConfigState = createSubagentsConfigState(loadSubagentsConfig());
+setSurfaceBackendPreference(configState.get().multiplexing.backend);
+const statusConfig = { get enabled() { return configState.get().status.enabled; }, lineLimit: DEFAULT_STATUS_LINE_LIMIT };
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -1618,6 +1635,7 @@ export const __test__ = {
   },
   parseSubagentSpec,
   resolveEffectiveModelAndThinking,
+  getSubagentsConfigState: () => configState,
   resolveParentModelDefaults,
   resolveFallbackModelAndThinking,
   shouldRetryWithFallback,
@@ -2339,23 +2357,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const agentDefs = loadAgentDefaults(params.agent);
         const parentDefaults = resolveParentModelDefaults(ctx, pi);
-        if (resolvePickerEnabled(pickerConfig.enabled) && canShowSpawnPicker(ctx)) {
-          const configured = resolveEffectiveModelAndThinking(params, agentDefs);
-          const picked = await showSpawnPicker(ctx, {
-            model: configured.model,
-            thinking: configured.thinking,
-            parentModel: parentDefaults.model,
-            parentThinking: parentDefaults.thinking,
-          });
-          if (!picked) {
-            return {
-              content: [{ type: "text", text: "Subagent spawn cancelled in the model picker." }],
-              details: { error: "picker cancelled", status: "cancelled" },
-            };
-          }
-          params.model = picked.model;
-          params.thinking = picked.thinking;
-        }
         const primarySelection = resolveEffectiveModelAndThinking(params, agentDefs);
         const fallbackSelection = resolveFallbackModelAndThinking(params, agentDefs, parentDefaults);
 
@@ -3028,154 +3029,70 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagent-mux — select an explicit surface backend. on/off/toggle remain
-  // aliases for auto/background to preserve existing scripts and muscle memory.
-  pi.registerCommand("subagent-mux", {
-    description: "Control subagent surfaces: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]",
-    getArgumentCompletions: (prefix: string) => {
-      const choices = ["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"];
-      const value = prefix.trim().toLowerCase();
-      return choices
-        .filter((choice) => choice.startsWith(value))
-        .map((choice) => ({ value: choice, label: choice }));
+  // `/subagent-settings` — backend, status widget, per-agent model/thinking
+  // defaults, and orphan cleanup. Replaces `/subagent-mux` and
+  // `/subagent-sessions` (both removed, no shims). The page is also the
+  // model picker: per-agent overrides persist to config.json and outrank
+  // markdown defaults, while explicit spawn args still win per-spawn.
+  registerSubagentSettingsCommand(pi, {
+    discoverAgents: () => discoverAgentDefinitions().map((a) => ({
+      name: a.name,
+      description: a.description,
+    })),
+    markdownDefaults: (agentName) => {
+      const defs = loadAgentDefaults(agentName);
+      const split = splitModelThinking(defs?.model);
+      return {
+        model: split.model,
+        thinking: split.thinking ?? normalizeThinking(defs?.thinking),
+      };
     },
-    handler: async (args, ctx) => {
-      const action = args.trim().toLowerCase() || "toggle";
-      if (!["auto", "tmux", "herdr", "background", "on", "off", "status", "toggle"].includes(action)) {
-        ctx.ui.notify("Usage: /subagent-mux [auto|tmux|herdr|background|on|off|status|toggle]", "warning");
-        return;
+    registryModels: (preferred) => {
+      const models: string[] = [];
+      try {
+        for (const m of latestCtx?.modelRegistry?.getAll() ?? []) {
+          if (m.provider && m.id) models.push(`${m.provider}/${m.id}`);
+        }
+      } catch {}
+      const seen = new Set<string>();
+      const out: string[] = [];
+      for (const value of [preferred, ...models]) {
+        const trimmed = value?.trim();
+        if (trimmed && !seen.has(trimmed)) {
+          seen.add(trimmed);
+          out.push(trimmed);
+        }
       }
-
-      if (action !== "status") {
-        if (action === "on") setSurfaceBackendPreference("auto");
-        else if (action === "off") setSurfaceBackendPreference("background");
-        else if (action === "toggle") {
-          setSurfaceBackendPreference(getSurfaceBackendPreference() === "background" ? "auto" : "background");
-        } else setSurfaceBackendPreference(action as SurfaceBackendKind);
-      }
-
-      let effective: string;
-      try { effective = resolveSurfaceBackend(); }
-      catch (error: any) { effective = `error (${error?.message ?? error})`; }
-      ctx.ui.notify(
-        `Subagent backend preference: ${getSurfaceBackendPreference()}\n` +
-          `effective backend: ${effective}\n` +
-          `tmux detected: ${isTmuxAvailable() ? "YES" : "NO"}\n` +
-          `Herdr detected: ${isHerdrAvailable() ? "YES" : "NO"}`,
-        effective.startsWith("error") ? "warning" : "info",
-      );
+      return out;
     },
-  });
-
-  // /subagent-sessions command — inspect subagents and manually clean orphaned artifacts
-  pi.registerCommand("subagent-sessions", {
-    description: "Manage subagent sessions: /subagent-sessions [status|cleanup-orphans|help] [--apply]",
-    getArgumentCompletions: (prefix: string) => {
-      const subcommands = ["status", "list", "cleanup-orphans", "help"];
-      const trimmed = prefix.trim();
-      if (!trimmed) return subcommands.map((s) => ({ value: s, label: s }));
-      if (trimmed.startsWith("cleanup-orphans")) {
-        return ["cleanup-orphans", "cleanup-orphans --apply"]
-          .filter((c) => c.startsWith(trimmed))
-          .map((c) => ({ value: c, label: c }));
+    modelSupportsReasoning: (model) => {
+      if (!model || !latestCtx?.modelRegistry) return true;
+      try {
+        const match = latestCtx.modelRegistry.getAll().find((m) =>
+          `${m.provider}/${m.id}` === model || m.id === model
+        );
+        return match?.reasoning !== false;
+      } catch {
+        return true;
       }
-      return subcommands
-        .filter((s) => s.startsWith(trimmed))
-        .map((s) => ({ value: s, label: s }));
     },
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const subcmd = parts[0]?.toLowerCase() || "status";
-      const flag = parts[1]?.toLowerCase();
-      const isApply = flag === "--apply";
-
-      const sessionDir = ctx.sessionManager.getSessionDir();
-      const sessionId = ctx.sessionManager.getSessionId();
-      const artifactDir = getArtifactDir(sessionDir, sessionId);
-
-      if (subcmd === "status" || subcmd === "list") {
-        const runningList = Array.from(runningSubagents.values());
-        const registry = readNameRegistry(artifactDir);
-        const regEntries = Object.entries(registry);
-
-        const lines: string[] = [];
-        lines.push(`Subagent Sessions Status:`);
-        lines.push(`• Active running: ${runningList.length}`);
-        for (const r of runningList) {
-          lines.push(`  - ${r.name} (${r.agent ?? "agent"}) [${r.id}] — surface: ${r.surface}`);
-        }
-        lines.push(`• Registered in session (${sessionId}): ${regEntries.length}`);
-        for (const [name, entry] of regEntries) {
-          const exists = existsSync(entry.sessionFile) ? "persisted" : "missing";
-          lines.push(`  - ${name}: ${entry.sessionId ?? "n/a"} (${exists})`);
-        }
-
-        if (ctx.hasUI) {
-          ctx.ui.notify(lines.join("\n"), "info");
-        }
-        return;
+    configState,
+    setBackendPreference: (backend) => setSurfaceBackendPreference(backend),
+    setStatusEnabled: () => updateWidget(),
+    sessionDirs: (ctx) => {
+      try {
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (!sessionFile) return null;
+        return {
+          sessionDir: ctx.sessionManager.getSessionDir(),
+          sessionId: ctx.sessionManager.getSessionId(),
+        };
+      } catch {
+        return null;
       }
-
-      if (subcmd === "cleanup-orphans") {
-        const runningSessionFiles = Array.from(runningSubagents.values()).map((r) => r.sessionFile);
-        const preview = cleanOrphanArtifactDirs(sessionDir, {
-          dryRun: true,
-          currentSessionId: sessionId,
-          runningSessionFiles,
-          minAgeMs: 0,
-        });
-
-        if (isApply) {
-          if (preview.candidates.length === 0) {
-            if (ctx.hasUI) ctx.ui.notify("Orphan cleanup: No orphan artifact directories found.", "info");
-            return;
-          }
-
-          if (ctx.hasUI) {
-            const totalFiles = preview.candidates.reduce((sum, c) => sum + c.fileCount, 0);
-            const totalKb = Math.round(preview.candidates.reduce((sum, c) => sum + c.sizeBytes, 0) / 1024);
-            const ok = await ctx.ui.confirm(
-              "Confirm Orphan Cleanup",
-              `Permanently clean recognized extension artifacts for ${preview.candidates.length} orphan session(s) (${totalFiles} stored files, ${totalKb} KB total)? Ensure no child from a deleted parent is still running in another Pi process.`,
-            );
-            if (!ok) {
-              ctx.ui.notify("Orphan cleanup cancelled.", "info");
-              return;
-            }
-          }
-
-          const result = cleanOrphanArtifactDirs(sessionDir, {
-            dryRun: false,
-            currentSessionId: sessionId,
-            runningSessionFiles,
-            minAgeMs: 0,
-          });
-
-          const msg = result.cleanedFilesCount > 0
-            ? `Orphan cleanup: Cleaned ${result.cleanedFilesCount} files across ${result.cleanedDirs.length + result.preservedForeignDirs.length} orphan session(s).`
-            : `Orphan cleanup: No orphan artifact files cleaned.`;
-          if (ctx.hasUI) ctx.ui.notify(msg, "info");
-        } else {
-          const candidateLines = preview.candidates.map(
-            (c) => `• ${basename(c.dir)} (${c.fileCount} files, ${Math.round(c.sizeBytes / 1024)} KB)`,
-          );
-          const msg = preview.candidates.length > 0
-            ? `Orphan cleanup preview (${preview.candidates.length} candidate(s)):\n${candidateLines.join("\n")}\nRun '/subagent-sessions cleanup-orphans --apply' to remove.`
-            : `Orphan cleanup preview: No orphan artifact directories found.`;
-          if (ctx.hasUI) ctx.ui.notify(msg, "info");
-        }
-        return;
-      }
-
-      // Help
-      const help = [
-        `Subagent Sessions Management (/subagent-sessions):`,
-        `  /subagent-sessions status       - Show active and registered subagents`,
-        `  /subagent-sessions cleanup-orphans           - Preview orphaned subagent artifacts`,
-        `  /subagent-sessions cleanup-orphans --apply   - Remove marked orphan artifacts`,
-      ].join("\n");
-      if (ctx.hasUI) ctx.ui.notify(help, "info");
     },
+    runningSessionFiles: () => Array.from(runningSubagents.values()).map((r) => r.sessionFile),
+    artifactDirFor: (sessionDir, sessionId) => getArtifactDir(sessionDir, sessionId),
   });
 
   // ── subagent_result message renderer ──

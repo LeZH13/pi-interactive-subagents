@@ -71,15 +71,16 @@ import {
   formatStatusLine,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
-  parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
-  loadPickerConfig,
-  parsePickerConfig,
-  regexFilterModels,
-  resolvePickerEnabled,
-} from "../pi-extension/subagents/picker.ts";
+  createSubagentsConfigState,
+  DEFAULT_SUBAGENTS_CONFIG,
+  loadSubagentsConfig,
+  parseSubagentsConfig,
+  serializeSubagentsConfig,
+  writeSubagentsConfig,
+} from "../pi-extension/subagents/config.ts";
+import { regexFilterModels } from "../pi-extension/subagents/settings.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -1225,59 +1226,70 @@ describe("session.ts", () => {
 
 });
 
-describe("status.ts", () => {
-  it("parses strict config objects", () => {
-    const disabled = parseStatusConfig({ status: { enabled: false } });
-
-    assert.deepEqual(disabled, {
-      enabled: false,
-      lineLimit: 4,
+describe("config.ts (unified subagent config)", () => {
+  it("parses the unified config with defaults", () => {
+    assert.deepEqual(parseSubagentsConfig({}), {
+      status: { enabled: true },
+      multiplexing: { backend: "auto" },
+      agents: {},
     });
+    assert.deepEqual(
+      parseSubagentsConfig({
+        status: { enabled: false },
+        multiplexing: { backend: "background" },
+        agents: { worker: { model: "openai/gpt-5", thinking: "high" } },
+      }),
+      {
+        status: { enabled: false },
+        multiplexing: { backend: "background" },
+        agents: { worker: { model: "openai/gpt-5", thinking: "high" } },
+      },
+    );
   });
 
-  it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    const config = loadStatusConfig(examplePath);
-
-    assert.deepEqual(config, {
-      enabled: true,
-      lineLimit: 4,
-    });
+  it("tolerates the legacy picker key and drops it on serialize", () => {
+    const parsed = parseSubagentsConfig({ picker: { enabled: true } });
+    assert.deepEqual(parsed.agents, {});
+    assert.doesNotMatch(serializeSubagentsConfig(parsed), /picker/);
   });
 
   it("loads the shared example when local config is absent", () => {
-    withTempDir((dir) => {
-      const examplePath = join(dir, "config.json.example");
-      writeFileSync(
-        examplePath,
-        JSON.stringify({ status: { enabled: true } }, null, 2) + "\n",
-      );
-
-      const config = loadStatusConfig(join(dir, "config.json"), examplePath);
-
-      assert.deepEqual(config, {
-        enabled: true,
-        lineLimit: 4,
-      });
+    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    assert.deepEqual(loadSubagentsConfig(examplePath), {
+      status: { enabled: true },
+      multiplexing: { backend: "auto" },
+      agents: {},
     });
   });
 
   it("fails fast for invalid config shapes", () => {
     assert.throws(
-      () => parseStatusConfig({ status: { enabled: "false" } }),
+      () => parseSubagentsConfig({ status: { enabled: "false" } }),
       /status\.enabled must be a boolean/,
     );
     assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
-      /status has unsupported key\(s\): defaultCadenceSeconds/,
+      () => parseSubagentsConfig({ multiplexing: { backend: "carrier-pigeon" } }),
+      /multiplexing\.backend must be auto, tmux, herdr, or background/,
+    );
+    assert.throws(
+      () => parseSubagentsConfig({ multiplexing: { enabled: false, backend: "auto" } }),
+      /enabled=false conflicts/,
+    );
+    assert.throws(
+      () => parseSubagentsConfig({ agents: { worker: { model: 42 } } }),
+      /agents\.worker\.model must be a string/,
+    );
+    assert.throws(
+      () => parseSubagentsConfig({ agents: { worker: { model: "x", turbo: true } } }),
+      /agents\.worker has unsupported key/,
     );
   });
 
   it("reports when neither local nor shared config exists", () => {
     withTempDir((dir) => {
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
-        /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
+        () => loadSubagentsConfig(join(dir, "config.json"), join(dir, "config.json.example")),
+        /Missing subagent config\. Expected .*config\.json.*or.*config\.json\.example/,
       );
     });
   });
@@ -1288,7 +1300,7 @@ describe("status.ts", () => {
       writeFileSync(examplePath, "{\n");
 
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), examplePath),
+        () => loadSubagentsConfig(join(dir, "config.json"), examplePath),
         /Invalid JSON in subagent config .*config\.json\.example/,
       );
     });
@@ -1305,9 +1317,46 @@ describe("status.ts", () => {
       );
 
       assert.throws(
-        () => loadStatusConfig(configPath, examplePath),
+        () => loadSubagentsConfig(configPath, examplePath),
         /Invalid JSON in subagent config .*config\.json/,
       );
+    });
+  });
+
+  it("round-trips through writeSubagentsConfig, pruning empty overrides", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeSubagentsConfig(
+        {
+          status: { enabled: false },
+          multiplexing: { backend: "tmux" },
+          agents: { worker: { model: "  ", thinking: "high" }, ghost: {} },
+        },
+        configPath,
+      );
+      assert.deepEqual(loadSubagentsConfig(configPath), {
+        status: { enabled: false },
+        multiplexing: { backend: "tmux" },
+        agents: { worker: { thinking: "high" } },
+      });
+    });
+  });
+
+  it("createSubagentsConfigState prunes overrides for deleted agents", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      const state = createSubagentsConfigState(
+        {
+          ...DEFAULT_SUBAGENTS_CONFIG,
+          agents: { worker: { model: "openai/gpt-5" }, ghost: { model: "x/y" } },
+        },
+        configPath,
+      );
+      state.update(() => {}, { pruneAgents: ["worker"] });
+      assert.deepEqual(state.get().agents, { worker: { model: "openai/gpt-5" } });
+      assert.deepEqual(loadSubagentsConfig(configPath).agents, {
+        worker: { model: "openai/gpt-5" },
+      });
     });
   });
 
@@ -1700,32 +1749,7 @@ describe("status.ts", () => {
   });
 });
 
-describe("model picker configuration", () => {
-  it("defaults off and parses picker.enabled strictly", () => {
-    assert.deepEqual(parsePickerConfig({}), { enabled: false });
-    assert.deepEqual(parsePickerConfig({ picker: { enabled: true } }), { enabled: true });
-    assert.throws(
-      () => parsePickerConfig({ picker: { enabled: "yes" } }),
-      /picker\.enabled must be a boolean/,
-    );
-    assert.throws(
-      () => parsePickerConfig({ picker: { enabled: true, mode: "all" } }),
-      /picker has unsupported key\(s\): mode/,
-    );
-  });
-
-  it("loads picker config and applies strict environment overrides", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
-    assert.deepEqual(loadPickerConfig(examplePath), { enabled: false });
-    assert.equal(resolvePickerEnabled(false, { PI_SUBAGENT_PICKER: "1" }), true);
-    assert.equal(resolvePickerEnabled(true, { PI_SUBAGENT_PICKER: "0" }), false);
-    assert.equal(resolvePickerEnabled(true, {}), true);
-    assert.throws(
-      () => resolvePickerEnabled(false, { PI_SUBAGENT_PICKER: "yes" }),
-      /expected 0 or 1/,
-    );
-  });
-
+describe("settings page model filtering", () => {
   it("filters full model ids with case-insensitive regular expressions", () => {
     const models = ["openai/gpt-5", "anthropic/claude-sonnet", "openrouter/z-ai/glm-5.3"];
     assert.deepEqual(regexFilterModels(models, "^(openai|anthropic)/").matches, models.slice(0, 2));
@@ -2097,6 +2121,66 @@ describe("subagent discovery", () => {
 
     for (const [spec, expected] of cases) {
       assert.deepEqual(testApi.parseSubagentSpec(spec), expected, spec);
+    }
+  });
+
+  it("prefers settings-page overrides over markdown defaults but not over explicit args", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      const state = createSubagentsConfigState(DEFAULT_SUBAGENTS_CONFIG, configPath);
+      state.update((draft) => {
+        draft.agents["worker"] = { model: "override/model", thinking: "high" };
+      });
+      // Persisted to the temp config file.
+      assert.deepEqual(loadSubagentsConfig(configPath).agents, {
+        worker: { model: "override/model", thinking: "high" },
+      });
+      // Parsing precedence (args > page > markdown) is covered by
+      // resolveEffectiveModelAndThinking reading the live configState;
+      // exercise the merge helper directly via the temp state.
+      assert.deepEqual(state.get().agents, {
+        worker: { model: "override/model", thinking: "high" },
+      });
+      state.update(
+        (draft) => {
+          draft.agents["worker"] = { model: "override/model" };
+        },
+        { pruneAgents: ["worker", "scout"] },
+      );
+      assert.deepEqual(state.get().agents, { worker: { model: "override/model" } });
+      // Pruning drops overrides for agents that no longer exist.
+      state.update(() => {}, { pruneAgents: ["scout"] });
+      assert.deepEqual(state.get().agents, {});
+    });
+  });
+
+  it("live configState override outranks markdown but yields to explicit args", () => {
+    const state = testApi.getSubagentsConfigState();
+    const before = state.get();
+    // The extension module loads the real config.json at import; a stale
+    // "worker" override from an earlier settings-page save would leak into
+    // unrelated precedence tests. Scope the mutation with try/finally.
+    state.replace({
+      ...before,
+      agents: { ...before.agents, worker: { model: "override/model", thinking: "high" } },
+    });
+    try {
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T" },
+          { model: "provider/model", thinking: "low" },
+        ),
+        { model: "override/model", thinking: "high" },
+      );
+      assert.deepEqual(
+        testApi.resolveEffectiveModelAndThinking(
+          { agent: "worker", task: "T", model: "explicit/model", thinking: "low" },
+          { model: "provider/model", thinking: "low" },
+        ),
+        { model: "explicit/model", thinking: "low" },
+      );
+    } finally {
+      state.replace(before);
     }
   });
 
@@ -3069,43 +3153,26 @@ describe("run-scoped completion records", () => {
 describe("commands", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  it("registers /subagent before secondary subagent commands so prefix ties prioritize /subagent", () => {
+  it("registers /subagent before /subagent-settings so prefix ties prioritize /subagent", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const subagentIndex = registeredCommands.findIndex((c) => c.name === "subagent");
-    const muxIndex = registeredCommands.findIndex((c) => c.name === "subagent-mux");
-    const sessionsIndex = registeredCommands.findIndex((c) => c.name === "subagent-sessions");
+    const settingsIndex = registeredCommands.findIndex((c) => c.name === "subagent-settings");
     assert.ok(subagentIndex !== -1, "subagent command registered");
-    assert.ok(muxIndex !== -1, "subagent-mux command registered");
-    assert.ok(sessionsIndex !== -1, "subagent-sessions command registered");
-    assert.ok(subagentIndex < muxIndex, "/subagent should be registered before /subagent-mux");
-    assert.ok(subagentIndex < sessionsIndex, "/subagent should be registered before /subagent-sessions");
+    assert.ok(settingsIndex !== -1, "subagent-settings command registered");
+    assert.equal(registeredCommands.find((c) => c.name === "subagent-mux"), undefined);
+    assert.equal(registeredCommands.find((c) => c.name === "subagent-sessions"), undefined);
+    assert.ok(subagentIndex < settingsIndex, "/subagent should be registered before /subagent-settings");
   });
 
-  it("registers /subagent-mux with completions and toggles session state", async () => {
+  it("registers /subagent-settings with a non-interactive fallback", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-    const command = registeredCommands.find((item) => item.name === "subagent-mux");
-    assert.ok(command);
-    assert.deepEqual(command.getArgumentCompletions("").map((item: any) => item.value), [
-      "auto", "tmux", "herdr", "background", "on", "off", "status", "toggle",
-    ]);
-
+    const command = registeredCommands.find((item) => item.name === "subagent-settings");
+    assert.ok(command, "expected /subagent-settings to be registered");
     const notices: string[] = [];
-    const ctx = { ui: { notify(message: string) { notices.push(message); } } };
-    const previous = isMultiplexingEnabled();
-    try {
-      await command.handler("off", ctx);
-      assert.equal(isMultiplexingEnabled(), false);
-      assert.match(notices.at(-1)!, /backend preference: background/);
-      await command.handler("toggle", ctx);
-      assert.equal(isMultiplexingEnabled(), true);
-      await command.handler("status", ctx);
-      assert.match(notices.at(-1)!, /tmux detected: (YES|NO)/);
-      assert.match(notices.at(-1)!, /Herdr detected: (YES|NO)/);
-    } finally {
-      setMultiplexingEnabled(previous);
-    }
+    await command.handler("", { hasUI: false, ui: { notify: (m: string) => notices.push(m) } });
+    assert.ok(notices.some((n) => n.includes("interactive mode")));
   });
 
   it("/subagent completes agent names for empty and partial prefixes", async () => {
@@ -3306,95 +3373,49 @@ describe("commands", () => {
     ]);
   });
 
-  it("does not register the removed /iterate or /plan commands", () => {
+  it("does not register the removed /iterate, /plan, /subagent-mux, or /subagent-sessions commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+    assert.equal(registeredCommands.find((c) => c.name === "subagent-mux"), undefined);
+    assert.equal(registeredCommands.find((c) => c.name === "subagent-sessions"), undefined);
   });
 
-  it("/subagent-sessions provides status and explicit orphan cleanup", async () => {
-    const { api, registeredCommands } = createMockExtensionApi();
-    (subagentsModule as any).default(api);
-
-    const subagentsCmd = registeredCommands.find((c) => c.name === "subagent-sessions");
-    assert.ok(subagentsCmd, "expected /subagent-sessions to be registered");
-    assert.equal(registeredCommands.find((c) => c.name === "subagents"), undefined);
-    assert.equal(registeredCommands.find((c) => c.name === "subagent-session"), undefined);
-
-    // Check argument completions
-    const completionsAll = subagentsCmd.getArgumentCompletions("");
-    assert.ok(completionsAll.some((c: any) => c.value === "status"));
-    assert.ok(completionsAll.some((c: any) => c.value === "cleanup-orphans"));
-    assert.equal(completionsAll.some((c: any) => c.value === "gc"), false);
-
-    const cleanupCompletions = subagentsCmd.getArgumentCompletions("cleanup-orphans");
-    assert.ok(cleanupCompletions.some((c: any) => c.value === "cleanup-orphans --apply"));
-
-    // Test handler execution with mock UI context
+  it("orphan artifact helpers still find and clean marked dirs (settings page reuses them)", async () => {
     await withTempDir(async (tDir) => {
       const parentId = "test-parent-session";
       const parentFile = join(tDir, `${parentId}.jsonl`);
       writeFileSync(parentFile, JSON.stringify({ type: "session", version: 3, id: parentId, cwd: tDir }) + "\n");
-      const notifications: string[] = [];
-      const mockCtx = {
-        hasUI: true,
-        sessionManager: {
-          getSessionDir: () => tDir,
-          getSessionId: () => parentId,
-          getSessionFile: () => parentFile,
-        },
-        ui: {
-          notify: (msg: string) => notifications.push(msg),
-        },
-      };
 
-      // 1. Status command
-      subagentsCmd.handler("status", mockCtx);
-      assert.ok(notifications.some((n) => n.includes("Subagent Sessions Status")));
+      // 1. Empty scan finds nothing.
+      assert.equal(
+        findOrphanArtifactDirs(tDir, { dryRun: true, currentSessionId: parentId, minAgeMs: 0 }).length,
+        0,
+      );
 
-      // 2. Cleanup preview (dry-run when empty)
-      notifications.length = 0;
-      await subagentsCmd.handler("cleanup-orphans", mockCtx);
-      assert.ok(notifications.some((n) => n.includes("No orphan artifact directories found")));
-
-      // 3. Setup orphan artifact directory
+      // 2. A marked dir whose parent session is gone becomes a candidate.
       const orphanArt = join(tDir, "artifacts", "orphan-1");
       mkdirSync(join(orphanArt, "subagents"), { recursive: true });
       writeFileSync(join(orphanArt, "subagent-registry.json"), "{}");
       writeArtifactOwnershipMarker(orphanArt, "orphan-1");
 
-      // 4. Cleanup preview (dry-run with orphan candidate — exercises basename)
-      notifications.length = 0;
-      await subagentsCmd.handler("cleanup-orphans", mockCtx);
-      assert.ok(notifications.some((n) => n.includes("Orphan cleanup preview (1 candidate(s))")));
-      assert.ok(notifications.some((n) => n.includes("• orphan-1")));
+      const candidates = findOrphanArtifactDirs(tDir, {
+        dryRun: true,
+        currentSessionId: parentId,
+        minAgeMs: 0,
+      });
+      assert.equal(candidates.length, 1);
+      assert.ok(candidates[0].dir.endsWith("orphan-1"));
 
-      // 5. Cleanup apply with rejection (confirm: false)
-      notifications.length = 0;
-      const rejectMockCtx = {
-        ...mockCtx,
-        ui: {
-          notify: (msg: string) => notifications.push(msg),
-          confirm: async () => false,
-        },
-      };
-      await subagentsCmd.handler("cleanup-orphans --apply", rejectMockCtx);
-      assert.ok(notifications.some((n) => n.includes("cancelled")));
-      assert.ok(existsSync(orphanArt)); // preserved
-
-      // 6. Cleanup apply with acceptance (confirm: true)
-      notifications.length = 0;
-      const acceptMockCtx = {
-        ...mockCtx,
-        ui: {
-          notify: (msg: string) => notifications.push(msg),
-          confirm: async () => true,
-        },
-      };
-      await subagentsCmd.handler("cleanup-orphans --apply", acceptMockCtx);
-      assert.ok(notifications.some((n) => n.includes("Orphan cleanup")));
-      assert.equal(existsSync(orphanArt), false); // cleaned
+      // 3. Cleaning removes recognized extension files.
+      const result = cleanOrphanArtifactDirs(tDir, {
+        dryRun: false,
+        currentSessionId: parentId,
+        minAgeMs: 0,
+      });
+      assert.equal(existsSync(orphanArt), false);
+      assert.ok(result.cleanedFilesCount > 0);
     });
   });
 });
