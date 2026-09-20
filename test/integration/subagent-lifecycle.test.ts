@@ -196,6 +196,45 @@ for (const backend of backends) {
       );
     });
 
+    it("retries a failed primary model with the inherited parent model", async () => {
+      const id = uniqueId();
+      const fallbackAgentFile = join(env.dir, ".pi", "agents", `test-fallback-${id}.md`);
+      writeFileSync(
+        fallbackAgentFile,
+        [
+          "---",
+          `name: test-fallback-${id}`,
+          "model: non-existent-provider/invalid-model-id",
+          "model-fallback: inherit",
+          "thinking: low",
+          "auto-exit: true",
+          "---",
+          "",
+          "Reply with exactly FALLBACK_CHILD_OK.",
+        ].join("\n"),
+      );
+
+      const surface = await createTrackedSurface(env, `fallback-${id}`);
+      await sleep(1000);
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Fallback-${id}"`,
+        `  agent: "test-fallback-${id}"`,
+        `  task: "Reply with exactly FALLBACK_CHILD_OK"`,
+        `Do not do anything else until the result arrives.`,
+        `After the result arrives, say FALLBACK_PARENT_OK.`,
+      ].join("\n");
+
+      await startPi(surface, env.dir, task);
+      const screen = await waitForScreen(
+        surface,
+        /retried with[\s\S]*FALLBACK_CHILD_OK|FALLBACK_CHILD_OK[\s\S]*retried with/i,
+        PI_TIMEOUT,
+      );
+      assert.match(screen, /retried with/i);
+      assert.match(screen, /FALLBACK_CHILD_OK/i);
+    });
+
     // ── In-progress activity snapshots ──
 
     it("keeps a long active tool call from surfacing false stalled status", async () => {

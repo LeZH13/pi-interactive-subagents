@@ -61,6 +61,12 @@ import {
   type SubagentLoadout,
 } from "./session.ts";
 import {
+  canShowSpawnPicker,
+  loadPickerConfig,
+  resolvePickerEnabled,
+  showSpawnPicker,
+} from "./picker.ts";
+import {
   type StatusSnapshot,
   type SubagentStatusState,
   advanceStatusState,
@@ -143,6 +149,7 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
+  modelFallback?: string;
   tools?: string;
   skills?: string;
   thinking?: string;
@@ -337,6 +344,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
+    modelFallback: getFrontmatterValue(frontmatter, "model-fallback"),
     tools: getFrontmatterValue(frontmatter, "tools"),
     systemPromptMode:
       systemPromptMode === "replace"
@@ -463,6 +471,10 @@ function getKnownModelsFromRegistry(): string[] {
   for (const agent of discoverAgentDefinitions()) {
     const model = splitModelThinking(agent.model).model?.trim();
     if (model) modelIds.add(model);
+    if (agent.modelFallback?.toLowerCase() !== "inherit") {
+      const fallback = splitModelThinking(agent.modelFallback).model?.trim();
+      if (fallback) modelIds.add(fallback);
+    }
   }
   const environmentModel = splitModelThinking(process.env.PI_MODEL).model?.trim();
   if (environmentModel) modelIds.add(environmentModel);
@@ -577,6 +589,38 @@ function resolveEffectiveModelAndThinking(
     : resolvedModel.thinking ?? normalizeThinking(agentDefs?.thinking);
 
   return { model: resolvedModel.model, thinking };
+}
+
+interface ParentModelDefaults {
+  model?: string;
+  thinking?: string;
+}
+
+function resolveParentModelDefaults(ctx: ExtensionContext, pi: ExtensionAPI): ParentModelDefaults {
+  const model = ctx.model?.provider && ctx.model.id
+    ? `${ctx.model.provider}/${ctx.model.id}`
+    : undefined;
+  let thinking: string | undefined;
+  try {
+    thinking = normalizeThinking(pi.getThinkingLevel());
+  } catch {}
+  return { model, thinking };
+}
+
+/** Resolve one explicit frontmatter fallback. Undefined means no retry is configured. */
+function resolveFallbackModelAndThinking(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+  parent: ParentModelDefaults,
+): { model: string | undefined; thinking: string | undefined } | undefined {
+  const rawFallback = agentDefs?.modelFallback?.trim();
+  if (!rawFallback) return undefined;
+  const fallbackModel = rawFallback.toLowerCase() === "inherit"
+    ? { model: parent.model, thinking: undefined }
+    : splitModelThinking(rawFallback);
+  const primary = resolveEffectiveModelAndThinking(params, agentDefs);
+  const thinking = primary.thinking ?? parent.thinking;
+  return { model: fallbackModel.model, thinking: thinking ?? fallbackModel.thinking };
 }
 
 function resolveEffectiveSessionMode(
@@ -834,6 +878,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 }
 
 const statusConfig = loadStatusConfig();
+const pickerConfig = loadPickerConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -857,13 +902,16 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
+    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage" | "fallback"
   >,
   name: string,
 ): string {
   // Name is the persistent handle: the same name steers a running subagent or
   // resumes a finished one, so follow-ups always reference it.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  const fallbackNote = result.fallback
+    ? `Primary model${result.fallback.primaryModel ? ` ${result.fallback.primaryModel}` : ""} failed (${result.fallback.reason}); retried with ${result.fallback.fallbackModel}.\n\n`
+    : "";
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -871,6 +919,7 @@ function resolveResultPresentation(
     // failure so the orchestrator can decide whether to retry, resume, or
     // change approach instead of silently treating the run as completed.
     return (
+      fallbackNote +
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
@@ -879,9 +928,9 @@ function resolveResultPresentation(
     );
   }
 
-  return result.exitCode !== 0
+  return fallbackNote + (result.exitCode !== 0
     ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`);
 }
 
 /**
@@ -900,8 +949,25 @@ interface SubagentResult {
   error?: string;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
+  /** Whether this run produced any non-whitespace assistant text. */
+  hasAssistantText?: boolean;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Present when this is the result of a one-shot model fallback retry. */
+  fallback?: {
+    primaryModel?: string;
+    fallbackModel: string;
+    reason: string;
+    failedSessionFile?: string;
+  };
+}
+
+function shouldRetryWithFallback(result: SubagentResult): { retry: boolean; reason?: string } {
+  if (result.error === "cancelled") return { retry: false };
+  if (result.errorMessage) return { retry: true, reason: result.errorMessage };
+  if (result.exitCode !== 0) return { retry: true, reason: `exit code ${result.exitCode}` };
+  if (result.hasAssistantText === false) return { retry: true, reason: "no assistant response text" };
+  return { retry: false };
 }
 
 /**
@@ -1552,6 +1618,9 @@ export const __test__ = {
   },
   parseSubagentSpec,
   resolveEffectiveModelAndThinking,
+  resolveParentModelDefaults,
+  resolveFallbackModelAndThinking,
+  shouldRetryWithFallback,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1603,8 +1672,8 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  ctx: ExtensionContext,
+  options?: { surface?: string; parentLeafId?: string | null },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -1667,7 +1736,9 @@ async function launchSubagent(
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
       parentSessionFile: sessionFile,
-      parentLeafId: ctx.sessionManager.getLeafId(),
+      parentLeafId: options?.parentLeafId !== undefined
+        ? options.parentLeafId
+        : ctx.sessionManager.getLeafId(),
       childSessionFile: subagentSessionFile,
       childCwd: targetCwdForSession,
     });
@@ -2038,13 +2109,30 @@ async function watchSubagent(
       await closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        hasAssistantText: summary.trim().length > 0,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
     let summary: string;
+    let hasAssistantText = false;
     if (existsSync(sessionFile)) {
       const allEntries = getNewEntries(sessionFile, 0);
+      hasAssistantText = allEntries.some((entry: any) =>
+        entry?.type === "message" &&
+        entry?.message?.role === "assistant" &&
+        Array.isArray(entry.message.content) &&
+        entry.message.content.some(
+          (block: any) => block?.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+        )
+      );
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
@@ -2075,6 +2163,7 @@ async function watchSubagent(
       exitCode: result.exitCode,
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+      hasAssistantText,
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
@@ -2248,6 +2337,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const agentDefs = loadAgentDefaults(params.agent);
+        const parentDefaults = resolveParentModelDefaults(ctx, pi);
+        if (resolvePickerEnabled(pickerConfig.enabled) && canShowSpawnPicker(ctx)) {
+          const configured = resolveEffectiveModelAndThinking(params, agentDefs);
+          const picked = await showSpawnPicker(ctx, {
+            model: configured.model,
+            thinking: configured.thinking,
+            parentModel: parentDefaults.model,
+            parentThinking: parentDefaults.thinking,
+          });
+          if (!picked) {
+            return {
+              content: [{ type: "text", text: "Subagent spawn cancelled in the model picker." }],
+              details: { error: "picker cancelled", status: "cancelled" },
+            };
+          }
+          params.model = picked.model;
+          params.thinking = picked.thinking;
+        }
+        const primarySelection = resolveEffectiveModelAndThinking(params, agentDefs);
+        const fallbackSelection = resolveFallbackModelAndThinking(params, agentDefs, parentDefaults);
+
         // This spawner session's artifact dir hosts its persistent name
         // registry (artifacts/<parentSessionId>/subagent-registry.json).
         const parentArtifactDir = getArtifactDir(
@@ -2268,12 +2379,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           reservedNames.add(reservedName);
         }
 
+        const spawnParentLeafId = ctx.sessionManager.getLeafId();
+
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, { parentLeafId: spawnParentLeafId });
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -2295,20 +2408,64 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
+        // Fire-and-forget: start watching in background. A configured model
+        // fallback gets one fresh retry from the original task; failed-session
+        // artifacts remain available for diagnosis.
         watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
+          .then(async (primaryResult) => {
+            let finalRunning = running;
+            let result = primaryResult;
+            const retryDecision = shouldRetryWithFallback(primaryResult);
+            const fallbackDiffers = !!fallbackSelection && (
+              fallbackSelection.model !== primarySelection.model ||
+              normalizeThinking(fallbackSelection.thinking) !== normalizeThinking(primarySelection.thinking)
+            );
+
+            if (retryDecision.retry && fallbackSelection && fallbackDiffers) {
+              const fallback = {
+                primaryModel: primarySelection.model,
+                fallbackModel: fallbackSelection.model ?? "(pi default)",
+                reason: retryDecision.reason ?? "primary run failed",
+                failedSessionFile: primaryResult.sessionFile,
+              };
+              const retryParams = {
+                ...params,
+                name: running.name,
+                model: fallbackSelection.model,
+                thinking: fallbackSelection.thinking,
+              };
+              try {
+                finalRunning = await launchSubagent(retryParams, ctx, { parentLeafId: spawnParentLeafId });
+                finalRunning.abortController = watcherAbort;
+                startWidgetRefresh();
+                startStatusRefresh(pi);
+                registerName(parentArtifactDir, finalRunning.name, {
+                  sessionFile: finalRunning.sessionFile,
+                  sessionId: getSessionId(finalRunning.sessionFile),
+                });
+                result = await watchSubagent(finalRunning, watcherAbort.signal);
+                result.fallback = fallback;
+              } catch (error: any) {
+                result = {
+                  ...primaryResult,
+                  exitCode: 1,
+                  errorMessage: `Fallback launch failed: ${error?.message ?? String(error)}`,
+                  fallback,
+                };
+              }
+            }
+
             updateWidget(); // reflect removal from Map immediately
 
             // Update registry with resolved sessionId if it was previously null
             if (result.sessionId) {
-              registerName(parentArtifactDir, running.name, {
-                sessionFile: running.sessionFile,
+              registerName(parentArtifactDir, finalRunning.name, {
+                sessionFile: finalRunning.sessionFile,
                 sessionId: result.sessionId,
               });
             }
 
-            const presentation = resolveResultPresentation(result, running.name);
+            const presentation = resolveResultPresentation(result, finalRunning.name);
 
             pi.sendMessage(
               {
@@ -2316,9 +2473,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 content: presentation,
                 display: true,
                 details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
+                  name: finalRunning.name,
+                  task: finalRunning.task,
+                  agent: finalRunning.agent,
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: result.sessionFile,
@@ -2326,6 +2483,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
                   ...(result.stats ? { stats: result.stats } : {}),
+                  ...(result.fallback ? { fallback: result.fallback } : {}),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -2457,7 +2615,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
-          const model = a.model ? ` [${a.model}]` : "";
+          const fallback = a.modelFallback ? ` → ${a.modelFallback}` : "";
+          const model = a.model ? ` [${a.model}${fallback}]` : "";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
@@ -2476,7 +2635,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const lines = agents.map((a: any) => {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
+          const fallback = a.modelFallback ? ` → ${a.modelFallback}` : "";
+          const model = a.model ? theme.fg("dim", ` [${a.model}${fallback}]`) : "";
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);

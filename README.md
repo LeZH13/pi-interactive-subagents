@@ -84,7 +84,7 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 | **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash` | Web research, synthesized into a sourced brief |
 | **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All three are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if GLM-5.3 fails.
 
 ## Custom agents
 
@@ -95,6 +95,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 name: my-agent
 description: Does something specific
 model: openrouter/z-ai/glm-5.3
+model-fallback: inherit
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
@@ -110,7 +111,8 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model |
+| `model` | string | Primary/default model |
+| `model-fallback` | string | Optional one-shot fallback model. Use `inherit` to copy the immediate spawning session's live model, or provide a concrete model id |
 | `thinking` | string | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget) |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
@@ -122,6 +124,26 @@ You are a specialized agent that does X...
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+
+### Model fallback
+
+`model-fallback` is attempted once when the primary run reports a provider/agent error, exits non-zero, or exits without any non-whitespace assistant text. The failed child is retained in the parent's artifacts and a fresh child starts from the original task under the same display name. User cancellation never triggers fallback, and a fallback that resolves to the same model and thinking level is skipped.
+
+With `model-fallback: inherit`, nested agents inherit from their **immediate spawner**, not always from the top-level conversation. Fallback thinking resolves in this order: an explicit per-spawn/picker value, the agent's `thinking`, the spawner's live thinking level, then Pi's default. The fallback model and thinking are frozen in the retry's loadout, so later `subagent_message` resumes replay the same selection.
+
+### Model picker
+
+Enable an interactive model and thinking picker for every new spawn:
+
+```json
+{
+  "picker": { "enabled": true }
+}
+```
+
+`PI_SUBAGENT_PICKER=1` enables it and `PI_SUBAGENT_PICKER=0` disables it, overriding `config.json`. The picker defaults to off. It lists registered models with the agent's configured model first and supports live, case-insensitive regular-expression filtering over full `provider/model` ids. Explicit tool or `/subagent` overrides become the initial choice, but the human's selection wins.
+
+Nested interactive spawners show their own picker. Headless callers and `subagent_message` resumes do not prompt; resumes replay the stored loadout. An automatic fallback retry also does not prompt a second time.
 
 ### session-mode
 
@@ -178,6 +200,7 @@ Choose `auto`, `tmux`, `herdr`, or `background` in `config.json`:
 ```json
 {
   "status": { "enabled": true },
+  "picker": { "enabled": false },
   "multiplexing": { "backend": "auto" }
 }
 ```

@@ -75,6 +75,12 @@ import {
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
+  loadPickerConfig,
+  parsePickerConfig,
+  regexFilterModels,
+  resolvePickerEnabled,
+} from "../pi-extension/subagents/picker.ts";
+import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
@@ -1694,6 +1700,40 @@ describe("status.ts", () => {
   });
 });
 
+describe("model picker configuration", () => {
+  it("defaults off and parses picker.enabled strictly", () => {
+    assert.deepEqual(parsePickerConfig({}), { enabled: false });
+    assert.deepEqual(parsePickerConfig({ picker: { enabled: true } }), { enabled: true });
+    assert.throws(
+      () => parsePickerConfig({ picker: { enabled: "yes" } }),
+      /picker\.enabled must be a boolean/,
+    );
+    assert.throws(
+      () => parsePickerConfig({ picker: { enabled: true, mode: "all" } }),
+      /picker has unsupported key\(s\): mode/,
+    );
+  });
+
+  it("loads picker config and applies strict environment overrides", () => {
+    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    assert.deepEqual(loadPickerConfig(examplePath), { enabled: false });
+    assert.equal(resolvePickerEnabled(false, { PI_SUBAGENT_PICKER: "1" }), true);
+    assert.equal(resolvePickerEnabled(true, { PI_SUBAGENT_PICKER: "0" }), false);
+    assert.equal(resolvePickerEnabled(true, {}), true);
+    assert.throws(
+      () => resolvePickerEnabled(false, { PI_SUBAGENT_PICKER: "yes" }),
+      /expected 0 or 1/,
+    );
+  });
+
+  it("filters full model ids with case-insensitive regular expressions", () => {
+    const models = ["openai/gpt-5", "anthropic/claude-sonnet", "openrouter/z-ai/glm-5.3"];
+    assert.deepEqual(regexFilterModels(models, "^(openai|anthropic)/").matches, models.slice(0, 2));
+    assert.deepEqual(regexFilterModels(models, "GLM").matches, [models[2]]);
+    assert.match(regexFilterModels(models, "[").error ?? "", /Invalid regular expression/);
+  });
+});
+
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -1867,6 +1907,22 @@ describe("subagent discovery", () => {
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
     }
+  });
+
+  it("loads model-fallback from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "fallback-test-agent",
+        [
+          "name: fallback-test-agent",
+          "model: provider/primary",
+          "model-fallback: inherit",
+        ].join("\n"),
+      );
+      const defs = testApi.loadAgentDefaults("fallback-test-agent");
+      assert.equal(defs?.modelFallback, "inherit");
+    });
   });
 
   it("worker is granted the spawning toolset restricted to scout and researcher", () => {
@@ -2102,6 +2158,70 @@ describe("subagent discovery", () => {
         null,
       ),
       { model: "ollama/llama3.1:8b", thinking: undefined },
+    );
+  });
+
+  it("resolves inherited and explicit fallback models with thinking precedence", () => {
+    const parent = { model: "openai/main", thinking: "medium" };
+    assert.deepEqual(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T" },
+        { modelFallback: "inherit", thinking: "high" },
+        parent,
+      ),
+      { model: "openai/main", thinking: "high" },
+    );
+    assert.deepEqual(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T", thinking: "low" },
+        { modelFallback: "anthropic/backup", thinking: "high" },
+        parent,
+      ),
+      { model: "anthropic/backup", thinking: "low" },
+    );
+    assert.deepEqual(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T" },
+        { modelFallback: "inherit" },
+        parent,
+      ),
+      { model: "openai/main", thinking: "medium" },
+    );
+    assert.deepEqual(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T" },
+        { model: "provider/primary:high", modelFallback: "inherit" },
+        parent,
+      ),
+      { model: "openai/main", thinking: "high" },
+    );
+    assert.deepEqual(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T" },
+        { modelFallback: "inherit", thinking: "low" },
+        {},
+      ),
+      { model: undefined, thinking: "low" },
+    );
+    assert.equal(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T" },
+        { model: "provider/primary" },
+        parent,
+      ),
+      undefined,
+    );
+  });
+
+  it("recognizes broad fallback failures but not cancellation", () => {
+    const base = { name: "worker", task: "T", summary: "ok", exitCode: 0, elapsed: 1 };
+    assert.equal(testApi.shouldRetryWithFallback({ ...base, errorMessage: "overloaded" }).retry, true);
+    assert.equal(testApi.shouldRetryWithFallback({ ...base, exitCode: 2 }).retry, true);
+    assert.equal(testApi.shouldRetryWithFallback({ ...base, hasAssistantText: false }).retry, true);
+    assert.equal(testApi.shouldRetryWithFallback({ ...base, hasAssistantText: true }).retry, false);
+    assert.equal(
+      testApi.shouldRetryWithFallback({ ...base, exitCode: 1, error: "cancelled" }).retry,
+      false,
     );
   });
 
@@ -4036,6 +4156,29 @@ describe("subagent interruption", () => {
     // Follow-ups reference the name (not the session id).
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
+  });
+
+  it("reports a successful automatic model fallback", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const presentation = testApi.resolveResultPresentation(
+      {
+        exitCode: 0,
+        elapsed: 9,
+        summary: "Fallback completed",
+        sessionFile: "/tmp/retry.jsonl",
+        sessionId: "retry-id",
+        fallback: {
+          primaryModel: "provider/primary",
+          fallbackModel: "openai/main",
+          reason: "no assistant response text",
+        },
+      },
+      "Scout",
+    );
+
+    assert.match(presentation, /Primary model provider\/primary failed/);
+    assert.match(presentation, /retried with openai\/main/);
+    assert.match(presentation, /Fallback completed/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {

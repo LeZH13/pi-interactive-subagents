@@ -2,6 +2,9 @@
   "status": {
     "enabled": true
   },
+  "picker": {
+    "enabled": false
+  },
   "multiplexing": {
     "backend": "auto"
   }
