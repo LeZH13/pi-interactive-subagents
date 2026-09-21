@@ -2,6 +2,8 @@
  * `/subagent-settings` overlay: backend preference, status-widget toggle, one
  * grouped row per discovered agent (model + thinking + reset), and an orphan
  * cleanup row. Built on pi-tui SettingsList, mirroring pi's /settings page.
+ * Framed by full-width border lines above and below the list, mirroring
+ * pi's native /settings page (DynamicBorder).
  *
  * Every change applies live in memory and persists to config.json immediately
  * (atomic write). Empty per-agent overrides are dropped; overrides for agents
@@ -11,6 +13,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import { getSelectListTheme, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import {
   Container,
+  getKeybindings,
   Input,
   SelectList,
   SettingsList,
@@ -127,20 +130,16 @@ function modelFilterComponent(
       return lines.map((line) => truncateToWidth(line, width));
     },
     handleInput(data: string) {
-      const keybindings = (ctx as unknown as { keybindings?: { matches(d: string, id: string): boolean } }).keybindings;
-      const cancel = keybindings
-        ? keybindings.matches(data, "tui.select.cancel")
-        : data === "\x1b" || data === "\x03";
-      if (cancel) {
+      const kb = getKeybindings();
+      if (kb.matches(data, "tui.select.cancel")) {
         done();
         return;
       }
-      const nav = keybindings
-        ? keybindings.matches(data, "tui.select.up") ||
-          keybindings.matches(data, "tui.select.down") ||
-          keybindings.matches(data, "tui.select.confirm")
-        : data === "\x1b[A" || data === "\x1b[B" || data === "\r";
-      if (nav) {
+      if (
+        kb.matches(data, "tui.select.up") ||
+        kb.matches(data, "tui.select.down") ||
+        kb.matches(data, "tui.select.confirm")
+      ) {
         selectList.handleInput(data);
         return;
       }
@@ -305,6 +304,7 @@ function agentSubmenu(
   deps: SubagentSettingsDeps,
   agentName: string,
   onChanged: (summary: string) => void,
+  onCancel: () => void,
 ): Component {
   const theme = ctx.ui.theme;
   const options = ["Model…", "Thinking…", "Reset to markdown"];
@@ -366,9 +366,21 @@ function agentSubmenu(
   list.onSelect = (item) => {
     if (item.value === "Model…") openNested("model");
     else if (item.value === "Thinking…") openNested("thinking");
+    else if (item.value === "Reset to markdown") {
+      // Reset is a direct action, not a nested submenu.
+      deps.configState.update(
+        (draft) => {
+          delete draft.agents[agentName];
+        },
+        { pruneAgents: deps.discoverAgents().map((a) => a.name) },
+      );
+      const md = currentMarkdown();
+      onChanged(describeOverride(undefined, undefined, md.model, md.thinking));
+    }
   };
-  // Reset is a direct action, not a nested submenu.
-  const originalHandleInput = list.handleInput.bind(list);
+  // Esc at this level must close the submenu (SettingsList only closes via
+  // the done() callback). Without this, Esc is swallowed and the user is stuck.
+  list.onCancel = () => onCancel();
 
   return {
     invalidate() {
@@ -394,24 +406,7 @@ function agentSubmenu(
         nested.handleInput(data);
         return;
       }
-      const selected = list.getSelectedItem();
-      // Intercept confirm on the Reset row so it acts immediately.
-      const keybindings = (ctx as unknown as { keybindings?: { matches(d: string, id: string): boolean } }).keybindings;
-      const isConfirm = keybindings
-        ? keybindings.matches(data, "tui.select.confirm")
-        : data === "\r";
-      if (isConfirm && selected?.value === "Reset to markdown") {
-        deps.configState.update(
-          (draft) => {
-            delete draft.agents[agentName];
-          },
-          { pruneAgents: deps.discoverAgents().map((a) => a.name) },
-        );
-        const md = currentMarkdown();
-        onChanged(describeOverride(undefined, undefined, md.model, md.thinking));
-        return;
-      }
-      originalHandleInput(data);
+      list.handleInput(data);
     },
   } as Component;
 }
@@ -424,6 +419,30 @@ export function buildSubagentSettingItems(
   const snapshot = deps.configState.get();
   const agents = deps.discoverAgents();
   const items: SettingItem[] = [];
+
+  // Model picker rows first so they read as the primary action, above the
+  // Backend/Status/Maintenance entries.
+  for (const agent of agents) {
+    const md = deps.markdownDefaults(agent.name);
+    const override = snapshot.agents[agent.name];
+    items.push({
+      id: `agent:${agent.name}`,
+      label: `[subagents] ${agent.name}`,
+      description: agent.description ?? `Model and thinking defaults for the ${agent.name} agent.`,
+      currentValue: describeOverride(override?.model, override?.thinking, md.model, md.thinking),
+      submenu: (_currentValue, done) => agentSubmenu(
+        ctx,
+        deps,
+        agent.name,
+        (summary) => {
+          done(summary);
+        },
+        () => {
+          done();
+        },
+      ),
+    });
+  }
 
   let effectiveBackend: string;
   try {
@@ -480,20 +499,6 @@ export function buildSubagentSettingItems(
     ),
   });
 
-  for (const agent of agents) {
-    const md = deps.markdownDefaults(agent.name);
-    const override = snapshot.agents[agent.name];
-    items.push({
-      id: `agent:${agent.name}`,
-      label: agent.name,
-      description: agent.description ?? `Model and thinking defaults for the ${agent.name} agent.`,
-      currentValue: describeOverride(override?.model, override?.thinking, md.model, md.thinking),
-      submenu: (_currentValue, done) => agentSubmenu(ctx, deps, agent.name, (summary) => {
-        done(summary);
-      }),
-    });
-  }
-
   const dirs = deps.sessionDirs(ctx);
   items.push({
     id: "orphan-cleanup",
@@ -521,6 +526,17 @@ export async function showSubagentSettings(
     const container = new Container();
     container.addChild(new Text(theme.fg("accent", theme.bold("Subagent settings")), 0, 0));
     container.addChild(new Spacer(1));
+
+    // Full-width border above/below the list, mirroring pi's native /settings
+    // page (DynamicBorder). Built inline against the live theme from custom()
+    // because the global theme singleton may be undefined under jiti.
+    const makeBorder = (): Component => ({
+      invalidate() {},
+      render(width: number) {
+        return [theme.fg("border", "─".repeat(Math.max(1, width)))];
+      },
+    });
+    container.addChild(makeBorder());
 
     const refreshOrphanRow = () => {
       const dirs = deps.sessionDirs(ctx);
@@ -571,7 +587,21 @@ export async function showSubagentSettings(
       { enableSearch: true },
     );
     container.addChild(settingsList);
-    return container;
+    container.addChild(makeBorder());
+    // NOTE: Container has no handleInput, so returning it directly would
+    // swallow all keyboard input (Esc/Ctrl+C included) and freeze the pane.
+    // Return a thin wrapper that forwards input to the SettingsList.
+    return {
+      invalidate() {
+        container.invalidate();
+      },
+      render(width: number) {
+        return container.render(width);
+      },
+      handleInput(data: string) {
+        settingsList.handleInput(data);
+      },
+    };
   });
 }
 
