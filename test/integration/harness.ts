@@ -306,7 +306,7 @@ export async function waitForScreen(
 
   let finalScreen = "";
   try {
-    finalScreen = readScreen(surface, lines);
+    finalScreen = await readScreen(surface, lines);
   } catch {}
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,

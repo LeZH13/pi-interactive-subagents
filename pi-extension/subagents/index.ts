@@ -1,7 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -1482,7 +1482,7 @@ async function steerSubagent(
   running: RunningSubagent,
   message: string,
   send?: (surface: string, command: string, options?: { sessionFile?: string }) => void,
-): { ok: true } | { error: string } {
+): Promise<{ ok: true } | { error: string }> {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     // Pi consumes orchestration input through a sidecar queue. Sending the
@@ -1681,6 +1681,8 @@ async function launchSubagent(
   const runId = `${id}-${Math.random().toString(16).slice(2, 10)}`;
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  // Display name is optional in the tool params; default to the agent's own name.
+  const displayName = params.name ?? params.agent ?? "subagent";
   const { model: effectiveModel, thinking: effectiveThinking } =
     resolveEffectiveModelAndThinking(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
@@ -1721,7 +1723,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent";
   const logFile = join(artifactDir, "subagent-logs", `${safeLogName}-${id}.log`);
-  const surface = options?.surface ?? await createSurface(params.name, {
+  const surface = options?.surface ?? await createSurface(displayName, {
     id,
     logPath: logFile,
     sessionFile: subagentSessionFile,
@@ -1810,7 +1812,7 @@ async function launchSubagent(
     const running: RunningSubagent = {
       id,
       runId,
-      name: params.name,
+      name: displayName,
       task: params.task,
       agent: params.agent,
       surface,
@@ -1873,7 +1875,7 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, { artifactDir, name: displayName });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -1885,7 +1887,7 @@ async function launchSubagent(
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
@@ -1909,7 +1911,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
+    const safeName = displayName
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
       .replace(/\s+/g, "-") // spaces to hyphens
@@ -1957,7 +1959,7 @@ async function launchSubagent(
   const running: RunningSubagent = {
     id,
     runId,
-    name: params.name,
+    name: displayName,
     task: params.task,
     agent: params.agent,
     surface,
@@ -2088,7 +2090,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = await readScreen(surface, 200)
+        summary = (await readScreen(surface, 200))
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
@@ -2567,7 +2569,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2692,7 +2695,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -3186,6 +3190,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -3215,6 +3220,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -3251,8 +3257,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
 }
-// test

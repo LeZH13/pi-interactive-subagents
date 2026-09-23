@@ -95,7 +95,7 @@ function getForkContentLines(parentSessionFile: string, parentLeafId: string | n
       .filter((id): id is string => typeof id === "string"),
   );
 
-  const removedParents = new Map<string, string | null | undefined>();
+  const removedParents = new Map<string, string | undefined>();
   const sanitized: SessionEntry[] = [];
 
   for (const entry of branch) {

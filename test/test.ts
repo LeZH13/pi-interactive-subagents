@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdir
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@mariozechner/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 // Tests run as top-level orchestrator tests; clear any inherited child subagent allowlist.

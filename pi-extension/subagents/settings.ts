@@ -9,8 +9,8 @@
  * (atomic write). Empty per-agent overrides are dropped; overrides for agents
  * that no longer exist are pruned on each save.
  */
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { getSelectListTheme, getSettingsListTheme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import {
   Container,
   getKeybindings,
@@ -23,7 +23,7 @@ import {
   type Component,
   type SelectItem,
   type SettingItem,
-} from "@mariozechner/pi-tui";
+} from "@earendil-works/pi-tui";
 import { basename } from "node:path";
 import {
   cleanOrphanArtifactDirs,
@@ -403,7 +403,7 @@ function agentSubmenu(
     },
     handleInput(data: string) {
       if (nested) {
-        nested.handleInput(data);
+        nested.handleInput?.(data);
         return;
       }
       list.handleInput(data);
