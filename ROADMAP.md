@@ -116,9 +116,10 @@ extension could not load at all. Migrated everything to
   `removedParents` map type).
 - Verified: `npm run typecheck` clean; `npm test` 247/247 pass (51 suites).
 
-Remaining live check (user-side): load the extension in the installed pi
-(`/reload`), spawn → widget → done → settings page. Import names now match
-the host package exactly, so remaining risk is minimal.
+Remaining live check (user-side) — ✅ PASSED 2026-09-23: extension loaded in
+the installed pi 0.87.1, spawn ran to completion, live widget tracked the
+child (labels cycled streaming/tool as designed), completion block rendered.
+Phase 0 is fully green; no follow-up items.
 
 Goal (historical): confirm our `@mariozechner` imports (0.65 devDeps) still resolve against
 the pi the user actually runs (global install is
