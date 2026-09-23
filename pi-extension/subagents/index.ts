@@ -20,6 +20,7 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
+  interruptSurface,
   sendCommand,
   sendLongCommand,
   sendTerminalMessage,
@@ -180,6 +181,7 @@ interface ListedAgentDefinition extends AgentDefinition {
  */
 const SPAWNING_TOOLS = [
   "subagent",
+  "subagent_interrupt",
   "subagent_message",
   "subagents_list",
 ] as const;
@@ -947,6 +949,8 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  /** True when the parent cancelled the run with `subagent_interrupt`. */
+  interrupted?: boolean;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Whether this run produced any non-whitespace assistant text. */
@@ -963,7 +967,7 @@ interface SubagentResult {
 }
 
 function shouldRetryWithFallback(result: SubagentResult): { retry: boolean; reason?: string } {
-  if (result.error === "cancelled") return { retry: false };
+  if (result.error === "cancelled" || result.interrupted) return { retry: false };
   if (result.errorMessage) return { retry: true, reason: result.errorMessage };
   if (result.exitCode !== 0) return { retry: true, reason: `exit code ${result.exitCode}` };
   if (result.hasAssistantText === false) return { retry: true, reason: "no assistant response text" };
@@ -995,6 +999,14 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /**
+   * Set when the parent cancels the run with `subagent_interrupt`. The pane is
+   * being torn down: hide the widget entry, ignore status transitions and
+   * pending questions, skip model fallback, and steer a concise interruption
+   * notice instead of the full completion result.
+   */
+  userInterrupted?: boolean;
+  interruptedAt?: number;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1205,7 +1217,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, the
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
+  const visible = visibleRunningSubagents();
+  if (visible.length === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1221,7 +1234,7 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, theme);
+          return renderSubagentWidgetLines(visibleRunningSubagents(), width, theme);
         },
       };
     },
@@ -1463,6 +1476,84 @@ function resolveRunningByName(name: string):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
+/** Running subagents that should still appear in the widget. Interrupted runs stay in the map until their watcher observes the torn-down surface and removes them. */
+function visibleRunningSubagents(): RunningSubagent[] {
+  return Array.from(runningSubagents.values()).filter((running) => !running.userInterrupted);
+}
+
+function runningTargetHint(): string {
+  const targets = [
+    ...new Map(
+      Array.from(runningSubagents.values()).map((running) => [running.id, `${running.name} [${running.id}]`] as const),
+    ).values(),
+  ];
+  return targets.length
+    ? ` Currently running: ${targets.join(", ")}.`
+    : " No subagents are currently running.";
+}
+
+function resolveRunningForInterrupt(params: { id?: unknown; name?: unknown }):
+  | { running: RunningSubagent }
+  | { error: string } {
+  const id = typeof params.id === "string" ? params.id.trim() : "";
+  const name = typeof params.name === "string" ? params.name.trim() : "";
+  if (!id && !name) {
+    return { error: "Provide the running subagent's `id` or `name`." };
+  }
+
+  let running: RunningSubagent | undefined;
+  if (id) {
+    running = runningSubagents.get(id);
+    if (!running) return { error: `No running subagent with id "${id}".${runningTargetHint()}` };
+  }
+  if (name) {
+    const resolved = resolveRunningByName(name);
+    if ("error" in resolved) return { error: resolved.error };
+    if (running && resolved.running !== running) {
+      return { error: `Subagent id "${id}" does not match subagent name "${name}".` };
+    }
+    running = resolved.running;
+  }
+  return { running: running as RunningSubagent };
+}
+
+function formatInterruptedNotice(name: string, elapsed: number): string {
+  return `Sub-agent "${name}" was interrupted by the user after ${formatElapsed(elapsed)}. It did not produce a result.`;
+}
+
+/**
+ * Deliver the concise interruption notice for a cancelled run. Returns true
+ * when the caller should skip the normal completion path (full result,
+ * fallback retry, and pending questions) entirely.
+ */
+function finalizeInterruptedRun(
+  pi: ExtensionAPI,
+  running: RunningSubagent,
+  result: Pick<SubagentResult, "elapsed" | "exitCode" | "interrupted"> & { sessionId?: string },
+): boolean {
+  if (!running.userInterrupted && !result.interrupted) return false;
+  updateWidget();
+  pi.sendMessage(
+    {
+      customType: "subagent_result",
+      content: formatInterruptedNotice(running.name, result.elapsed),
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        sessionFile: running.sessionFile,
+        ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+        interrupted: true,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+  return true;
+}
+
 /**
  * Type a follow-up message into a running subagent's live surface. Newlines are
  * collapsed to spaces because each newline submits a turn in the child's TUI
@@ -1519,6 +1610,13 @@ async function handleSubagentSteer(
   }
 
   const running = resolved.running;
+  if (running.userInterrupted) {
+    const err = `Subagent "${running.name}" was interrupted and is shutting down; it cannot receive new messages.`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name },
+    };
+  }
   const now = Date.now();
   observeRunningSubagent(running, now);
 
@@ -1544,6 +1642,81 @@ async function handleSubagentSteer(
   };
 }
 
+/**
+ * Cancel a running Pi-backed subagent. The run is marked user-interrupted
+ * before touching the surface so the watcher suppresses the normal completion
+ * result, fallback retry, status transitions, and pending questions. Escape
+ * (or SIGINT headless) cancels the in-flight turn; closing the surface
+ * guarantees the child process is gone. If teardown fails, the marker is
+ * reverted so a still-live run keeps its normal completion path.
+ */
+async function handleSubagentInterrupt(
+  params: { id?: unknown; name?: unknown },
+  interrupt: (surface: string) => Promise<void> = interruptSurface,
+  close: (surface: string) => Promise<void> = closeSurface,
+) {
+  const resolved = resolveRunningForInterrupt(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
+
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    const err = `Subagent "${running.name}" runs via the Claude Code CLI and cannot be interrupted from here. Close its pane manually.`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name },
+    };
+  }
+  if (running.userInterrupted) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `Interrupt already requested for subagent "${running.name}". Its pane is shutting down; the watcher will confirm removal.`,
+      }],
+      details: { id: running.id, name: running.name, status: "interrupt_already_requested" },
+    };
+  }
+
+  const now = Date.now();
+  const wasInterrupted = running.userInterrupted ?? false;
+  const wasInterruptedAt = running.interruptedAt;
+  const previousStatusState = running.statusState;
+  running.userInterrupted = true;
+  running.interruptedAt = now;
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  updateWidget();
+
+  try {
+    await interrupt(running.surface);
+    await close(running.surface);
+  } catch (error: any) {
+    running.userInterrupted = wasInterrupted;
+    running.interruptedAt = wasInterruptedAt;
+    running.statusState = previousStatusState;
+    updateWidget();
+    const message = error?.message ?? String(error);
+    const err = `Failed to interrupt subagent "${running.name}": ${message}`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name, status: "interrupt_failed" },
+    };
+  }
+
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Interrupt requested for subagent "${running.name}". Its turn was cancelled and its pane closed. ` +
+        `The watcher will confirm removal and steer a concise interruption notice; no result will follow.`,
+    }],
+    details: { id: running.id, name: running.name, status: "interrupt_requested" },
+  };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1562,6 +1735,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
+      if (running.userInterrupted) continue;
       observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
@@ -1639,6 +1813,11 @@ export const __test__ = {
   enqueueSteerMessage,
   steerSubagent,
   handleSubagentSteer,
+  handleSubagentInterrupt,
+  resolveRunningForInterrupt,
+  formatInterruptedNotice,
+  finalizeInterruptedRun,
+  visibleRunningSubagents,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -2073,7 +2252,7 @@ async function watchSubagent(
       completionFile: `${sessionFile}.complete`,
       onTick() {
         observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        if (!running.userInterrupted) deliverPendingQuestion(running);
       },
     });
 
@@ -2119,6 +2298,7 @@ async function watchSubagent(
         exitCode: result.exitCode,
         elapsed,
         hasAssistantText: summary.trim().length > 0,
+        interrupted: running.userInterrupted === true,
         ...(sessionId ? { claudeSessionId: sessionId } : {}),
       };
     }
@@ -2167,6 +2347,7 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       hasAssistantText,
+      interrupted: running.userInterrupted === true,
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
@@ -2183,6 +2364,7 @@ async function watchSubagent(
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
+        interrupted: running.userInterrupted === true,
         sessionFile,
       };
     }
@@ -2193,6 +2375,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      interrupted: running.userInterrupted === true,
     };
   }
 }
@@ -2401,6 +2584,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then(async (primaryResult) => {
             let finalRunning = running;
             let result = primaryResult;
+            // A parent-cancelled run never retries or reports a normal result.
+            if (finalizeInterruptedRun(pi, running, primaryResult)) return;
             const retryDecision = shouldRetryWithFallback(primaryResult);
             const fallbackDiffers = !!fallbackSelection && (
               fallbackSelection.model !== primarySelection.model ||
@@ -2569,6 +2754,72 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_interrupt tool ──
+  pi.registerTool({
+      name: "subagent_interrupt",
+      label: "Interrupt Subagent",
+      description:
+        "Cancel a running Pi-backed subagent by exact `id` or `name`. " +
+        "This cancels its in-flight turn, terminates its child process, and closes its pane. " +
+        "The watcher then steers a concise interruption notice instead of a result. " +
+        "Use for a runaway or obsolete subagent. Claude Code CLI children cannot be interrupted.",
+      promptSnippet:
+        "Cancel a running Pi-backed subagent by exact id or name. Terminates the child process and closes its pane; " +
+        "the watcher steers a concise interruption notice instead of a result.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+      }),
+
+      async execute(_toolCallId, params): Promise<any> {
+        return handleSubagentInterrupt(params);
+      },
+
+      renderCall(args, theme) {
+        const partialArgs = args as { id?: unknown; name?: unknown };
+        const target =
+          typeof partialArgs.id === "string" && partialArgs.id
+            ? partialArgs.id
+            : typeof partialArgs.name === "string" && partialArgs.name
+              ? partialArgs.name
+              : "(unknown)";
+        return new Text(
+          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — interrupt"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const name = details?.name ?? details?.id ?? "subagent";
+        if (details?.status === "interrupt_requested") {
+          return new Text(
+            theme.fg("warning", "!") +
+              " " +
+              theme.fg("toolTitle", theme.bold(name)) +
+              theme.fg("dim", " — interrupt requested"),
+            0,
+            0,
+          );
+        }
+        if (details?.status === "interrupt_already_requested") {
+          return new Text(
+            theme.fg("warning", "!") +
+              " " +
+              theme.fg("toolTitle", theme.bold(name)) +
+              theme.fg("dim", " — interrupt already requested"),
+            0,
+            0,
+          );
+        }
+
         const first = result.content[0];
         const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
@@ -2910,6 +3161,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (finalizeInterruptedRun(pi, running, { ...result, sessionId: resumedSessionId })) return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);

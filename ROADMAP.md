@@ -136,7 +136,9 @@ Done when: spawn, messaging, settings page, and status widget all behave in
 the installed pi, with a written verdict in this file's git history (commit
 message or amended here).
 
-### Phase 1 — `subagent_interrupt` tool
+### Phase 1 — `subagent_interrupt` tool — ✅ DONE 2026-09-23
+
+Implemented and verified: `npm run typecheck` clean; `npm test` 255/255 pass (51 suites). Cancellation marks `RunningSubagent.userInterrupted` before teardown, sends tmux `Escape` / Herdr `esc` / background `SIGINT`, closes the surface, hides the widget entry, suppresses status transitions and pending questions, skips model fallback, and steers one concise interruption notice. Unknown/finished targets and Claude CLI children get clear errors; teardown failure reverts the marker.
 
 Goal: give the parent a cancellation path. Today a runaway worker can only be
 killed by hand in the pane.

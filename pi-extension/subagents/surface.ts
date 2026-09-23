@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as tmux from "./tmux.ts";
-import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, launchBackground, readBackground } from "./background.ts";
-import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
+import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, interruptBackground, launchBackground, readBackground } from "./background.ts";
+import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, interruptHerdrPane, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
 
 export type SurfaceBackendKind = "auto" | "tmux" | "herdr" | "background";
 export interface MultiplexingConfig { enabled: boolean; backend: SurfaceBackendKind; }
@@ -136,6 +136,22 @@ export async function readScreenAsync(surface: string, lines = 50, signal?: Abor
   return tmux.readScreenAsync(surface, lines, signal);
 }
 export async function readScreen(surface: string, lines = 50): Promise<string> { return readScreenAsync(surface, lines); }
+/**
+ * Send a backend-specific cancellation signal without closing the surface.
+ * Terminal backends get Escape; headless background processes get SIGINT.
+ * The caller closes the surface afterwards to guarantee termination.
+ */
+export async function interruptSurface(surface: string, signal?: AbortSignal): Promise<void> {
+  if (kind(surface) === "background") {
+    await interruptBackground(surface);
+    return;
+  }
+  if (kind(surface) === "herdr") {
+    await interruptHerdrPane(pane(surface), signal);
+    return;
+  }
+  await tmux.sendEscape(surface, signal);
+}
 export async function closeSurface(surface: string, signal?: AbortSignal): Promise<void> {
   if (kind(surface) === "background") return closeBackground(surface);
   if (kind(surface) === "herdr") return closeHerdrPane(pane(surface), signal);

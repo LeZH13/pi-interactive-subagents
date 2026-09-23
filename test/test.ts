@@ -46,6 +46,7 @@ import {
   closeSurface,
   createSurface,
   getBackgroundSurfaceLogPath,
+  interruptSurface,
   isMultiplexingEnabled,
   layoutForDimensions,
   loadMultiplexingConfig,
@@ -1957,7 +1958,7 @@ describe("subagent discovery", () => {
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
     const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
+    for (const t of ["subagent", "subagent_interrupt", "subagent_message", "subagents_list"]) {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
@@ -2297,7 +2298,7 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("recognizes broad fallback failures but not cancellation", () => {
+  it("recognizes broad fallback failures but not cancellation or interruption", () => {
     const base = { name: "worker", task: "T", summary: "ok", exitCode: 0, elapsed: 1 };
     assert.equal(testApi.shouldRetryWithFallback({ ...base, errorMessage: "overloaded" }).retry, true);
     assert.equal(testApi.shouldRetryWithFallback({ ...base, exitCode: 2 }).retry, true);
@@ -2305,6 +2306,10 @@ describe("subagent discovery", () => {
     assert.equal(testApi.shouldRetryWithFallback({ ...base, hasAssistantText: true }).retry, false);
     assert.equal(
       testApi.shouldRetryWithFallback({ ...base, exitCode: 1, error: "cancelled" }).retry,
+      false,
+    );
+    assert.equal(
+      testApi.shouldRetryWithFallback({ ...base, exitCode: 1, interrupted: true }).retry,
       false,
     );
   });
@@ -3529,11 +3534,11 @@ describe("tool registration", () => {
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
   });
 
-  it("no longer registers subagent_interrupt or subagent_resume", () => {
+  it("registers subagent_interrupt but not subagent_resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
   });
 });
@@ -3929,12 +3934,12 @@ describe("subagent interruption", () => {
     };
   }
 
-  it("registers subagent_message and not the old interrupt/resume tools", () => {
+  it("registers subagent_message and subagent_interrupt, but not subagent_resume", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_message"), true);
-    assert.equal(names.includes("subagent_interrupt"), false);
+    assert.equal(names.includes("subagent_interrupt"), true);
     assert.equal(names.includes("subagent_resume"), false);
   });
 
@@ -3959,6 +3964,163 @@ describe("subagent interruption", () => {
     } finally {
       runningMap.clear();
     }
+  });
+
+  it("resolves interrupt targets by exact id or name", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("a1", makeRunning({ id: "a1", name: "Worker", surface: "a1", sessionFile: "a1.jsonl" }));
+      runningMap.set("b2", makeRunning({ id: "b2", name: "Scout", surface: "b2", sessionFile: "b2.jsonl" }));
+      assert.equal(testApi.resolveRunningForInterrupt({ id: "a1" }).running.id, "a1");
+      assert.equal(testApi.resolveRunningForInterrupt({ name: "Worker" }).running.id, "a1");
+      assert.match(testApi.resolveRunningForInterrupt({}).error, /Provide the running subagent's `id` or `name`/);
+      assert.match(testApi.resolveRunningForInterrupt({ id: "missing" }).error, /No running subagent with id "missing"/);
+      assert.match(
+        testApi.resolveRunningForInterrupt({ id: "a1", name: "Scout" }).error,
+        /does not match subagent name/,
+      );
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("marks a running subagent interrupted, then cancels and closes its surface", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const calls: string[] = [];
+    runningMap.clear();
+
+    const activeState = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 0 }),
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
+
+    try {
+      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      const interrupt = async (surface: string) => { calls.push(`interrupt:${surface}`); };
+      const close = async (surface: string) => { calls.push(`close:${surface}`); };
+      const result = await withMockedNow(20_000, async () =>
+        await testApi.handleSubagentInterrupt({ name: "Worker" }, interrupt, close),
+      );
+
+      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
+      assert.deepEqual(calls, ["interrupt:pane-1", "close:pane-1"]);
+      const running = runningMap.get("a1");
+      assert.equal(running.userInterrupted, true);
+      assert.equal(running.interruptedAt, 20_000);
+      const snapshot = classifyStatus(running.statusState, 20_000);
+      assert.equal(snapshot.kind, "waiting");
+      assert.equal(snapshot.activityLabel, "interrupted");
+      assert.equal(testApi.visibleRunningSubagents().length, 0);
+
+      const repeat = await testApi.handleSubagentInterrupt({ id: "a1" }, interrupt, close);
+      assert.equal(repeat.details.status, "interrupt_already_requested");
+      assert.deepEqual(calls, ["interrupt:pane-1", "close:pane-1"]);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("reverts the interrupt marker when surface teardown fails", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    const activeState = observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 0 }),
+      {
+        snapshot: "present",
+        updatedAt: 5_000,
+        sequence: 1,
+        phase: "active",
+        active: true,
+        activeScope: "tool",
+        activeSince: 5_000,
+        activityLabel: "bash",
+      },
+      5_000,
+    );
+
+    try {
+      runningMap.set("a1", makeRunning({ statusState: activeState }));
+      const result = await withMockedNow(20_000, async () =>
+        await testApi.handleSubagentInterrupt(
+          { id: "a1" },
+          async () => { throw new Error("pane gone"); },
+          async () => {},
+        ),
+      );
+
+      assert.equal(result.details.status, "interrupt_failed");
+      assert.match(result.content[0].text, /Failed to interrupt subagent "Worker": pane gone/);
+      const running = runningMap.get("a1");
+      assert.equal(running.userInterrupted, false);
+      assert.equal(classifyStatus(running.statusState, 20_000).kind, "active");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("refuses to interrupt Claude Code CLI children", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+
+    try {
+      runningMap.set("c1", makeRunning({ id: "c1", name: "Claude", cli: "claude" }));
+      const result = await testApi.handleSubagentInterrupt(
+        { name: "Claude" },
+        async () => { throw new Error("must not touch the surface"); },
+        async () => { throw new Error("must not close the surface"); },
+      );
+
+      assert.match(result.content[0].text, /cannot be interrupted/);
+      assert.equal(runningMap.get("c1").userInterrupted, undefined);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("finalizes interrupted runs with a concise notice and skips normal completion", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const { api, sentMessages } = createMockExtensionApi();
+    const interrupted = makeRunning({ userInterrupted: true, task: "do work" });
+    const handled = testApi.finalizeInterruptedRun(api, interrupted, {
+      elapsed: 42,
+      exitCode: 1,
+      interrupted: true,
+    });
+
+    assert.equal(handled, true);
+    assert.equal(sentMessages.length, 1);
+    const message = sentMessages[0].message;
+    assert.equal(message.customType, "subagent_result");
+    assert.equal(
+      message.content,
+      'Sub-agent "Worker" was interrupted by the user after 42s. It did not produce a result.',
+    );
+    assert.equal(message.details.interrupted, true);
+    assert.doesNotMatch(message.content, /Follow up with subagent_message/);
+
+    const ignored = testApi.finalizeInterruptedRun(api, makeRunning({ task: "do work" }), {
+      elapsed: 1,
+      exitCode: 0,
+    });
+    assert.equal(ignored, false);
+    assert.equal(sentMessages.length, 1);
   });
 
   it("uniqueRunningName suffixes defaulted names that collide with running subagents", () => {
@@ -4822,6 +4984,97 @@ describe("tmux.ts", () => {
           restoreEnvVar("HERDR_PANE_ID", oldPane);
           setSurfaceBackendPreference(oldPref);
           __surfaceTest__.resetCommandAvailability();
+        }
+      });
+    });
+
+    it("sends Escape before killing tmux panes", async () => {
+      await withTempDir(async (dir) => {
+        const binDir = join(dir, "bin");
+        const log = join(dir, "args.log");
+        mkdirSync(binDir);
+        writeFileSync(binDir + "/tmux", `#!/bin/sh\necho "$*" >> '${log}'\nexit 0\n`);
+        chmodSync(binDir + "/tmux", 0o755);
+        const oldPath = process.env.PATH;
+        const oldTmux = process.env.TMUX;
+        try {
+          process.env.PATH = `${binDir}:${oldPath}`;
+          process.env.TMUX = "fake";
+          await interruptSurface("%99");
+          await closeSurface("%99");
+          assert.deepEqual(readFileSync(log, "utf8").trim().split("\n"), [
+            "send-keys -t %99 Escape",
+            "kill-pane -t %99",
+          ]);
+        } finally {
+          process.env.PATH = oldPath;
+          restoreEnvVar("TMUX", oldTmux);
+        }
+      });
+    });
+
+    it("sends the canonical Escape key before closing Herdr panes", async () => {
+      await withTempDir(async (dir) => {
+        const binDir = join(dir, "bin");
+        const log = join(dir, "args.log");
+        mkdirSync(binDir);
+        const cli = join(binDir, "herdr");
+        writeFileSync(cli, `#!/bin/sh\necho "$*" >> '${log}'\ncase "$1 $2" in\n  "pane split") echo '{"result":{"pane":{"pane_id":"w1:p9"}}}' ;;\n  *) echo '{"result":{}}' ;;\nesac\n`);
+        chmodSync(cli, 0o755);
+        const oldPath = process.env.PATH;
+        const oldEnv = process.env.HERDR_ENV;
+        const oldPane = process.env.HERDR_PANE_ID;
+        const oldPref = getSurfaceBackendPreference();
+        let surface: string | undefined;
+        try {
+          process.env.PATH = `${binDir}:${oldPath}`;
+          process.env.HERDR_ENV = "1";
+          process.env.HERDR_PANE_ID = "w1:p1";
+          setSurfaceBackendPreference("herdr");
+          surface = await createSurface("worker");
+          await interruptSurface(surface);
+          await closeSurface(surface);
+          const calls = readFileSync(log, "utf8").trim().split("\n");
+          assert.ok(calls.includes("pane send-keys w1:p9 esc"));
+          assert.equal(calls.filter((line) => line === "pane close w1:p9").length, 1);
+        } finally {
+          if (surface) await closeSurface(surface).catch(() => {});
+          process.env.PATH = oldPath;
+          restoreEnvVar("HERDR_ENV", oldEnv);
+          restoreEnvVar("HERDR_PANE_ID", oldPane);
+          setSurfaceBackendPreference(oldPref);
+        }
+      });
+    });
+
+    it("signals background processes before terminating them", async () => {
+      await withTempDir(async (dir) => {
+        const previous = isMultiplexingEnabled();
+        setMultiplexingEnabled(false);
+        const marker = join(dir, "sigint.marker");
+        const ready = join(dir, "ready.marker");
+        const logPath = join(dir, "artifacts", "session", "subagent-logs", "worker-interrupt.log");
+        const surface = await createSurface("worker", { id: "interrupt-test", logPath });
+        try {
+          await sendLongCommand(
+            surface,
+            `echo READY > ${ready}\ntrap 'echo SIGNALLED > ${marker}' INT\nsleep 5 &\nwait $!`,
+            { scriptPath: join(dir, "launch.sh") },
+          );
+          const readyDeadline = Date.now() + 1_000;
+          while (!existsSync(ready) && Date.now() < readyDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.ok(existsSync(ready), "expected the background process to start");
+          await interruptSurface(surface);
+          const deadline = Date.now() + 1_000;
+          while (!existsSync(marker) && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.ok(existsSync(marker), "expected SIGINT before termination");
+        } finally {
+          await closeSurface(surface);
+          setMultiplexingEnabled(previous);
         }
       });
     });

@@ -32,6 +32,36 @@ export function readBackground(surface: string, lines: number): string {
   return readFileSync(record.logPath, "utf8").split("\n").slice(-Math.max(1, lines) - 1).join("\n");
 }
 
+/**
+ * Send a headless subagent its graceful cancellation signal. Background
+ * surfaces have no terminal input, so SIGINT stands in for Escape. Returns
+ * false when there is no live child to signal. The caller still closes the
+ * surface (SIGTERM) to guarantee termination.
+ */
+export async function interruptBackground(surface: string, gracePeriodMs = 500): Promise<boolean> {
+  const record = surfaces.get(surface);
+  const child = record?.child;
+  if (!record || !child || record.exitCode !== null || child.exitCode !== null) return false;
+  try {
+    child.kill("SIGINT");
+  } catch {
+    return false;
+  }
+  if (record.exitCode !== null || child.exitCode !== null) return true;
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      resolve();
+    }, Math.max(0, gracePeriodMs));
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    child.once("exit", onExit);
+  });
+  return true;
+}
+
 export function backgroundExitCode(surface: string): number | null | undefined {
   const record = surfaces.get(surface);
   return record?.exitCode ?? record?.child?.exitCode;
