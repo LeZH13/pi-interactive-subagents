@@ -798,42 +798,25 @@ const ICON_YELLOW = "\x1b[38;2;214;181;94m";
 const ICON_RED = "\x1b[38;2;224;108;117m";
 const ICON_DIM = "\x1b[38;2;128;128;128m";
 
-/** ANSI colors for widget thinking levels (escalating intensity, analogous to Pi's thinking border hierarchy). */
-const THINKING_CYAN = "\x1b[38;2;0;170;255m";        // minimal, low
-const THINKING_BRIGHT_CYAN = "\x1b[38;2;0;255;255m"; // medium
-const THINKING_MAGENTA = "\x1b[38;2;255;0;255m";     // high
-const THINKING_RED = "\x1b[38;2;255;0;0m";          // xhigh
-const THINKING_ROSE = "\x1b[38;2;255;0;136m";        // max
-const THINKING_BUDGET = "\x1b[38;2;214;181;94m";     // token budget (amber)
+type ThinkingTheme = {
+  getThinkingBorderColor(level: string): (text: string) => string;
+};
 
-function formatThinkingLevelColor(level: string): string {
-  const normalized = level.trim().toLowerCase();
-  switch (normalized) {
-    case "minimal":
-    case "low":
-      return THINKING_CYAN;
-    case "medium":
-      return THINKING_BRIGHT_CYAN;
-    case "high":
-      return THINKING_MAGENTA;
-    case "xhigh":
-      return THINKING_RED;
-    case "max":
-      return THINKING_ROSE;
-    default:
-      return /^\d/.test(normalized) ? THINKING_BUDGET : ICON_DIM;
-  }
-}
-
-function formatModelWithThinking(rawModel: string, thinkingOverride?: string): string {
+function formatModelWithThinking(rawModel: string, thinkingOverride: string | undefined, theme: ThinkingTheme): string {
   const { model: baseModel, thinking: inlineThinking } = splitModelThinking(rawModel);
   const effectiveModel = (baseModel ?? rawModel).trim();
   const effectiveThinking = (thinkingOverride ?? inlineThinking)?.trim();
   if (!effectiveThinking || effectiveThinking.toLowerCase() === "off" || effectiveThinking.toLowerCase() === "none") {
     return `${ICON_DIM}${effectiveModel}${RST}`;
   }
-  const color = formatThinkingLevelColor(effectiveThinking);
-  return `${ICON_DIM}${effectiveModel}${RST}${color}:${effectiveThinking}${RST}`;
+  const normalized = effectiveThinking.toLowerCase();
+  const label = `:${effectiveThinking}`;
+  const colored = /^\d/.test(normalized)
+    ? `${ICON_YELLOW}${label}`
+    : ["minimal", "low", "medium", "high", "xhigh", "max"].includes(normalized)
+      ? theme.getThinkingBorderColor(normalized)(label)
+      : `${ICON_DIM}${label}`;
+  return `${ICON_DIM}${effectiveModel}${RST}${colored}${RST}`;
 }
 
 /** Map a live status kind to a colored single-char icon for the widget. */
@@ -1140,6 +1123,7 @@ function formatWidgetTelemetryClusters(stats: {
 
 function formatWidgetTelemetryLine(
   snapshot: StatusSnapshot,
+  theme: ThinkingTheme,
 ): { left: string; right: string } | null {
   const hasTelemetry = [
     snapshot.model,
@@ -1166,7 +1150,7 @@ function formatWidgetTelemetryLine(
 
   const rightSegments: string[] = [];
   if (snapshot.model) {
-    rightSegments.push(formatModelWithThinking(snapshot.model, snapshot.thinking));
+    rightSegments.push(formatModelWithThinking(snapshot.model, snapshot.thinking, theme));
   }
   if (snapshot.contextTokens != null && snapshot.contextTokens > 0) {
     const baseModel = splitModelThinking(snapshot.model).model ?? snapshot.model;
@@ -1189,7 +1173,7 @@ function formatWidgetTelemetryLine(
   return { left, right };
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, theme: ThinkingTheme): string[] {
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -1210,7 +1194,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
 
     lines.push(borderLine(left, right, width));
 
-    const telemetryLine = formatWidgetTelemetryLine(snapshot);
+    const telemetryLine = formatWidgetTelemetryLine(snapshot, theme);
     if (telemetryLine) lines.push(borderLine(telemetryLine.left, telemetryLine.right, width));
   }
 
@@ -1233,11 +1217,11 @@ function updateWidget() {
 
   latestCtx.ui.setWidget(
     "subagent-status",
-    (_tui: any, _theme: any) => {
+    (_tui: any, theme: ThinkingTheme) => {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, theme);
         },
       };
     },
@@ -1666,7 +1650,6 @@ export const __test__ = {
   formatWidgetTelemetryClusters,
   formatWidgetTelemetryLine,
   formatModelWithThinking,
-  formatThinkingLevelColor,
   activityLabel,
   widgetIcon,
   wrapCommandWithCompletion,

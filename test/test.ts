@@ -4338,6 +4338,11 @@ describe("subagent startup delay", () => {
     }
   });
 });
+const levels = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const thinkingTheme = {
+  getThinkingBorderColor: (level: string) => (text: string) => `\x1b[38;5;${levels.indexOf(level) + 1}m${text}\x1b[0m`,
+};
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
@@ -4375,7 +4380,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess3",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
         },
-      ], 16);
+      ], 16, thinkingTheme);
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -4416,7 +4421,7 @@ describe("subagents widget rendering", () => {
       startTime: now - 144_000,
       sessionFile: "sess1",
       statusState,
-    }], 100));
+    }], 100, thinkingTheme));
     const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
     const plain = lines.map(stripAnsi);
 
@@ -4460,13 +4465,13 @@ describe("subagents widget rendering", () => {
       startTime: now - 60_000,
       sessionFile: "sess1",
       statusState,
-    }], 100));
+    }], 100, thinkingTheme));
     const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
     const plain = lines.map(stripAnsi);
 
     assert.match(plain[1], /active · thinking 5s/);
     assert.match(plain[2], /claude-3-7-sonnet:high · 5\.0%\/200k/);
-    assert.match(lines[2], /\x1b\[38;2;255;0;255m:high/);
+    assert.match(lines[2], /\x1b\[38;5;4m:high/);
   });
 
   it("keeps telemetry blocks within narrow terminal widths", () => {
@@ -4497,7 +4502,7 @@ describe("subagents widget rendering", () => {
         startTime: now - 5_000,
         sessionFile: "sess1",
         statusState,
-      }], width);
+      }], width, thinkingTheme);
       assert.equal(lines.length, 4);
       for (const line of lines) assert.ok(visibleWidth(line) <= width);
     }
@@ -4530,7 +4535,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
         },
-      ], width);
+      ], width, thinkingTheme);
 
       for (const line of lines) {
         assert.ok(
@@ -4640,9 +4645,9 @@ describe("subagent display helpers", () => {
         model: "gpt-5.6-sol",
         contextTokens,
       });
-      assert.match(testApi.formatWidgetTelemetryLine(snapshot(98_000)).right, /38;2;126;186;103m/);
-      assert.match(testApi.formatWidgetTelemetryLine(snapshot(100_000)).right, /38;2;214;181;94m/);
-      assert.match(testApi.formatWidgetTelemetryLine(snapshot(162_000)).right, /38;2;224;108;117m/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(98_000), thinkingTheme).right, /38;2;126;186;103m/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(100_000), thinkingTheme).right, /38;2;214;181;94m/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot(162_000), thinkingTheme).right, /38;2;224;108;117m/);
     });
 
     it("formats model thinking suffix with semantic color when configured", () => {
@@ -4652,9 +4657,9 @@ describe("subagent display helpers", () => {
         thinking,
         inputTokens: 100,
       });
-      assert.match(testApi.formatWidgetTelemetryLine(snapshot("high")).right, /\x1b\[38;2;255;0;255m:high/);
-      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot("off")).right, /:off/);
-      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot(undefined)).right, /:/);
+      assert.match(testApi.formatWidgetTelemetryLine(snapshot("high"), thinkingTheme).right, /\x1b\[38;5;4m:high/);
+      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot("off"), thinkingTheme).right, /:off/);
+      assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot(undefined), thinkingTheme).right, /:/);
     });
   });
 
@@ -4662,30 +4667,28 @@ describe("subagent display helpers", () => {
     it("hides thinking suffix when unset, off, or none", () => {
       const testApi = (subagentsModule as any).__test__;
       const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol")), "gpt-5.6-sol");
-      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "off")), "gpt-5.6-sol");
-      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "none")), "gpt-5.6-sol");
-      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol:off")), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", undefined, thinkingTheme)), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "off", thinkingTheme)), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol", "none", thinkingTheme)), "gpt-5.6-sol");
+      assert.equal(strip(testApi.formatModelWithThinking("gpt-5.6-sol:off", undefined, thinkingTheme)), "gpt-5.6-sol");
     });
 
-    it("applies semantic ANSI colors to thinking levels", () => {
+    it("uses Pi's thinking border colors for each thinking level", () => {
       const testApi = (subagentsModule as any).__test__;
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "low"), /\x1b\[38;2;0;170;255m:low/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "minimal"), /\x1b\[38;2;0;170;255m:minimal/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "medium"), /\x1b\[38;2;0;255;255m:medium/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "high"), /\x1b\[38;2;255;0;255m:high/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "xhigh"), /\x1b\[38;2;255;0;0m:xhigh/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "max"), /\x1b\[38;2;255;0;136m:max/);
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "16k"), /\x1b\[38;2;214;181;94m:16k/);
+      for (const [index, level] of levels.entries()) {
+        assert.ok(testApi.formatModelWithThinking("claude-3-7", level, thinkingTheme)
+          .includes(`\x1b[38;5;${index + 1}m:${level}`));
+      }
+      assert.match(testApi.formatModelWithThinking("claude-3-7", "16k", thinkingTheme), /\x1b\[38;2;214;181;94m:16k/);
     });
 
     it("parses inline model thinking suffix and honors explicit overrides", () => {
       const testApi = (subagentsModule as any).__test__;
       const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
-      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high")), "claude-3-7:high");
-      assert.match(testApi.formatModelWithThinking("claude-3-7:high"), /\x1b\[38;2;255;0;255m:high/);
-      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high", "off")), "claude-3-7");
-      assert.match(testApi.formatModelWithThinking("claude-3-7:high", "medium"), /\x1b\[38;2;0;255;255m:medium/);
+      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high", undefined, thinkingTheme)), "claude-3-7:high");
+      assert.match(testApi.formatModelWithThinking("claude-3-7:high", undefined, thinkingTheme), /\x1b\[38;5;4m:high/);
+      assert.equal(strip(testApi.formatModelWithThinking("claude-3-7:high", "off", thinkingTheme)), "claude-3-7");
+      assert.match(testApi.formatModelWithThinking("claude-3-7:high", "medium", thinkingTheme), /\x1b\[38;5;3m:medium/);
     });
   });
 
