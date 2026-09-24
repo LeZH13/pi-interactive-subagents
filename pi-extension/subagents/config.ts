@@ -2,18 +2,32 @@
  * Unified subagent configuration: status widget, surface backend preference,
  * and per-agent model/thinking overrides.
  *
- * `config.json` in the package root is the single persisted store, edited via
- * `/subagent-settings` (live-apply + immediate atomic write) and read at
- * spawn/resume time. Every accessor tolerates a missing or legacy file:
- * absent keys fall back to defaults and the legacy `picker` key is ignored.
+ * The durable store is `<agentDir>/extensions/pi-interactive-subagents/config.json`,
+ * edited via `/subagent-settings` (live-apply + immediate atomic write) and read at
+ * spawn/resume time. Package-local `config.json` is not used. Every accessor tolerates
+ * a missing file or legacy content: absent keys fall back to defaults and the legacy
+ * `picker` key is ignored.
  */
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-export const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 export const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
+
+/** Extension directory name used for durable user configuration. */
+export const SUBAGENT_CONFIG_EXTENSION_DIR = "pi-interactive-subagents";
+
+/** Resolve the durable user config path, honoring `PI_CODING_AGENT_DIR`. */
+export function subagentsUserConfigPath(agentDir: string = getAgentDir()): string {
+  return join(agentDir, "extensions", SUBAGENT_CONFIG_EXTENSION_DIR, "config.json");
+}
+
+/** Default path for every config read/write. Evaluated at call time. */
+export function defaultSubagentsConfigPath(): string {
+  return subagentsUserConfigPath();
+}
 
 export type AgentOverride = {
   model?: string;
@@ -154,7 +168,7 @@ function readConfigFile(
 }
 
 export function loadSubagentsConfig(
-  configPath = DEFAULT_CONFIG_PATH,
+  configPath = defaultSubagentsConfigPath(),
   examplePath = EXAMPLE_CONFIG_PATH,
 ): SubagentsConfig {
   const { sourcePath, rawConfig } = readConfigFile(configPath, examplePath);
@@ -198,7 +212,7 @@ export function serializeSubagentsConfig(config: SubagentsConfig): string {
  */
 export function writeSubagentsConfig(
   config: SubagentsConfig,
-  configPath = DEFAULT_CONFIG_PATH,
+  configPath = defaultSubagentsConfigPath(),
 ): void {
   mkdirSync(dirname(configPath), { recursive: true });
   const tmp = `${configPath}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`;
@@ -207,7 +221,7 @@ export function writeSubagentsConfig(
 }
 
 /** True when a real config.json exists (as opposed to falling back to the example). */
-export function hasSubagentsConfigFile(configPath = DEFAULT_CONFIG_PATH): boolean {
+export function hasSubagentsConfigFile(configPath = defaultSubagentsConfigPath()): boolean {
   return existsSync(configPath);
 }
 
@@ -218,7 +232,7 @@ export function hasSubagentsConfigFile(configPath = DEFAULT_CONFIG_PATH): boolea
  */
 export function createSubagentsConfigState(
   initial: SubagentsConfig,
-  configPath = DEFAULT_CONFIG_PATH,
+  configPath = defaultSubagentsConfigPath(),
 ): {
   get(): SubagentsConfig;
   update(mutator: (draft: SubagentsConfig) => void, options?: { pruneAgents?: string[] }): void;

@@ -3,9 +3,9 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import * as tmux from "./tmux.ts";
 import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, interruptBackground, launchBackground, readBackground } from "./background.ts";
+import { EXAMPLE_CONFIG_PATH, subagentsUserConfigPath } from "./config.ts";
 import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, interruptHerdrPane, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
 
 export type SurfaceBackendKind = "auto" | "tmux" | "herdr" | "background";
@@ -21,9 +21,6 @@ export interface SurfaceBackend {
 }
 export interface SurfaceOptions { id?: string; logPath?: string; sessionFile?: string; }
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 export function parseMultiplexingConfig(raw: unknown, source = "config.json"): MultiplexingConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Invalid subagent multiplexing config in ${source}: root must be an object`);
   const multiplexing = (raw as any).multiplexing;
@@ -38,7 +35,7 @@ export function parseMultiplexingConfig(raw: unknown, source = "config.json"): M
   if (!enabled && multiplexing.backend !== undefined && backend !== "background") throw new Error(`Invalid subagent multiplexing config in ${source}: multiplexing.enabled=false conflicts with backend=${backend}`);
   return { enabled, backend };
 }
-export function loadMultiplexingConfig(configPath = DEFAULT_CONFIG_PATH, examplePath = EXAMPLE_CONFIG_PATH): MultiplexingConfig {
+export function loadMultiplexingConfig(configPath = subagentsUserConfigPath(), examplePath = EXAMPLE_CONFIG_PATH): MultiplexingConfig {
   let source = configPath; let raw: string;
   try { raw = readFileSync(configPath, "utf8"); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;

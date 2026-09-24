@@ -194,34 +194,40 @@ loadout replayed and steers the result back; (b) a session without a sidecar
 is refused with a clear error; (c) passing both `name` and `sessionPath` is a
 parameter error; (d) README documents the parameter.
 
-### Phase 3 — Durable user-dir config
+### Phase 3 — Durable user-dir config — ✅ DONE 2026-09-24
 
-Goal: settings survive package reinstalls. Our persisted config lives in the
-package directory today and is clobbered on every update; the fork stores
+Implemented and verified: `npm run typecheck` clean; `npm test` passes. All configuration reads and writes now default to `<agentDir>/extensions/pi-interactive-subagents/config.json`, honoring `PI_CODING_AGENT_DIR`. The package-local `config.json` path is no longer used, migrated, or imported.
+
+Goal: settings survive package reinstalls. Our persisted config lived in the
+package directory and was clobbered on every update; the fork stores
 user config in the pi agent dir for this reason.
 
 Approach:
 
-1. Move persisted state (`status.enabled`, `multiplexing.backend`, per-agent
+1. Moved persisted state (`status.enabled`, `multiplexing.backend`, per-agent
    model/thinking overrides) to
    `<agentDir>/extensions/pi-interactive-subagents/config.json`, honoring
    `PI_CODING_AGENT_DIR`.
-2. One-time import: on load, if the user-dir file is absent and a
-   package-local `config.json` exists, copy it over and stop reading the
-   package-local file thereafter. No ongoing fallback layer.
-3. `/subagent-settings` stays the UI (ours is nicer than their slash menu)
-   and writes to the new path atomically as it already does.
+2. Removed the package-local config path entirely: no migration, no
+   package-file fallback, and no ongoing compatibility layer. An obsolete
+   package-local `config.json`, if present, is ignored.
+3. `/subagent-settings` stays the UI and writes to the new path atomically
+   through the existing config-state machinery.
 4. `config.json.example` remains in the package purely as schema
-   documentation; `config.json` itself leaves `.gitignore`-relevant scope.
+   documentation.
+5. Unified the previously separate `surface.ts` multiplexing loader onto the
+   same durable config-path helper.
+6. Removed package-local `config.json` from `.gitignore`-relevant scope.
 
-Files: `pi-extension/subagents/config.ts` (path resolution + import),
-`settings.ts` (write target), `.gitignore`.
+Files: `pi-extension/subagents/config.ts` (path resolution),
+`surface.ts` (shared durable path), `settings.ts` (user-agent wording),
+`README.md`, `.gitignore`.
 
 Done when: (a) changing a setting persists to the user-dir path and survives
-`pi install` of a fresh package copy; (b) a pre-existing package-local
-`config.json` is imported exactly once and then ignored; (c) deleting the
-user-dir file re-imports (fresh start); (d) unit tests cover import-once and
-`PI_CODING_AGENT_DIR` handling.
+`pi install` of a fresh package copy; (b) a package-local `config.json` is
+not read, written, migrated, or imported; (c) deleting the user-dir file
+returns to example/default behavior; (d) unit tests cover the durable path
+and `PI_CODING_AGENT_DIR` handling.
 
 ### Phase 4 — `/plan` workflow skill + planner/reviewer agents
 

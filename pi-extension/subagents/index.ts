@@ -875,7 +875,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 /**
  * Unified live config state: status widget flag, backend preference, and
  * per-agent model/thinking overrides. `/subagent-settings` mutates it live
- * (persisting each change to config.json); spawn/resume resolution reads it.
+ * (persisting each change to the durable user agent config); spawn/resume resolution reads it.
  * The surface backend preference mirrors into surface.ts so live
  * createSurface() calls follow page changes without a restart.
  */
@@ -3337,7 +3337,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // `/subagent-settings` — backend, status widget, per-agent model/thinking
   // defaults, and orphan cleanup. Replaces `/subagent-mux` and
   // `/subagent-sessions` (both removed, no shims). The page is also the
-  // model picker: per-agent overrides persist to config.json and outrank
+  // model picker: per-agent overrides persist to the user agent config and outrank
   // markdown defaults, while explicit spawn args still win per-spawn.
   registerSubagentSettingsCommand(pi, {
     discoverAgents: () => discoverAgentDefinitions().map((a) => ({

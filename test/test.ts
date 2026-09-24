@@ -76,6 +76,8 @@ import {
 import {
   createSubagentsConfigState,
   DEFAULT_SUBAGENTS_CONFIG,
+  defaultSubagentsConfigPath,
+  hasSubagentsConfigFile,
   loadSubagentsConfig,
   parseSubagentsConfig,
   serializeSubagentsConfig,
@@ -1260,6 +1262,36 @@ describe("config.ts (unified subagent config)", () => {
       status: { enabled: true },
       multiplexing: { backend: "auto" },
       agents: {},
+    });
+  });
+
+  it("persists settings to the durable user agent config path", () => {
+    withTempDir((dir) => {
+      const agentDir = join(dir, "agent");
+      const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+      try {
+        process.env.PI_CODING_AGENT_DIR = agentDir;
+        const expected = join(
+          agentDir,
+          "extensions",
+          "pi-interactive-subagents",
+          "config.json",
+        );
+        const config = {
+          status: { enabled: false },
+          multiplexing: { backend: "tmux" as const },
+          agents: { worker: { thinking: "high" } },
+        };
+
+        assert.equal(defaultSubagentsConfigPath(), expected);
+        assert.equal(hasSubagentsConfigFile(), false);
+        writeSubagentsConfig(config);
+        assert.equal(hasSubagentsConfigFile(), true);
+        assert.deepEqual(loadSubagentsConfig(), config);
+        assert.deepEqual(loadMultiplexingConfig(), { enabled: true, backend: "tmux" });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+      }
     });
   });
 

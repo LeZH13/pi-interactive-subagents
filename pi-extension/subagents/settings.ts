@@ -5,8 +5,8 @@
  * Framed by full-width border lines above and below the list, mirroring
  * pi's native /settings page (DynamicBorder).
  *
- * Every change applies live in memory and persists to config.json immediately
- * (atomic write). Empty per-agent overrides are dropped; overrides for agents
+ * Every change applies live in memory and persists to the durable user agent
+ * config immediately (atomic write). Empty per-agent overrides are dropped; overrides for agents
  * that no longer exist are pruned on each save.
  */
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -456,7 +456,7 @@ export function buildSubagentSettingItems(
     description:
       `Surface backend for new subagents (preference: ${getSurfaceBackendPreference()}, ` +
       `effective: ${effectiveBackend}, tmux: ${isTmuxAvailable() ? "yes" : "no"}, ` +
-      `Herdr: ${isHerdrAvailable() ? "yes" : "no"}). Persists to config.json and applies live.`,
+      `Herdr: ${isHerdrAvailable() ? "yes" : "no"}). Persists to the user agent config and applies live.`,
     currentValue: snapshot.multiplexing.backend,
     submenu: (currentValue, done) => simpleSelectComponent(
       ctx,
@@ -479,7 +479,7 @@ export function buildSubagentSettingItems(
   items.push({
     id: "status-widget",
     label: "Status widget",
-    description: "Show the live subagent status widget above the editor. Persists to config.json.",
+    description: "Show the live subagent status widget above the editor. Persists to the user agent config.",
     currentValue: snapshot.status.enabled ? "true" : "false",
     submenu: (currentValue, done) => simpleSelectComponent(
       ctx,

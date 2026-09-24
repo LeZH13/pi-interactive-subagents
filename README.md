@@ -150,9 +150,9 @@ You are a specialized agent that does X...
 
 With `model-fallback: inherit`, nested agents inherit from their **immediate spawner**, not always from the top-level conversation. Fallback thinking resolves in this order: an explicit per-spawn value, the settings-page override, the agent's `thinking`, the spawner's live thinking level, then Pi's default. The fallback model and thinking are frozen in the retry's loadout, so later `subagent_message` resumes replay the same selection.
 
-## Configuration (`config.json` + `/subagent-settings`)
+## Configuration (agent-dir `config.json` + `/subagent-settings`)
 
-`config.json` in the package root is the single persisted store (`status`, `multiplexing.backend`, per-agent `agents` overrides). It is **local and gitignored** — `config.json.example` is the committed template; copy it to opt out of defaults. Every `/subagent-settings` change applies live and is written immediately (atomic write); overrides for deleted agents are pruned on save.
+The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.json` (`status`, `multiplexing.backend`, per-agent `agents` overrides), honoring `PI_CODING_AGENT_DIR`. This keeps settings outside the installed package, so reinstalling or replacing the package does not erase them. Package-local `config.json` is obsolete and is no longer read; `config.json.example` remains the committed template. Every `/subagent-settings` change applies live and is written immediately (atomic write); overrides for deleted agents are pruned on save.
 
 ```json
 {
@@ -223,7 +223,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Surface backends & background mode
 
-Backend preference lives in `config.json` (`multiplexing.backend`) — see [Configuration](#configuration-configjson--subagent-settings) — or the `/subagent-settings` backend row.
+Backend preference lives in the user agent config (`multiplexing.backend`) — see [Configuration](#configuration-agent-dir-configjson--subagent-settings) — or the `/subagent-settings` backend row.
 
 `auto` selects Herdr when the process has `HERDR_ENV=1` plus `HERDR_PANE_ID`, tmux when it has `TMUX`, and otherwise background mode. If both nested environments are present, `auto` refuses to guess; explicitly select the intended backend. The effective choice is exported to children as `PI_SUBAGENT_BACKEND`, so nested subagents do not re-detect a different multiplexer.
 
@@ -235,7 +235,7 @@ Background output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.l
 
 ## Status widget
 
-The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`. Toggle the widget via the `/subagent-settings` status-widget row (persists to `config.json`).
+The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`. Toggle the widget via the `/subagent-settings` status-widget row (persists to the user agent config).
 
 ## Session Storage & Orphan Cleanup
 
