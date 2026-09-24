@@ -1345,6 +1345,49 @@ function applySandboxToParts(
   }
 }
 
+/**
+ * Build the `pi --session` command for resuming a recorded session: the
+ * session file, the always-loaded subagent-done extension, the model /
+ * identity / default-deny sandbox replayed from the spawn-time loadout
+ * snapshot, and the follow-up prompt as an @file. Split out of the resume
+ * tool handler so tests can pin the replay wiring without spawning a real
+ * surface.
+ */
+function buildResumeCommandParts(
+  sessionPath: string,
+  loadout: SubagentLoadout,
+  opts: { artifactDir: string; name: string; message?: string },
+): { parts: string[]; resumeMsgFile?: string } {
+  const parts = ["pi", "--session", shellEscape(sessionPath)];
+
+  // Load subagent-done extension so the agent can self-terminate if needed
+  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+  parts.push("-e", shellEscape(subagentDonePath));
+
+  // Replay the model, identity, and default-deny tool/extension sandbox.
+  applySandboxToParts(parts, loadout, { artifactDir: opts.artifactDir, name: opts.name });
+
+  let resumeMsgFile: string | undefined;
+  if (opts.message) {
+    const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    resumeMsgFile = join(
+      opts.artifactDir,
+      "subagent-resume",
+      `${opts.name
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .replace(/\s+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+    );
+    mkdirSync(dirname(resumeMsgFile), { recursive: true });
+    writeFileSync(resumeMsgFile, opts.message, "utf8");
+    parts.push(shellEscape(`@${resumeMsgFile}`));
+  }
+
+  return { parts, resumeMsgFile };
+}
+
 function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
@@ -1740,21 +1783,14 @@ async function handleSubagentInterrupt(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
-
-  statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
-      if (statusInterval) {
-        clearInterval(statusInterval);
-        statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-      }
-      return;
-    }
-
+/**
+ * One status-supervision pass over the running set: refresh snapshots, advance
+ * status kinds, and steer stalled/recovered transitions for non-interactive
+ * runs. Split out of the refresh interval so tests can drive it with a fixed
+ * clock instead of real timers.
+ */
+function runStatusSupervisionTick(pi: ExtensionAPI, now: number): void {
     const transitionLines: string[] = [];
-    const now = Date.now();
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
@@ -1789,6 +1825,22 @@ function startStatusRefresh(pi: ExtensionAPI) {
         { triggerTurn: true, deliverAs: "steer" },
       );
     }
+}
+
+function startStatusRefresh(pi: ExtensionAPI) {
+  if (!statusConfig.enabled || statusInterval) return;
+
+  statusInterval = setInterval(() => {
+    if (runningSubagents.size === 0) {
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      }
+      return;
+    }
+
+    runStatusSupervisionTick(pi, Date.now());
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
@@ -1844,6 +1896,8 @@ export const __test__ = {
   visibleRunningSubagents,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  buildResumeCommandParts,
+  runStatusSupervisionTick,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -3112,38 +3166,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
         }
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
-
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
-        }
+        // Build pi resume command, replaying the spawn-time sandbox snapshot.
+        const { parts, resumeMsgFile } = buildResumeCommandParts(sessionPath, loadout, {
+          artifactDir,
+          name,
+          message,
+        });
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps

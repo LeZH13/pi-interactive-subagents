@@ -88,6 +88,7 @@ import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
+  writeSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
   shouldMarkUserTookOver,
@@ -5307,5 +5308,207 @@ describe("tmux.ts", () => {
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
     });
+  });
+});
+
+describe("status supervision tick", () => {
+  function tickRunning(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "a1",
+      name: "Worker",
+      task: "",
+      surface: "pane-1",
+      startTime: 0,
+      sessionFile: "worker.jsonl",
+      interactive: false,
+      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
+      ...overrides,
+    };
+  }
+
+  /** A status state whose snapshot has been missing since t=0. */
+  function agedMissingState() {
+    return observeStatus(
+      createStatusState({ source: "pi", startTimeMs: 0 }),
+      { snapshot: "missing" },
+      0,
+    );
+  }
+
+  function tickSetup() {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    const sent: Array<{ msg: any; opts: any }> = [];
+    const pi = {
+      sendMessage: (msg: any, opts: any) => {
+        sent.push({ msg, opts });
+      },
+    };
+    return { testApi, runningMap, sent, pi };
+  }
+
+  it("steers a stalled transition for a non-interactive run with no snapshots", () => {
+    const { testApi, runningMap, sent, pi } = tickSetup();
+    try {
+      runningMap.set("a1", tickRunning({ statusState: agedMissingState() }));
+      testApi.runStatusSupervisionTick(pi, 61_000);
+
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].msg.customType, "subagent_status");
+      assert.deepEqual(sent[0].opts, { triggerTurn: true, deliverAs: "steer" });
+      assert.match(sent[0].msg.content, /Worker/);
+      assert.equal(runningMap.get("a1").statusState.currentKind, "stalled");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("advances an interactive run silently without waking the parent", () => {
+    const { testApi, runningMap, sent, pi } = tickSetup();
+    try {
+      runningMap.set("a1", tickRunning({ statusState: agedMissingState(), interactive: true }));
+      testApi.runStatusSupervisionTick(pi, 61_000);
+
+      assert.equal(sent.length, 0);
+      assert.equal(runningMap.get("a1").statusState.currentKind, "stalled");
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("skips user-interrupted runs entirely", () => {
+    const { testApi, runningMap, sent, pi } = tickSetup();
+    const before = agedMissingState();
+    try {
+      runningMap.set(
+        "a1",
+        tickRunning({ statusState: before, userInterrupted: true, interruptedAt: 61_000 }),
+      );
+      testApi.runStatusSupervisionTick(pi, 61_000);
+
+      assert.equal(sent.length, 0);
+      assert.strictEqual(runningMap.get("a1").statusState, before);
+    } finally {
+      runningMap.clear();
+    }
+  });
+
+  it("steers a recovery when fresh snapshots resume", () => {
+    const { testApi, runningMap, sent, pi } = tickSetup();
+    const dir = mkdtempSync(join(tmpdir(), "pi-tick-"));
+    try {
+      const stalled = advanceStatusState(agedMissingState(), 61_000).nextState;
+      assert.equal(stalled.currentKind, "stalled");
+
+      const activityFile = join(dir, "activity.json");
+      writeSubagentActivityFile(activityFile, {
+        version: 1,
+        runningChildId: "a1",
+        createdAt: 0,
+        updatedAt: 62_000,
+        sequence: 2,
+        latestEvent: "agent_end",
+        phase: "waiting",
+        agentActive: false,
+        turnActive: false,
+        providerActive: false,
+        toolActive: false,
+        waitingSince: 62_000,
+      });
+
+      runningMap.set("a1", tickRunning({ statusState: stalled, activityFile }));
+      testApi.runStatusSupervisionTick(pi, 62_000);
+
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].msg.customType, "subagent_status");
+      assert.match(sent[0].msg.content, /recovered/);
+      assert.equal(runningMap.get("a1").statusState.currentKind, "waiting");
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("resume command construction", () => {
+  it("replays the loadout sandbox onto the pi --session command", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const dir = mkdtempSync(join(tmpdir(), "pi-resume-cmd-"));
+    try {
+      const sessionFile = join(dir, "subagent-ab12cd34.jsonl");
+      writeFileSync(sessionFile, "", "utf8");
+      const loadout: SubagentLoadout = {
+        agent: "worker",
+        model: "openai/gpt-5",
+        thinking: "high",
+        toolAllowlist: "read",
+        systemPromptMode: "append",
+        identity: "You are a test agent.",
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+      };
+      writeSubagentLoadout(sessionFile, loadout);
+
+      const stored = readSubagentLoadout(sessionFile);
+      assert.ok(stored);
+      const { parts, resumeMsgFile } = testApi.buildResumeCommandParts(sessionFile, stored, {
+        artifactDir: dir,
+        name: "Worker",
+        message: "follow up",
+      });
+
+      const command = parts.join(" ");
+      assert.ok(command.startsWith("pi "), "starts with the pi binary");
+      assert.ok(command.includes("--session"), "resumes the recorded session file");
+      assert.ok(command.includes(sessionFile), "points at the session path");
+      assert.ok(command.includes("--model"), "replays the snapshot model");
+      assert.ok(command.includes("openai/gpt-5:high"), "replays model with thinking suffix");
+      assert.ok(command.includes("--no-extensions"), "keeps default-deny extension loading");
+      assert.ok(command.includes("subagent-done.ts"), "always loads the completion tool");
+      assert.ok(resumeMsgFile, "writes the follow-up prompt to a file");
+      assert.ok(command.includes(`@${resumeMsgFile}`), "delivers the follow-up as an @file");
+      assert.equal(readFileSync(resumeMsgFile as string, "utf8"), "follow up");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("omits the message file when resuming without a follow-up", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const dir = mkdtempSync(join(tmpdir(), "pi-resume-cmd-"));
+    try {
+      const sessionFile = join(dir, "subagent-ab12cd34.jsonl");
+      writeFileSync(sessionFile, "", "utf8");
+      const loadout: SubagentLoadout = {
+        agent: "worker",
+        model: null,
+        thinking: null,
+        toolAllowlist: "read",
+        systemPromptMode: null,
+        identity: null,
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+      };
+
+      const { parts, resumeMsgFile } = testApi.buildResumeCommandParts(sessionFile, loadout, {
+        artifactDir: dir,
+        name: "Worker",
+      });
+
+      assert.equal(resumeMsgFile, undefined);
+      assert.ok(!parts.join(" ").includes("@"), "no @file argument without a message");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("resolveResumeLaunchBehavior keeps resumes autonomous", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.deepEqual(testApi.resolveResumeLaunchBehavior(), { autoExit: true, interactive: false });
   });
 });

@@ -229,7 +229,16 @@ not read, written, migrated, or imported; (c) deleting the user-dir file
 returns to example/default behavior; (d) unit tests cover the durable path
 and `PI_CODING_AGENT_DIR` handling.
 
-### Phase 4 — `/plan` workflow skill + planner/reviewer agents
+### Phase 4 — `/plan` workflow skill + planner/reviewer agents — ⏸ DEFERRED
+
+Status: deferred — `/plan` is prompt injection only (the command just
+sends `plan-skill.md` as a user message; all phase orchestration is the
+main model following instructions, with no coded state machine or
+enforcement). No machinery is lost by deferring. Optional cherry-picks if
+needed later: (a) `interactive` as a per-spawn `subagent` tool param
+(explicit param > frontmatter via `resolveInteractive`); (b) bundled
+`planner`/`reviewer` agents, usable via plain `subagent()` with no `/plan`
+command. Original proposal retained below for reference.
 
 Goal: batteries-included orchestration. The fork's `/plan` is a skill file
 injected as a user message that scripts the main agent through phases —
@@ -269,7 +278,16 @@ todos, reviewer run at the end; (b) artifacts land under
 reviewer with project>global>package precedence; (d) `interactive` is
 supported end-to-end (spawn param → child behavior).
 
-### Phase 5 — Programmatic bridge + `hiddenFromWidget`
+### Phase 5 — Programmatic bridge + `hiddenFromWidget` — ⏸ DEFERRED
+
+Status: deferred — no consumer exists. The bridge (`launchSubagent`/
+`watchSubagent` on the process-global + `hiddenFromWidget`) only pays off
+for orchestrator-style callers that spawn in code and await results inline
+(the fork built it for `pi-dynamic-workflows`; we have no equivalent).
+`hiddenFromWidget` alone is pointless: model-driven spawns should always
+show, and only programmatic launches would ever set the flag. Revisit when
+an orchestrator-style consumer actually exists. Original proposal retained
+below for reference.
 
 Goal: let other extensions launch subagents without widget clutter, the way
 the fork's `pi-dynamic-workflows` does.
@@ -299,7 +317,21 @@ object keeps working (project-local extension tool registry unaffected);
 (d) the bridge survives `/reload` (re-registered on module load, like our
 other `Symbol.for` globals).
 
-### Phase 6 — Test depth pass
+### Phase 6 — Test depth pass — ✅ DONE 2026-09-24
+
+Implemented and verified: `npm run typecheck` clean; `npm test` 269/269 pass
+(53 suites, up from 262/51). Two behavior-preserving extractions in
+`index.ts` to expose test seams via `__test__`: `runStatusSupervisionTick`
+(split out of the `startStatusRefresh` interval) and
+`buildResumeCommandParts` (split out of the resume tool handler). New suites
+in `test/test.ts`: `status supervision tick` (stalled steer, interactive
+silence with local advance, interrupted-run skip, recovery steer) and
+`resume command construction` (loadout replay onto `pi --session`, msg-file
+omission, autonomous resume behavior). Pre-existing coverage confirmed for
+the rest: double-interrupt (`interrupt_already_requested`, no repeat
+teardown), marker suppression, user-dir persistence + `PI_CODING_AGENT_DIR`,
+refusal paths, abort handling. Coverage gate holds: no 0-coverage files
+under `pi-extension/subagents/` (`index.ts` line coverage 59.5% → 62.1%).
 
 Goal: reach the fork's confidence level (~140 unit tests) for everything
 touched above plus our untested areas.
@@ -310,12 +342,12 @@ rest:
 - status transitions: `starting` → `active` → `waiting`/`stalled`/recovered,
   watchdog timing, stale-snapshot gating (incl. Phase 1 markers);
 - interrupt lifecycle (Phase 1);
-- config import-once + user-dir persistence (Phase 3);
+- config durable user-dir persistence + `PI_CODING_AGENT_DIR` handling (Phase 3);
 - loadout replay on path-resume (Phase 2);
 - nudge/reminder suppression on abort (we have the behavior; the fork has
   explicit tests to mirror).
 
-Done when: `npm test` passes with the new suites; every Phase 1–5 item's
+Done when: `npm test` passes with the new suites; every Phase 1–3 item's
 criteria are covered by at least one test; coverage run
 (`npm run test:coverage`) shows no 0-coverage files under
 `pi-extension/subagents/`.
