@@ -1,6 +1,6 @@
 # ROADMAP — maplezzk-improve worktree
 
-**Created:** 2026-09-23 · **Base:** `87040da` (our v3.7.2) · **Status:** plan, nothing implemented yet
+**Created:** 2026-09-23 · **Base:** `87040da` (our v3.7.2) · **Status:** complete 2026-09-24 — Phases 0–3 and 6 implemented; Phases 4, 5, 7 deferred (see each phase)
 
 This worktree ports proven design choices from the maplezzk fork of
 `pi-interactive-subagents` into ours. The document is self-contained: the
@@ -352,7 +352,11 @@ criteria are covered by at least one test; coverage run
 (`npm run test:coverage`) shows no 0-coverage files under
 `pi-extension/subagents/`.
 
-### Phase 7 — SKILL.md
+### Phase 7 — SKILL.md — ⏸ DEFERRED
+
+Status: deferred — docs-only operator manual (`SKILL.md` + `pi.skills` declaration) with no current demand; revisit when users start asking the
+model to configure or troubleshoot the extension. Original proposal retained
+below for reference.
 
 Goal: agents can configure and verify the package on request, matching our
 repo's skills conventions.
