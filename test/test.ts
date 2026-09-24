@@ -3510,7 +3510,7 @@ describe("tool registration", () => {
     assert.match(output, /\(unnamed\)/);
   });
 
-  it("registers subagent_message with name + message both required (name-only addressing)", () => {
+  it("registers subagent_message with message required and name/sessionPath optional", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -3520,18 +3520,151 @@ describe("tool registration", () => {
     const props = messageTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["message", "name"],
-      "only name/message should remain (sessionId dropped)",
+      ["message", "name", "sessionPath"],
+      "message tool should accept name/sessionPath addressing",
     );
     assert.equal(props.message.type, "string");
     assert.equal(props.name.type, "string");
+    assert.equal(props.sessionPath.type, "string");
     assert.deepEqual(
       messageTool.parameters.required?.slice().sort(),
-      ["message", "name"],
-      "name and message should both be required",
+      ["message"],
+      "only message should be required; name and sessionPath are mutually-exclusive optionals",
     );
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
+    assert.match(props.sessionPath.description, /loadout/i);
+  });
+
+  it("refuses a message with both name and sessionPath", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.ok(messageTool, "expected subagent_message tool to be registered");
+
+    const result = await messageTool.execute(
+      "call-1",
+      { name: "Scout", sessionPath: "/tmp/x.jsonl", message: "hi" },
+    );
+    assert.match(result.content[0].text, /either `name` or `sessionPath`, not both/);
+    assert.match(result.details?.error, /not both/);
+  });
+
+  it("requires name or sessionPath on a message", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+
+    const result = await messageTool.execute("call-1", { message: "hi" });
+    assert.match(result.content[0].text, /`sessionPath`/);
+  });
+
+  it("refuses a sessionPath that points at no file", async () => {
+    const dir = createTestDir();
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+      const ctx = {
+        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+      } as any;
+
+      const result = await messageTool.execute(
+        "call-1",
+        { sessionPath: join(dir, "nope.jsonl"), message: "hi" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(result.content[0].text, /No session file at/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a path resume without a loadout sidecar and names the missing snapshot", async () => {
+    const dir = createTestDir();
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+      const ctx = {
+        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+      } as any;
+
+      const sessionFile = join(dir, "subagent-ab12cd34.jsonl");
+      writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-1" }) + "\n");
+      const result = await messageTool.execute(
+        "call-1",
+        { sessionPath: sessionFile, message: "hi" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      // Name is derived from the filename when the session is not registered.
+      assert.match(result.content[0].text, /Cannot safely resume "subagent-ab12cd34"/);
+      assert.match(result.content[0].text, /\.loadout\.json.*missing/);
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims the registry name for a path resume of a known session", async () => {
+    const dir = createTestDir();
+    try {
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+      const ctx = {
+        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+      } as any;
+
+      const sessionFile = join(dir, "subagent-ff99.jsonl");
+      writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-9" }) + "\n");
+      registerName(join(dir, "artifacts", "parent-1"), "Scout", {
+        sessionFile,
+        sessionId: "child-9",
+      });
+      const result = await messageTool.execute(
+        "call-1",
+        { sessionPath: sessionFile, message: "hi" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      // Still refused (no sidecar), but under the reclaimed registry name.
+      assert.match(result.content[0].text, /Cannot safely resume "Scout"/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaimNameForSessionPath derives and uniquifies display names", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.clear();
+    const dir = createTestDir();
+    try {
+      const artifactDir = join(dir, "artifacts", "parent-1");
+      const known = join(dir, "subagent-aa11.jsonl");
+      registerName(artifactDir, "Scout", { sessionFile: known, sessionId: "c1" });
+
+      assert.equal(testApi.reclaimNameForSessionPath(artifactDir, known), "Scout");
+
+      const unknown = join(dir, "subagent-bb22.jsonl");
+      assert.equal(testApi.reclaimNameForSessionPath(artifactDir, unknown), "subagent-bb22");
+
+      // A derived name taken by an unrelated entry gets suffixed, never clobbered.
+      registerName(artifactDir, "subagent-bb22", { sessionFile: join(dir, "other.jsonl"), sessionId: null });
+      assert.equal(testApi.reclaimNameForSessionPath(artifactDir, unknown), "subagent-bb22-2");
+    } finally {
+      runningMap.clear();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("registers subagent_interrupt but not subagent_resume", () => {

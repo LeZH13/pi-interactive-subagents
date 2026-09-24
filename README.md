@@ -34,7 +34,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | --- | --- |
 | `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
 | `subagent_interrupt` | Cancel a running Pi-backed sub-agent by exact `id` or `name` — terminates its process and closes its pane |
-| `subagent_message` | Message a sub-agent by name — steers it if running, resumes its session if finished |
+| `subagent_message` | Message a sub-agent by name (or `sessionPath`) — steers it if running, resumes its session if finished |
 | `subagents_list` | List available agent definitions |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
@@ -58,7 +58,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 
 ### Messaging
 
-`subagent_message` is addressed **by name only**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
+`subagent_message` is addressed **by name or by session path**. Names are unique per session and persist after a sub-agent finishes, so the same name works either way:
 
 ```typescript
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
@@ -66,6 +66,14 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 - **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+
+Pass `sessionPath` instead of `name` to resume a recorded session (`.jsonl`) file directly, bypassing the name registry:
+
+```typescript
+subagent_message({ sessionPath: "/path/to/artifacts/<id>/subagents/subagent-ab12cd34.jsonl", message: "Now fix the migration too" });
+```
+
+Provide exactly one of `name` or `sessionPath`. Path resume reaches sessions missing from the current session's registry — e.g. after starting a fresh pi session, or children of a nested sub-agent (registered under their spawner's session id, not yours). The registry name is reclaimed when the file is known to the current session; otherwise a display name is derived from the filename. The `.loadout.json` sandbox snapshot must sit beside the session file or resume is refused, exactly as with name resume — a path never relaxes the sandbox.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 

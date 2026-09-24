@@ -166,7 +166,9 @@ entry, and no completion reminder in the transcript; (b) interrupting an
 already-finished or unknown id/name returns a clear error; (c) unit tests
 cover marker suppression and double-interrupt; (d) README documents the tool.
 
-### Phase 2 — Path-based resume
+### Phase 2 — Path-based resume — ✅ DONE 2026-09-24
+
+Implemented and verified: `npm run typecheck` clean; `npm test` 261/261 pass (51 suites). `subagent_message` accepts an optional `sessionPath` (mutually exclusive with `name`); path-addressed resumes reuse the existing loadout-replay machinery, reclaim the registry name when known else derive a unique one from the filename, and refuse without a sidecar while naming the missing `.loadout.json` path. README documents the parameter.
 
 Goal: resume a recorded session `.jsonl` by path — covers pi restarts and
 sessions not in the current registry. Our name-based `subagent_message`
