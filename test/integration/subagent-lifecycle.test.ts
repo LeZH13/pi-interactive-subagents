@@ -17,8 +17,9 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { getSubagentActivityFile, readSubagentActivityFile } from "../../pi-extension/subagents/activity.ts";
 import {
   getAvailableBackends,
   createTestEnv,
@@ -26,12 +27,13 @@ import {
   createTrackedSurface,
   startPi,
   waitForScreen,
+  waitForSessionEntry,
   waitForFile,
   sleep,
   uniqueId,
   trackTempFile,
-  readScreen,
   PI_TIMEOUT,
+  TEST_MODEL,
   setSurfaceBackendPreference,
   type TestEnv,
 } from "./harness.ts";
@@ -225,14 +227,24 @@ for (const backend of backends) {
         `After the result arrives, say FALLBACK_PARENT_OK.`,
       ].join("\n");
 
-      await startPi(surface, env.dir, task);
-      const screen = await waitForScreen(
-        surface,
-        /retried with[\s\S]*FALLBACK_CHILD_OK|FALLBACK_CHILD_OK[\s\S]*retried with/i,
-        PI_TIMEOUT,
+      const sessionDir = await startPi(surface, env.dir, task);
+      const result = await waitForSessionEntry(
+        sessionDir,
+        (entry) => entry.type === "custom_message" && entry.customType === "subagent_result"
+          && entry.details?.name === `Fallback-${id}`,
       );
-      assert.match(screen, /retried with/i);
-      assert.match(screen, /FALLBACK_CHILD_OK/i);
+      assert.equal(result.details.exitCode, 0);
+      assert.equal(result.details.fallback?.primaryModel, "non-existent-provider/invalid-model-id");
+      assert.equal(result.details.fallback?.fallbackModel, TEST_MODEL);
+      assert.ok(result.details.fallback.failedSessionFile?.endsWith(".jsonl"), "Failed primary run should be identifiable");
+      assert.notEqual(result.details.fallback.failedSessionFile, result.details.sessionFile);
+      assert.ok(existsSync(result.details.sessionFile), "Successful retry session should exist");
+      assert.match(result.content, /FALLBACK_CHILD_OK/);
+      await waitForSessionEntry(
+        sessionDir,
+        (entry) => entry.type === "message" && entry.message?.role === "assistant"
+          && entry.message.content?.some((block: any) => block.type === "text" && block.text === "FALLBACK_PARENT_OK"),
+      );
     });
 
     // ── In-progress activity snapshots ──
@@ -256,28 +268,48 @@ for (const backend of backends) {
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
-      await startPi(surface, env.dir, task);
-
-      const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
-      assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      const sessionDir = await startPi(surface, env.dir, task);
+      const launch = await waitForSessionEntry(
+        sessionDir,
+        (entry) => entry.type === "message" && entry.message?.role === "toolResult"
+          && entry.message.toolName === "subagent" && entry.message.details?.name === `Status-${id}`,
+      );
+      const { id: childId, sessionFile } = launch.message.details;
+      const activityFile = getSubagentActivityFile(dirname(dirname(sessionFile)), childId);
 
       await waitForFile(startFile, PI_TIMEOUT, /START_/);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the long sleep");
+      const active = readSubagentActivityFile(activityFile, childId);
+      assert.ok(active.ok, "Child should publish an activity snapshot during its tool call");
+      assert.equal(active.activity.phase, "active");
+      assert.equal(active.activity.activeScope, "tool");
+      assert.equal(active.activity.toolName, "bash");
+
       await sleep(65_000);
       assert.equal(existsSync(markerFile), false, "Completion marker should not exist before the watchdog assertion");
-      const watchdogScreen = await readScreen(surface, 300);
-      assert.doesNotMatch(watchdogScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
+      const watchdog = readSubagentActivityFile(activityFile, childId);
+      assert.ok(watchdog.ok, "Child activity snapshot should remain readable during the long call");
+      assert.equal(watchdog.activity.phase, "active");
+      assert.equal(watchdog.activity.activeScope, "tool");
+      assert.equal(watchdog.activity.toolName, "bash");
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
       assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
-
-      const completionScreen = await waitForScreen(
-        surface,
-        /STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i,
-        PI_TIMEOUT,
-        300,
+      const result = await waitForSessionEntry(
+        sessionDir,
+        (entry) => entry.type === "custom_message" && entry.customType === "subagent_result"
+          && entry.details?.name === `Status-${id}`,
       );
-      assert.ok(/STATUS_TEST_DONE|completed|Sub-agent.*"Status-/i.test(completionScreen));
+      assert.equal(result.details.exitCode, 0);
+      // Check the full parent session rather than the narrow/collapsed Herdr display.
+      for (const file of readdirSync(sessionDir).filter((name) => name.endsWith(".jsonl"))) {
+        for (const line of readFileSync(join(sessionDir, file), "utf8").trim().split("\n")) {
+          const entry = JSON.parse(line);
+          if (entry.type === "custom_message" && entry.customType === "subagent_status") {
+            assert.doesNotMatch(String(entry.content), /stalled/i, "Long active bash call must not trigger a stalled notice");
+          }
+        }
+      }
     });
 
     // ── Parallel subagent spawn ──

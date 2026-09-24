@@ -247,14 +247,17 @@ export function untrackSurface(env: TestEnv, surface: string): void {
  *
  * The command ends with a sentinel so we can detect when pi exits:
  *   `pi ...; echo '__TEST_DONE_'$?'__'`
+ * Returns a dedicated session directory for checking persisted events without
+ * depending on terminal width or collapsed TUI output.
  */
 export async function startPi(
   surface: string,
   testDir: string,
   task: string,
   opts?: { model?: string; extraArgs?: string; env?: Record<string, string> },
-): Promise<void> {
+): Promise<string> {
   const model = opts?.model ?? TEST_MODEL;
+  const sessionDir = join(testDir, `sessions-${uniqueId()}`);
   const extra = opts?.extraArgs ?? "";
   const envPrefix = opts?.env
     ? Object.entries(opts.env)
@@ -272,6 +275,7 @@ export async function startPi(
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
+    `--session-dir ${shellEscape(sessionDir)}`,
     extra,
     shellEscape(task),
   ]
@@ -281,6 +285,7 @@ export async function startPi(
   await sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
+  return sessionDir;
 }
 
 // ── Polling helpers ──
@@ -311,6 +316,38 @@ export async function waitForScreen(
   throw new Error(
     `Timeout (${timeout}ms) waiting for pattern ${pattern}.\nLast screen:\n${finalScreen.slice(-1000)}`,
   );
+}
+
+/**
+ * Poll the dedicated parent session for an entry. A live JSONL file may have
+ * an incomplete final line, so ignore that line until the next poll.
+ */
+export async function waitForSessionEntry(
+  sessionDir: string,
+  matches: (entry: any) => boolean,
+  timeout: number = PI_TIMEOUT,
+): Promise<any> {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    if (existsSync(sessionDir)) {
+      for (const file of readdirSync(sessionDir).filter((name) => name.endsWith(".jsonl"))) {
+        const text = readFileSync(join(sessionDir, file), "utf8");
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          let entry: any;
+          try {
+            entry = JSON.parse(line);
+          } catch (error) {
+            if (error instanceof SyntaxError) continue;
+            throw error;
+          }
+          if (matches(entry)) return entry;
+        }
+      }
+    }
+    await sleep(200);
+  }
+  throw new Error(`Timeout (${timeout}ms) waiting for a matching session entry in ${sessionDir}`);
 }
 
 /**
