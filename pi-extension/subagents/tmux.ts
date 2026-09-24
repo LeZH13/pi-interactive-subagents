@@ -54,6 +54,11 @@ export function sendCommand(surface: string, command: string): void {
   execFileSync("tmux", ["send-keys", "-t", surface, "Enter"], { stdio: "ignore" });
 }
 export function sendTerminalMessage(surface: string, message: string): void { sendCommand(surface, message); }
+/** Send Escape to cancel the in-flight turn. The caller closes the pane to guarantee termination. */
+export async function sendEscape(surface: string, signal?: AbortSignal): Promise<void> {
+  requireTmux();
+  await execFileAsync("tmux", ["send-keys", "-t", surface, "Escape"], { encoding: "utf8", signal, timeout: 5_000 });
+}
 export function sendLongCommand(surface: string, command: string, options?: { scriptPath?: string; scriptPreamble?: string }): string {
   const scriptPath = options?.scriptPath ?? join(tmpdir(), "pi-subagent-scripts", `cmd-${Date.now()}-${Math.random().toString(16).slice(2, 8)}.sh`);
   mkdirSync(dirname(scriptPath), { recursive: true });

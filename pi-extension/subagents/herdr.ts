@@ -73,6 +73,10 @@ export async function sendHerdrMessage(pane: string, message: string, signal?: A
   await execHerdr(["pane", "send-text", pane, message], "pane send-text", signal);
   await execHerdr(["pane", "send-keys", pane, "enter"], "pane send-keys", signal);
 }
+/** Send the canonical Escape key to cancel the in-flight turn. The caller closes the pane to guarantee termination. */
+export async function interruptHerdrPane(pane: string, signal?: AbortSignal): Promise<void> {
+  await execHerdr(["pane", "send-keys", pane, "esc"], "pane send-keys", signal);
+}
 
 export function getRecentOwnedHerdrPane(): string | undefined {
   const arr = Array.from(ownedPanes);

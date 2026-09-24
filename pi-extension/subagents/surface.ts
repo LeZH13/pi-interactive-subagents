@@ -3,10 +3,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import * as tmux from "./tmux.ts";
-import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, launchBackground, readBackground } from "./background.ts";
-import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
+import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, interruptBackground, launchBackground, readBackground } from "./background.ts";
+import { EXAMPLE_CONFIG_PATH, subagentsUserConfigPath } from "./config.ts";
+import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, interruptHerdrPane, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
 
 export type SurfaceBackendKind = "auto" | "tmux" | "herdr" | "background";
 export interface MultiplexingConfig { enabled: boolean; backend: SurfaceBackendKind; }
@@ -21,9 +21,6 @@ export interface SurfaceBackend {
 }
 export interface SurfaceOptions { id?: string; logPath?: string; sessionFile?: string; }
 
-const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
-const DEFAULT_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
-const EXAMPLE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json.example");
 export function parseMultiplexingConfig(raw: unknown, source = "config.json"): MultiplexingConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`Invalid subagent multiplexing config in ${source}: root must be an object`);
   const multiplexing = (raw as any).multiplexing;
@@ -38,7 +35,7 @@ export function parseMultiplexingConfig(raw: unknown, source = "config.json"): M
   if (!enabled && multiplexing.backend !== undefined && backend !== "background") throw new Error(`Invalid subagent multiplexing config in ${source}: multiplexing.enabled=false conflicts with backend=${backend}`);
   return { enabled, backend };
 }
-export function loadMultiplexingConfig(configPath = DEFAULT_CONFIG_PATH, examplePath = EXAMPLE_CONFIG_PATH): MultiplexingConfig {
+export function loadMultiplexingConfig(configPath = subagentsUserConfigPath(), examplePath = EXAMPLE_CONFIG_PATH): MultiplexingConfig {
   let source = configPath; let raw: string;
   try { raw = readFileSync(configPath, "utf8"); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -136,6 +133,22 @@ export async function readScreenAsync(surface: string, lines = 50, signal?: Abor
   return tmux.readScreenAsync(surface, lines, signal);
 }
 export async function readScreen(surface: string, lines = 50): Promise<string> { return readScreenAsync(surface, lines); }
+/**
+ * Send a backend-specific cancellation signal without closing the surface.
+ * Terminal backends get Escape; headless background processes get SIGINT.
+ * The caller closes the surface afterwards to guarantee termination.
+ */
+export async function interruptSurface(surface: string, signal?: AbortSignal): Promise<void> {
+  if (kind(surface) === "background") {
+    await interruptBackground(surface);
+    return;
+  }
+  if (kind(surface) === "herdr") {
+    await interruptHerdrPane(pane(surface), signal);
+    return;
+  }
+  await tmux.sendEscape(surface, signal);
+}
 export async function closeSurface(surface: string, signal?: AbortSignal): Promise<void> {
   if (kind(surface) === "background") return closeBackground(surface);
   if (kind(surface) === "herdr") return closeHerdrPane(pane(surface), signal);

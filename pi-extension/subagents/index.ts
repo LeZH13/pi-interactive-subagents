@@ -1,8 +1,8 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -20,6 +20,7 @@ import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
+  interruptSurface,
   sendCommand,
   sendLongCommand,
   sendTerminalMessage,
@@ -39,6 +40,7 @@ import {
   getNewEntries,
   getSessionId,
   getSubagentSessionDir,
+  loadoutSidecarPath,
   readNameRegistry,
   readSubagentLoadout,
   registerName,
@@ -180,6 +182,7 @@ interface ListedAgentDefinition extends AgentDefinition {
  */
 const SPAWNING_TOOLS = [
   "subagent",
+  "subagent_interrupt",
   "subagent_message",
   "subagents_list",
 ] as const;
@@ -872,7 +875,7 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
 /**
  * Unified live config state: status widget flag, backend preference, and
  * per-agent model/thinking overrides. `/subagent-settings` mutates it live
- * (persisting each change to config.json); spawn/resume resolution reads it.
+ * (persisting each change to the durable user agent config); spawn/resume resolution reads it.
  * The surface backend preference mirrors into surface.ts so live
  * createSurface() calls follow page changes without a restart.
  */
@@ -947,6 +950,8 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
+  /** True when the parent cancelled the run with `subagent_interrupt`. */
+  interrupted?: boolean;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Whether this run produced any non-whitespace assistant text. */
@@ -963,7 +968,7 @@ interface SubagentResult {
 }
 
 function shouldRetryWithFallback(result: SubagentResult): { retry: boolean; reason?: string } {
-  if (result.error === "cancelled") return { retry: false };
+  if (result.error === "cancelled" || result.interrupted) return { retry: false };
   if (result.errorMessage) return { retry: true, reason: result.errorMessage };
   if (result.exitCode !== 0) return { retry: true, reason: `exit code ${result.exitCode}` };
   if (result.hasAssistantText === false) return { retry: true, reason: "no assistant response text" };
@@ -995,6 +1000,14 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /**
+   * Set when the parent cancels the run with `subagent_interrupt`. The pane is
+   * being torn down: hide the widget entry, ignore status transitions and
+   * pending questions, skip model fallback, and steer a concise interruption
+   * notice instead of the full completion result.
+   */
+  userInterrupted?: boolean;
+  interruptedAt?: number;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1205,7 +1218,8 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, the
 function updateWidget() {
   if (!latestCtx?.hasUI) return;
 
-  if (runningSubagents.size === 0) {
+  const visible = visibleRunningSubagents();
+  if (visible.length === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
     if (widgetInterval) {
       clearInterval(widgetInterval);
@@ -1221,7 +1235,7 @@ function updateWidget() {
       return {
         invalidate() {},
         render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width, theme);
+          return renderSubagentWidgetLines(visibleRunningSubagents(), width, theme);
         },
       };
     },
@@ -1329,6 +1343,49 @@ function applySandboxToParts(
       parts.push("-e", shellEscape(extPath));
     }
   }
+}
+
+/**
+ * Build the `pi --session` command for resuming a recorded session: the
+ * session file, the always-loaded subagent-done extension, the model /
+ * identity / default-deny sandbox replayed from the spawn-time loadout
+ * snapshot, and the follow-up prompt as an @file. Split out of the resume
+ * tool handler so tests can pin the replay wiring without spawning a real
+ * surface.
+ */
+function buildResumeCommandParts(
+  sessionPath: string,
+  loadout: SubagentLoadout,
+  opts: { artifactDir: string; name: string; message?: string },
+): { parts: string[]; resumeMsgFile?: string } {
+  const parts = ["pi", "--session", shellEscape(sessionPath)];
+
+  // Load subagent-done extension so the agent can self-terminate if needed
+  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+  parts.push("-e", shellEscape(subagentDonePath));
+
+  // Replay the model, identity, and default-deny tool/extension sandbox.
+  applySandboxToParts(parts, loadout, { artifactDir: opts.artifactDir, name: opts.name });
+
+  let resumeMsgFile: string | undefined;
+  if (opts.message) {
+    const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    resumeMsgFile = join(
+      opts.artifactDir,
+      "subagent-resume",
+      `${opts.name
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .replace(/\s+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+    );
+    mkdirSync(dirname(resumeMsgFile), { recursive: true });
+    writeFileSync(resumeMsgFile, opts.message, "utf8");
+    parts.push(shellEscape(`@${resumeMsgFile}`));
+  }
+
+  return { parts, resumeMsgFile };
 }
 
 function buildPiPromptArgs(params: {
@@ -1441,6 +1498,28 @@ function uniqueRunningName(base: string, registryNames?: Set<string>): string {
   return `${base}-${n}`;
 }
 
+/**
+ * Resolve the display name for a path-addressed resume (`sessionPath`).
+ * Reclaims the registry name when this session file is already known to the
+ * current spawner session; otherwise derives a name from the filename and
+ * uniquifies it against running agents and the registry, so the resumed run
+ * still registers without clobbering an unrelated entry.
+ */
+function reclaimNameForSessionPath(artifactDir: string, sessionFile: string): string {
+  const registry = readNameRegistry(artifactDir);
+  for (const [registeredName, entry] of Object.entries(registry)) {
+    if (
+      entry &&
+      typeof entry.sessionFile === "string" &&
+      resolve(entry.sessionFile) === sessionFile
+    ) {
+      return registeredName;
+    }
+  }
+  const base = basename(sessionFile, ".jsonl").trim() || "resume";
+  return uniqueRunningName(base, new Set(Object.keys(registry)));
+}
+
 function resolveRunningByName(name: string):
   | { running: RunningSubagent }
   | { error: string } {
@@ -1463,6 +1542,84 @@ function resolveRunningByName(name: string):
   return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
 }
 
+/** Running subagents that should still appear in the widget. Interrupted runs stay in the map until their watcher observes the torn-down surface and removes them. */
+function visibleRunningSubagents(): RunningSubagent[] {
+  return Array.from(runningSubagents.values()).filter((running) => !running.userInterrupted);
+}
+
+function runningTargetHint(): string {
+  const targets = [
+    ...new Map(
+      Array.from(runningSubagents.values()).map((running) => [running.id, `${running.name} [${running.id}]`] as const),
+    ).values(),
+  ];
+  return targets.length
+    ? ` Currently running: ${targets.join(", ")}.`
+    : " No subagents are currently running.";
+}
+
+function resolveRunningForInterrupt(params: { id?: unknown; name?: unknown }):
+  | { running: RunningSubagent }
+  | { error: string } {
+  const id = typeof params.id === "string" ? params.id.trim() : "";
+  const name = typeof params.name === "string" ? params.name.trim() : "";
+  if (!id && !name) {
+    return { error: "Provide the running subagent's `id` or `name`." };
+  }
+
+  let running: RunningSubagent | undefined;
+  if (id) {
+    running = runningSubagents.get(id);
+    if (!running) return { error: `No running subagent with id "${id}".${runningTargetHint()}` };
+  }
+  if (name) {
+    const resolved = resolveRunningByName(name);
+    if ("error" in resolved) return { error: resolved.error };
+    if (running && resolved.running !== running) {
+      return { error: `Subagent id "${id}" does not match subagent name "${name}".` };
+    }
+    running = resolved.running;
+  }
+  return { running: running as RunningSubagent };
+}
+
+function formatInterruptedNotice(name: string, elapsed: number): string {
+  return `Sub-agent "${name}" was interrupted by the user after ${formatElapsed(elapsed)}. It did not produce a result.`;
+}
+
+/**
+ * Deliver the concise interruption notice for a cancelled run. Returns true
+ * when the caller should skip the normal completion path (full result,
+ * fallback retry, and pending questions) entirely.
+ */
+function finalizeInterruptedRun(
+  pi: ExtensionAPI,
+  running: RunningSubagent,
+  result: Pick<SubagentResult, "elapsed" | "exitCode" | "interrupted"> & { sessionId?: string },
+): boolean {
+  if (!running.userInterrupted && !result.interrupted) return false;
+  updateWidget();
+  pi.sendMessage(
+    {
+      customType: "subagent_result",
+      content: formatInterruptedNotice(running.name, result.elapsed),
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        sessionFile: running.sessionFile,
+        ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+        interrupted: true,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+  return true;
+}
+
 /**
  * Type a follow-up message into a running subagent's live surface. Newlines are
  * collapsed to spaces because each newline submits a turn in the child's TUI
@@ -1482,7 +1639,7 @@ async function steerSubagent(
   running: RunningSubagent,
   message: string,
   send?: (surface: string, command: string, options?: { sessionFile?: string }) => void,
-): { ok: true } | { error: string } {
+): Promise<{ ok: true } | { error: string }> {
   const flattened = message.replace(/\s*\n\s*/g, " ").trim();
   try {
     // Pi consumes orchestration input through a sidecar queue. Sending the
@@ -1519,6 +1676,13 @@ async function handleSubagentSteer(
   }
 
   const running = resolved.running;
+  if (running.userInterrupted) {
+    const err = `Subagent "${running.name}" was interrupted and is shutting down; it cannot receive new messages.`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name },
+    };
+  }
   const now = Date.now();
   observeRunningSubagent(running, now);
 
@@ -1544,24 +1708,93 @@ async function handleSubagentSteer(
   };
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+/**
+ * Cancel a running Pi-backed subagent. The run is marked user-interrupted
+ * before touching the surface so the watcher suppresses the normal completion
+ * result, fallback retry, status transitions, and pending questions. Escape
+ * (or SIGINT headless) cancels the in-flight turn; closing the surface
+ * guarantees the child process is gone. If teardown fails, the marker is
+ * reverted so a still-live run keeps its normal completion path.
+ */
+async function handleSubagentInterrupt(
+  params: { id?: unknown; name?: unknown },
+  interrupt: (surface: string) => Promise<void> = interruptSurface,
+  close: (surface: string) => Promise<void> = closeSurface,
+) {
+  const resolved = resolveRunningForInterrupt(params);
+  if ("error" in resolved) {
+    return {
+      content: [{ type: "text" as const, text: resolved.error }],
+      details: { error: resolved.error },
+    };
+  }
 
-  statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
-      if (statusInterval) {
-        clearInterval(statusInterval);
-        statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-      }
-      return;
-    }
+  const running = resolved.running;
+  if (running.cli === "claude") {
+    const err = `Subagent "${running.name}" runs via the Claude Code CLI and cannot be interrupted from here. Close its pane manually.`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name },
+    };
+  }
+  if (running.userInterrupted) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `Interrupt already requested for subagent "${running.name}". Its pane is shutting down; the watcher will confirm removal.`,
+      }],
+      details: { id: running.id, name: running.name, status: "interrupt_already_requested" },
+    };
+  }
 
+  const now = Date.now();
+  const wasInterrupted = running.userInterrupted ?? false;
+  const wasInterruptedAt = running.interruptedAt;
+  const previousStatusState = running.statusState;
+  running.userInterrupted = true;
+  running.interruptedAt = now;
+  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  updateWidget();
+
+  try {
+    await interrupt(running.surface);
+    await close(running.surface);
+  } catch (error: any) {
+    running.userInterrupted = wasInterrupted;
+    running.interruptedAt = wasInterruptedAt;
+    running.statusState = previousStatusState;
+    updateWidget();
+    const message = error?.message ?? String(error);
+    const err = `Failed to interrupt subagent "${running.name}": ${message}`;
+    return {
+      content: [{ type: "text" as const, text: err }],
+      details: { error: err, id: running.id, name: running.name, status: "interrupt_failed" },
+    };
+  }
+
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Interrupt requested for subagent "${running.name}". Its turn was cancelled and its pane closed. ` +
+        `The watcher will confirm removal and steer a concise interruption notice; no result will follow.`,
+    }],
+    details: { id: running.id, name: running.name, status: "interrupt_requested" },
+  };
+}
+
+/**
+ * One status-supervision pass over the running set: refresh snapshots, advance
+ * status kinds, and steer stalled/recovered transitions for non-interactive
+ * runs. Split out of the refresh interval so tests can drive it with a fixed
+ * clock instead of real timers.
+ */
+function runStatusSupervisionTick(pi: ExtensionAPI, now: number): void {
     const transitionLines: string[] = [];
-    const now = Date.now();
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
+      if (running.userInterrupted) continue;
       observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
@@ -1592,6 +1825,22 @@ function startStatusRefresh(pi: ExtensionAPI) {
         { triggerTurn: true, deliverAs: "steer" },
       );
     }
+}
+
+function startStatusRefresh(pi: ExtensionAPI) {
+  if (!statusConfig.enabled || statusInterval) return;
+
+  statusInterval = setInterval(() => {
+    if (runningSubagents.size === 0) {
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      }
+      return;
+    }
+
+    runStatusSupervisionTick(pi, Date.now());
   }, 1000);
 
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
@@ -1635,12 +1884,20 @@ export const __test__ = {
   getToolExtensionPath,
   resolveRunningByName,
   uniqueRunningName,
+  reclaimNameForSessionPath,
   reservedNames,
   enqueueSteerMessage,
   steerSubagent,
   handleSubagentSteer,
+  handleSubagentInterrupt,
+  resolveRunningForInterrupt,
+  formatInterruptedNotice,
+  finalizeInterruptedRun,
+  visibleRunningSubagents,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  buildResumeCommandParts,
+  runStatusSupervisionTick,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1681,6 +1938,8 @@ async function launchSubagent(
   const runId = `${id}-${Math.random().toString(16).slice(2, 10)}`;
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  // Display name is optional in the tool params; default to the agent's own name.
+  const displayName = params.name ?? params.agent ?? "subagent";
   const { model: effectiveModel, thinking: effectiveThinking } =
     resolveEffectiveModelAndThinking(params, agentDefs);
   const effectiveTools = agentDefs?.tools;
@@ -1721,7 +1980,7 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent";
   const logFile = join(artifactDir, "subagent-logs", `${safeLogName}-${id}.log`);
-  const surface = options?.surface ?? await createSurface(params.name, {
+  const surface = options?.surface ?? await createSurface(displayName, {
     id,
     logPath: logFile,
     sessionFile: subagentSessionFile,
@@ -1810,7 +2069,7 @@ async function launchSubagent(
     const running: RunningSubagent = {
       id,
       runId,
-      name: params.name,
+      name: displayName,
       task: params.task,
       agent: params.agent,
       surface,
@@ -1873,7 +2132,7 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, { artifactDir, name: displayName });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -1885,7 +2144,7 @@ async function launchSubagent(
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
+  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
@@ -1909,7 +2168,7 @@ async function launchSubagent(
     taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
+    const safeName = displayName
       .toLowerCase()
       .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
       .replace(/\s+/g, "-") // spaces to hyphens
@@ -1957,7 +2216,7 @@ async function launchSubagent(
   const running: RunningSubagent = {
     id,
     runId,
-    name: params.name,
+    name: displayName,
     task: params.task,
     agent: params.agent,
     surface,
@@ -2071,7 +2330,7 @@ async function watchSubagent(
       completionFile: `${sessionFile}.complete`,
       onTick() {
         observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        if (!running.userInterrupted) deliverPendingQuestion(running);
       },
     });
 
@@ -2088,7 +2347,7 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = await readScreen(surface, 200)
+        summary = (await readScreen(surface, 200))
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
@@ -2117,6 +2376,7 @@ async function watchSubagent(
         exitCode: result.exitCode,
         elapsed,
         hasAssistantText: summary.trim().length > 0,
+        interrupted: running.userInterrupted === true,
         ...(sessionId ? { claudeSessionId: sessionId } : {}),
       };
     }
@@ -2165,6 +2425,7 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       hasAssistantText,
+      interrupted: running.userInterrupted === true,
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
@@ -2181,6 +2442,7 @@ async function watchSubagent(
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
+        interrupted: running.userInterrupted === true,
         sessionFile,
       };
     }
@@ -2191,6 +2453,7 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      interrupted: running.userInterrupted === true,
     };
   }
 }
@@ -2399,6 +2662,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then(async (primaryResult) => {
             let finalRunning = running;
             let result = primaryResult;
+            // A parent-cancelled run never retries or reports a normal result.
+            if (finalizeInterruptedRun(pi, running, primaryResult)) return;
             const retryDecision = shouldRetryWithFallback(primaryResult);
             const fallbackDiffers = !!fallbackSelection && (
               fallbackSelection.model !== primarySelection.model ||
@@ -2567,7 +2832,74 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+    });
+
+  // ── subagent_interrupt tool ──
+  pi.registerTool({
+      name: "subagent_interrupt",
+      label: "Interrupt Subagent",
+      description:
+        "Cancel a running Pi-backed subagent by exact `id` or `name`. " +
+        "This cancels its in-flight turn, terminates its child process, and closes its pane. " +
+        "The watcher then steers a concise interruption notice instead of a result. " +
+        "Use for a runaway or obsolete subagent. Claude Code CLI children cannot be interrupted.",
+      promptSnippet:
+        "Cancel a running Pi-backed subagent by exact id or name. Terminates the child process and closes its pane; " +
+        "the watcher steers a concise interruption notice instead of a result.",
+      parameters: Type.Object({
+        id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
+        name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
+      }),
+
+      async execute(_toolCallId, params): Promise<any> {
+        return handleSubagentInterrupt(params);
+      },
+
+      renderCall(args, theme) {
+        const partialArgs = args as { id?: unknown; name?: unknown };
+        const target =
+          typeof partialArgs.id === "string" && partialArgs.id
+            ? partialArgs.id
+            : typeof partialArgs.name === "string" && partialArgs.name
+              ? partialArgs.name
+              : "(unknown)";
+        return new Text(
+          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — interrupt"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+        const name = details?.name ?? details?.id ?? "subagent";
+        if (details?.status === "interrupt_requested") {
+          return new Text(
+            theme.fg("warning", "!") +
+              " " +
+              theme.fg("toolTitle", theme.bold(name)) +
+              theme.fg("dim", " — interrupt requested"),
+            0,
+            0,
+          );
+        }
+        if (details?.status === "interrupt_already_requested") {
+          return new Text(
+            theme.fg("warning", "!") +
+              " " +
+              theme.fg("toolTitle", theme.bold(name)) +
+              theme.fg("dim", " — interrupt already requested"),
+            0,
+            0,
+          );
+        }
+
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -2634,23 +2966,32 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent_message",
       label: "Message Subagent",
       description:
-        "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
+        "Send a message to a subagent by name, or resume a recorded session file by path. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
-        "`name` and `message` are both required. " +
+        "Pass `sessionPath` instead of `name` to resume a recorded subagent session (.jsonl) file directly — this reaches sessions missing from this session's name registry, e.g. after a pi restart or for nested subagents. The session file must have a `.loadout.json` sandbox snapshot beside it, otherwise resume is refused. " +
+        "`message` is always required; provide exactly one of `name` or `sessionPath`. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
-        "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
-        "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
+        "Message a subagent by name (steers it if running, resumes it if finished), or resume a recorded session file via `sessionPath` when the name is not in this session's registry. " +
+        "`message` is required; provide exactly one of `name` or `sessionPath`. Steering returns immediately; resuming delivers its result later as a steer message. " +
         "Do not poll or fabricate results.",
       parameters: Type.Object({
-        name: Type.String({
-          description:
-            "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished.",
-        }),
+        name: Type.Optional(
+          Type.String({
+            description:
+              "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished. Mutually exclusive with `sessionPath`.",
+          }),
+        ),
+        sessionPath: Type.Optional(
+          Type.String({
+            description:
+              "Path to a recorded subagent session (.jsonl) file to resume directly, bypassing the name registry. Use when the subagent's name is not known in this session (e.g. after a pi restart). Mutually exclusive with `name`. Requires a `.loadout.json` sandbox snapshot beside the session file.",
+          }),
+        ),
         message: Type.String({
           description:
             "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
@@ -2658,7 +2999,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }),
 
       renderCall(args, theme) {
-        const target = args.name ?? "(unknown)";
+        const target = args.name ?? (args.sessionPath ? basename(args.sessionPath) : "(unknown)");
         return new Text(
           "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — message"),
           0,
@@ -2692,14 +3033,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const first = result.content[0];
+        const text = first && "text" in first && typeof first.text === "string" ? first.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const requestedName = params.name?.trim();
-        if (!requestedName) {
-          const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
+        const requestedName = params.name?.trim() || undefined;
+        const requestedSessionPath = params.sessionPath?.trim() || undefined;
+        if (requestedName && requestedSessionPath) {
+          const err =
+            "Provide either `name` or `sessionPath`, not both. `name` addresses a subagent in this session's registry; " +
+            "`sessionPath` resumes a recorded session (.jsonl) file directly.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        if (!requestedName && !requestedSessionPath) {
+          const err =
+            "Provide the subagent's `name` to steer (if running) or resume (if finished), " +
+            "or `sessionPath` to resume a recorded session file directly.";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -2709,48 +3060,76 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // ── Steer a running subagent ──
         // A name that matches a currently-running subagent always steers it.
-        const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
-        if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message });
+        // Path-addressed messages skip this: the still-running guard below
+        // redirects them to a steer by the running entry's own name.
+        if (requestedName) {
+          const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+          if (runningMatch) {
+            return handleSubagentSteer({ name: requestedName, message: params.message });
+          }
         }
 
-        // ── Resume a finished session by name ──
+        // ── Resume a finished session by name or by session file path ──
         const message = params.message;
-        const name = requestedName; // identity preservation: the resumed run reclaims its name
         const { autoExit, interactive } = resolveResumeLaunchBehavior();
         const startTime = Date.now();
         const id = Math.random().toString(16).slice(2, 10);
         const runId = `${id}-${Math.random().toString(16).slice(2, 10)}`;
 
-        // Resolve the name to its session file via this session's registry.
         const parentArtifactDir = getArtifactDir(
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
         );
-        const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
-        if (!entry) {
-          const known = Object.keys(readNameRegistry(parentArtifactDir));
-          const err =
-            `No subagent named "${requestedName}" in this session. ` +
-            (known.length > 0
-              ? `Known subagents: ${known.join(", ")}.`
-              : "No subagents have been spawned in this session yet.");
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
-        }
 
-        const sessionPath = entry.sessionFile;
-        if (!sessionPath || !existsSync(sessionPath)) {
-          const err =
-            `Subagent "${requestedName}" is registered but its session file is gone ` +
-            `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        let sessionPath: string;
+        let name: string;
+        let resumedSessionId: string;
+        if (requestedName) {
+          // Resolve the name to its session file via this session's registry.
+          const entry = resolveNameInRegistry(parentArtifactDir, requestedName);
+          if (!entry) {
+            const known = Object.keys(readNameRegistry(parentArtifactDir));
+            const err =
+              `No subagent named "${requestedName}" in this session. ` +
+              (known.length > 0
+                ? `Known subagents: ${known.join(", ")}.`
+                : "No subagents have been spawned in this session yet.");
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+
+          const registeredPath = entry.sessionFile;
+          if (!registeredPath || !existsSync(registeredPath)) {
+            const err =
+              `Subagent "${requestedName}" is registered but its session file is gone ` +
+              `(${registeredPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+
+          sessionPath = registeredPath;
+          name = requestedName; // identity preservation: the resumed run reclaims its name
+          resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
+        } else {
+          // Resolve a recorded session file directly, bypassing the registry.
+          // This reaches sessions missing from this session's registry — e.g.
+          // after a pi restart, or children of a nested subagent.
+          // Validated above: exactly one of name/sessionPath is set.
+          sessionPath = resolve(requestedSessionPath as string);
+          if (!existsSync(sessionPath)) {
+            const err =
+              `No session file at "${requestedSessionPath}". Pass the path to a recorded subagent session (.jsonl) file — ` +
+              `the path is reported in the subagent's completion notice.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
+
+          name = reclaimNameForSessionPath(parentArtifactDir, sessionPath);
+          resumedSessionId = getSessionId(sessionPath) ?? name;
         }
 
         // Guard: never resume a session that is still running — two processes
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
-            const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
+            const err = `Subagent "${name}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
             return handleSubagentSteer({ name: r.name, message: params.message });
           }
         }
@@ -2761,18 +3140,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const loadout = readSubagentLoadout(sessionPath);
         if (!loadout) {
           const err =
-            `Cannot safely resume "${requestedName}": no sandbox snapshot found for this session ` +
-            `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
+            `Cannot safely resume "${name}": no sandbox snapshot found for this session ` +
+            `(${loadoutSidecarPath(sessionPath)} is missing — it predates sandboxed resume, or its sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
-        const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
-
         // Record entry count before resuming so we can extract new messages.
-        // Count lines cheaply (no per-line JSON.parse) so resuming a large
-        // transcript doesn't block the UI.
         const entryCountBefore = countSessionEntryLines(sessionPath);
 
         const resumeLogName = name
@@ -2791,38 +3166,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
         }
 
-        // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
-
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
-        }
+        // Build pi resume command, replaying the spawn-time sandbox snapshot.
+        const { parts, resumeMsgFile } = buildResumeCommandParts(sessionPath, loadout, {
+          artifactDir,
+          name,
+          message,
+        });
 
         // Build env prefix — replay the snapshot's config dir + spawn whitelist
         // so the resumed process resolves the same agents/extensions and keeps
@@ -2906,6 +3260,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            if (finalizeInterruptedRun(pi, running, { ...result, sessionId: resumedSessionId })) return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
@@ -3015,7 +3370,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // `/subagent-settings` — backend, status widget, per-agent model/thinking
   // defaults, and orphan cleanup. Replaces `/subagent-mux` and
   // `/subagent-sessions` (both removed, no shims). The page is also the
-  // model picker: per-agent overrides persist to config.json and outrank
+  // model picker: per-agent overrides persist to the user agent config and outrank
   // markdown defaults, while explicit spawn args still win per-spawn.
   registerSubagentSettingsCommand(pi, {
     discoverAgents: () => discoverAgentDefinitions().map((a) => ({
@@ -3186,6 +3541,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -3215,6 +3571,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
@@ -3251,8 +3608,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         box.addChild(new Text(contentLines.join("\n"), 0, 0));
         return ["", ...box.render(width)];
       },
+      invalidate() {},
     };
   });
 
 }
-// test

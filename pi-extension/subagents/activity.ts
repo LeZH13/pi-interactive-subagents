@@ -273,6 +273,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolResult() {},
     toolExecutionEnd() {},
     askQuestion() {},
+    syncTelemetry() {},
     sessionShutdown() {},
   };
 }
@@ -472,7 +473,7 @@ export function createSubagentActivityRecorder(params: {
   }
 
   function flushNow(): void {
-    if (disabled) return;
+    if (disabled || !activityFile) return;
     try {
       writeSubagentActivityFile(activityFile, activity);
       lastFlushAt = now();
