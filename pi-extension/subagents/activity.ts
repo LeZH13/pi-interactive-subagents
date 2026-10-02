@@ -10,6 +10,7 @@ export type SubagentActivityEvent =
   | "before_agent_start"
   | "agent_start"
   | "agent_end"
+  | "agent_settled"
   | "turn_start"
   | "turn_end"
   | "before_provider_request"
@@ -69,8 +70,9 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(telemetry?: SubagentTelemetry): void;
   agentStart(telemetry?: SubagentTelemetry): void;
-  agentEndWaiting(telemetry?: SubagentTelemetry): void;
-  agentEndDone(telemetry?: SubagentTelemetry): void;
+  agentEnd(telemetry?: SubagentTelemetry): void;
+  agentSettledWaiting(telemetry?: SubagentTelemetry): void;
+  agentSettledDone(telemetry?: SubagentTelemetry): void;
   turnStart(turnIndex?: number, telemetry?: SubagentTelemetry): void;
   turnEnd(turnIndex?: number, telemetry?: SubagentTelemetry): void;
   beforeProviderRequest(telemetry?: SubagentTelemetry): void;
@@ -96,6 +98,7 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "before_agent_start",
   "agent_start",
   "agent_end",
+  "agent_settled",
   "turn_start",
   "turn_end",
   "before_provider_request",
@@ -260,8 +263,9 @@ function createNoopRecorder(): SubagentActivityRecorder {
     input() {},
     beforeAgentStart() {},
     agentStart() {},
-    agentEndWaiting() {},
-    agentEndDone() {},
+    agentEnd() {},
+    agentSettledWaiting() {},
+    agentSettledDone() {},
     turnStart() {},
     turnEnd() {},
     beforeProviderRequest() {},
@@ -553,16 +557,24 @@ export function createSubagentActivityRecorder(params: {
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEndWaiting(telemetry) {
+    agentEnd(telemetry) {
       record("agent_end", (current, observedAt) => {
+        finishTelemetryTurn(current, telemetry);
+        clearActiveState(current);
+        current.agentActive = true;
+        markActive(current, "agent", observedAt);
+      }, "immediate");
+    },
+    agentSettledWaiting(telemetry) {
+      record("agent_settled", (current, observedAt) => {
         finishTelemetryTurn(current, telemetry);
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
       }, "immediate");
     },
-    agentEndDone(telemetry) {
-      record("agent_end", (current) => {
+    agentSettledDone(telemetry) {
+      record("agent_settled", (current) => {
         finishTelemetryTurn(current, telemetry);
         current.phase = "done";
         clearActiveState(current);

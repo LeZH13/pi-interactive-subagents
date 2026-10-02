@@ -168,6 +168,8 @@ export interface TestEnv {
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
+  /** Keep files (but still close surfaces) when a test fails. */
+  preserveArtifacts?: boolean;
 }
 
 /**
@@ -197,11 +199,19 @@ export function createTestEnv(): TestEnv {
  * Clean up all resources created during the test.
  */
 export async function cleanupTestEnv(env: TestEnv): Promise<void> {
+  if (env.preserveArtifacts) {
+    try {
+      await captureFailureDiagnostics(env);
+    } catch (error) {
+      console.error(`[integration failure] diagnostics failed; files retained at ${env.dir}: ${String(error)}`);
+    }
+  }
   for (const surface of env.surfaces) {
     try {
       await closeSurface(surface);
     } catch {}
   }
+  if (env.preserveArtifacts) return;
   for (const file of env.tempFiles) {
     try {
       unlinkSync(file);
@@ -210,6 +220,44 @@ export async function cleanupTestEnv(env: TestEnv): Promise<void> {
   try {
     rmSync(env.dir, { recursive: true, force: true });
   } catch {}
+}
+
+/** Preserve test artifacts and capture only harness-tracked surfaces before teardown. */
+async function captureFailureDiagnostics(env: TestEnv): Promise<void> {
+  const files: string[] = [];
+  const visit = (dir: string) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) files.push(path);
+    }
+  };
+  visit(env.dir);
+
+  // Files cannot establish surface ownership. Untracked child panes remain
+  // managed by the extension (existing behavior), not captured/closed here;
+  // their session, log, and launch files are retained for investigation.
+
+  const diagnosticsDir = join(env.dir, "failure-diagnostics");
+  mkdirSync(diagnosticsDir, { recursive: true });
+  console.error(`[integration failure] preserved environment: ${env.dir}`);
+  for (const [index, surface] of env.surfaces.entries()) {
+    const screenFile = join(diagnosticsDir, `surface-${index}.txt`);
+    let screen: string;
+    try {
+      screen = await readScreenAsync(surface, 500);
+    } catch (error) {
+      screen = `Screen unavailable: ${String(error)}`;
+    }
+    writeFileSync(screenFile, `Surface: ${surface}\n${screen}\n`);
+    console.error(`[integration failure] ${surface} screen: ${screenFile}`);
+  }
+  const artifacts = files.filter((path) => /\.(jsonl|log|sh)$/.test(path));
+  writeFileSync(join(diagnosticsDir, "paths.txt"), [...artifacts, ...env.tempFiles].join("\n") + "\n");
+  for (const path of artifacts) console.error(`[integration failure] artifact: ${path}`);
+  for (const path of env.tempFiles) {
+    console.error(`[integration failure] marker (${existsSync(path) ? "exists" : "missing"}): ${path}`);
+  }
 }
 
 /**

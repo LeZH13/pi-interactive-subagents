@@ -4,13 +4,13 @@
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
- * automatically when their agent loop ends (see the `agent_end` handler);
+ * automatically when their run fully settles (see the `agent_settled` handler);
  * interactive agents end when the human exits the pane.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
- * signal the parent's watcher picks up, parks the session in a "waiting" state
- * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
- * replies with subagent_message — which lands as the subagent's next turn.
+ * signal the parent's watcher picks up and awaits the answer inside the tool.
+ * The parent's next current-run steer (or human input) resolves the tool with
+ * the answer, without queueing a duplicate message or starting another turn.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
@@ -131,7 +131,7 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  * symbol. A subagent that spawns children and then writes a "waiting for
  * results" message would otherwise auto-exit the instant that turn ends —
  * killing the session before its children report back. Reading this count lets
- * `agent_end` keep the session open until every child has finished and its
+ * `agent_settled` keep the session open until every child has finished and its
  * result has been delivered.
  *
  * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
@@ -148,7 +148,7 @@ export function runningChildrenCount(): number {
   }
 }
 
-export function shouldAutoExitOnAgentEnd(
+export function shouldAutoExitOnAgentSettled(
   _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
@@ -184,7 +184,7 @@ export interface SubagentErrorInfo {
  * failure instead of silently treating the run as completed.
  *
  * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * aborted by the user (handled separately by shouldAutoExitOnAgentSettled).
  */
 export function findLatestAssistantError(
   messages: any[] | undefined,
@@ -278,10 +278,25 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let runOpen = false;
+  let runCancelled = false;
+  let runAssistantMessage: unknown;
   let steerInterval: ReturnType<typeof setInterval> | null = null;
 
+  let pendingQuestion: {
+    answer(message: string): void;
+    cancel(message: string): void;
+  } | undefined;
+  let shuttingDown = false;
+
+  function answerPendingQuestion(message: string): boolean {
+    if (!pendingQuestion || !message) return false;
+    pendingQuestion.answer(message);
+    return true;
+  }
+
   function deliverSteer(message: string): void {
-    if (!message) return;
+    if (!message || answerPendingQuestion(message)) return;
     pi.sendMessage(
       { customType: "subagent_steer", content: message, display: true },
       { triggerTurn: true, deliverAs: "steer" },
@@ -291,16 +306,6 @@ export default function (pi: ExtensionAPI) {
   function checkPendingSteerMessage(): void {
     const sessionFile = process.env.PI_SUBAGENT_SESSION;
     if (!sessionFile) return;
-
-    // Backwards compatibility with writers from older parent processes.
-    const steerFile = `${sessionFile}.steer`;
-    if (existsSync(steerFile)) {
-      try {
-        const message = readFileSync(steerFile, "utf8").trim();
-        unlinkSync(steerFile);
-        deliverSteer(message);
-      } catch {}
-    }
 
     // New writers publish one atomic file per message so rapid steers cannot
     // overwrite each other. Sorted names preserve enqueue order.
@@ -324,14 +329,9 @@ export default function (pi: ExtensionAPI) {
     try { if (existsSync(queueDir) && readdirSync(queueDir).length === 0) rmSync(queueDir, { recursive: true }); } catch {}
   }
 
-  // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
-  let awaitingAnswer = false;
-
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    shuttingDown = false;
     recorder.sessionStart(telemetryFromContext(ctx));
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -347,40 +347,54 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("input", () => {
+  pi.on("input", (event) => {
     recorder.input();
-    // A submitted message is the orchestrator's (or a human's) reply — the
-    // pending ask_question has been answered, however it was delivered. Clear
-    // here, not only on agent_start, because a reply steered in *mid-run* is
-    // absorbed into the current run (pi's `steer` behavior injects it before
-    // the next LLM call): no new agent_start fires, so without this the flag
-    // would stay set and agent_end would park the session as `waiting` even
-    // though the answer already arrived and was consumed. (The `input` event
-    // fires for mid-run steers because prompt() emits it before queueing.)
-    awaitingAnswer = false;
-    // Ignore the initial task message that starts an autonomous subagent.
-    // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
+    // sendMessage custom steers do not emit input; the queue handles those.
+    // Human input can also answer, but must not become a second queued prompt.
+    const answered = answerPendingQuestion(event.text.trim());
+    if (shouldMarkUserTookOver(agentStarted)) userTookOver = true;
+    if (answered) return { action: "handled" };
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
+    runCancelled = false;
+    runAssistantMessage = undefined;
     recorder.beforeAgentStart(telemetryFromContext(ctx));
   });
 
   pi.on("agent_start", (_event, ctx) => {
     agentStarted = true;
-    // A new turn is starting — any pending ask_question has now been answered
-    // (or superseded), so let auto-exit resume normally when this turn ends.
-    awaitingAnswer = false;
+    // Retry/compaction/queued continuations start more loops in the same run.
+    // Only a fresh run resets message freshness. A question is cleared only
+    // by its actual reply or cancellation, never by an assumed input event.
+    // This also covers sendMessage-triggered runs without before_agent_start.
+    if (!runOpen) {
+      runCancelled = false;
+      runAssistantMessage = undefined;
+      runOpen = true;
+    }
     recorder.agentStart(telemetryFromContext(ctx));
   });
 
+  pi.on("message_end", (event) => {
+    if (event.message.role === "assistant") runAssistantMessage = event.message;
+  });
+
   pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const telemetry = lifecycleTelemetry(latestAssistantMessage(messages), ctx);
+    // A loop ending is not final: Pi may retry, compact, drain queues, or
+    // continue from agent_before_settle. Keep recording until settlement.
+    recorder.agentEnd(lifecycleTelemetry(latestAssistantMessage(event.messages), ctx));
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    // The event has no messages. Use only messages finalized in this run,
+    // never an older assistant from a resumed session's branch.
+    const messages = runAssistantMessage ? [runAssistantMessage] : [];
+    const telemetry = lifecycleTelemetry(runAssistantMessage, ctx);
+    runOpen = false;
+    runAssistantMessage = undefined;
     // Never shut down while this session still has work in flight:
-    //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
+    //  - pendingQuestion: an ask_question is pending the orchestrator's reply.
     //  - runningChildrenCount(): this subagent spawned its own children and is
     //    waiting for their results (delivered as steered turns). Exiting now
     //    would strand those children and drop their results.
@@ -388,10 +402,11 @@ export default function (pi: ExtensionAPI) {
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
     const shouldExit =
-      !awaitingAnswer &&
+      !pendingQuestion &&
+      !runCancelled &&
       !hasPendingChildren &&
       autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      shouldAutoExitOnAgentSettled(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -419,12 +434,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      recorder.agentEndDone(telemetry);
+      recorder.agentSettledDone(telemetry);
       ctx.shutdown();
       return;
     }
 
-    recorder.agentEndWaiting(telemetry);
+    recorder.agentSettledWaiting(telemetry);
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
@@ -486,6 +501,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", (event) => {
+    shuttingDown = true;
+    pendingQuestion?.cancel("ask_question cancelled: session shutdown.");
     if (steerInterval) {
       clearInterval(steerInterval);
       steerInterval = null;
@@ -511,7 +528,7 @@ export default function (pi: ExtensionAPI) {
       "Ask the orchestrator (the parent agent that spawned you) a single question and pause until they reply. " +
       "Use this when requirements are ambiguous, a decision would materially affect your work, you're blocked, " +
       "or you need information or confirmation only the orchestrator has. Prefer asking over guessing. " +
-      "Your session stays open while you wait — the answer arrives as your next message, then you continue. " +
+      "The tool waits and returns their answer before you continue. " +
       "Ask exactly one question per call; make separate calls for unrelated questions.",
     promptSnippet:
       "Use this tool to ask the orchestrator one clarifying, missing-requirement, preference, or decision question before continuing — instead of guessing.",
@@ -521,7 +538,7 @@ export default function (pi: ExtensionAPI) {
       "Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
       "Use it when multiple valid paths exist and the right one depends on the orchestrator's intent.",
       "Give enough context in the question that the orchestrator can answer without re-reading your whole task.",
-      "After asking, stop and wait — the reply will arrive as your next message.",
+      "The tool pauses execution until the reply arrives; continue only after it returns the answer.",
     ],
     parameters: Type.Object({
       question: Type.String({
@@ -529,7 +546,7 @@ export default function (pi: ExtensionAPI) {
           "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
@@ -538,30 +555,69 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Keep the session open: suppress auto-exit for this turn and park in the
-      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
-      // notifies the orchestrator, who replies via subagent_message.
-      awaitingAnswer = true;
-      recorder.askQuestion();
-      const askData = {
-        name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-        agent: process.env.PI_SUBAGENT_AGENT ?? "",
-        question: params.question,
-        runId: process.env.PI_SUBAGENT_RUN_ID,
-        createdAt: Date.now(),
+      if (pendingQuestion) {
+        throw new Error("ask_question already has a pending question.");
+      }
+      const operationSignal = signal ?? ctx.signal;
+      const cancellation = (message: string) => {
+        const error = new Error(message);
+        error.name = "AbortError";
+        return error;
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      if (shuttingDown) throw cancellation("ask_question cancelled: session shutdown.");
+      if (operationSignal?.aborted) {
+        runCancelled = true;
+        throw cancellation("ask_question cancelled.");
+      }
+
+      // Blocking the tool also blocks the next provider request. Register the
+      // waiter before publishing so even an immediate parent reply is consumed.
+      const answer = await new Promise<string>((resolve, reject) => {
+        const askFile = `${sessionFile}.ask`;
+        const cleanup = () => {
+          pendingQuestion = undefined;
+          steerInterval?.unref();
+          operationSignal?.removeEventListener("abort", onAbort);
+          try { unlinkSync(askFile); } catch {}
+        };
+        const onAbort = () => {
+          // An aborted tool wait may leave the last assistant at toolUse, not
+          // aborted. Settlement must still park rather than treating it as done.
+          runCancelled = true;
+          pendingQuestion?.cancel("ask_question cancelled.");
+        };
+        pendingQuestion = {
+          answer(message) {
+            cleanup();
+            resolve(message);
+          },
+          cancel(message) {
+            cleanup();
+            reject(cancellation(message));
+          },
+        };
+        // An unresolved Promise alone does not keep headless Node alive.
+        // Keep polling referenced only while its answer is needed.
+        steerInterval?.ref();
+        operationSignal?.addEventListener("abort", onAbort, { once: true });
+        try {
+          recorder.askQuestion();
+          writeFileSync(askFile, JSON.stringify({
+            name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+            agent: process.env.PI_SUBAGENT_AGENT ?? "",
+            question: params.question,
+            runId: process.env.PI_SUBAGENT_RUN_ID,
+            createdAt: Date.now(),
+          }));
+        } catch (error) {
+          cleanup();
+          reject(error);
+        }
+      });
 
       return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Question sent to the orchestrator. Stop here and wait — do not continue working or " +
-              "assume an answer. Their reply will arrive as your next message.",
-          },
-        ],
-        details: { question: params.question },
+        content: [{ type: "text", text: answer }],
+        details: { question: params.question, answer },
       };
     },
 

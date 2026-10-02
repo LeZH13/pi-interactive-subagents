@@ -1,6 +1,6 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -138,6 +138,79 @@ const SubagentParams = Type.Object({
   ),
 });
 
+const SubagentMessageParams = Type.Object({
+  name: Type.Optional(Type.String({
+    description:
+      "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished. Mutually exclusive with `sessionPath`.",
+  })),
+  sessionPath: Type.Optional(Type.String({
+    description:
+      "Path to a recorded subagent session (.jsonl) file to resume directly, bypassing the name registry. Use when the subagent's name is not known in this session (e.g. after a pi restart). Mutually exclusive with `name`. Requires a `.loadout.json` sandbox snapshot beside the session file.",
+  })),
+  message: Type.String({
+    description:
+      "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
+  }),
+});
+
+// Structured output is an acknowledgement, never a child completion result.
+const SubagentActionOutputSchema = Type.Object({
+  ok: Type.Boolean(),
+  status: Type.Union([
+    Type.Literal("started"),
+    Type.Literal("steered"),
+    Type.Literal("interrupt_requested"),
+    Type.Literal("interrupt_already_requested"),
+    Type.Literal("error"),
+  ]),
+  id: Type.Optional(Type.String()),
+  name: Type.Optional(Type.String()),
+  agent: Type.Optional(Type.String()),
+  sessionFile: Type.Optional(Type.String()),
+  sessionId: Type.Optional(Type.String()),
+  error: Type.Optional(Type.String()),
+});
+
+const SubagentListOutputSchema = Type.Object({
+  agents: Type.Array(Type.Object({
+    name: Type.String(),
+    source: Type.Union([Type.Literal("package"), Type.Literal("global"), Type.Literal("project")]),
+    description: Type.Optional(Type.String()),
+    model: Type.Optional(Type.String()),
+    modelFallback: Type.Optional(Type.String()),
+  })),
+});
+
+/** Project only public handles/acknowledgements; never tasks, identity, or launch scripts. */
+function addStructuredSubagentResult<T extends { details: unknown }>(result: T) {
+  const details = result.details as Record<string, unknown>;
+  const failed = typeof details.error === "string";
+  const structuredContent: Static<typeof SubagentActionOutputSchema> = {
+    ok: !failed,
+    status: failed ? "error" : details.status as Static<typeof SubagentActionOutputSchema>["status"],
+  };
+  for (const key of ["id", "name", "agent", "sessionFile", "sessionId", "error"] as const) {
+    if (typeof details[key] === "string") structuredContent[key] = details[key];
+  }
+  return { ...result, structuredContent };
+}
+
+function withSubagentStructuredOutput<P extends TSchema>(execute: ToolDefinition<P>["execute"]): ToolDefinition<P>["execute"] {
+  return async (...args) => addStructuredSubagentResult(await execute(...args));
+}
+
+function listStructuredAgents(list: ListedAgentDefinition[]): Static<typeof SubagentListOutputSchema> {
+  return {
+    agents: list.map(({ name, source, description, model, modelFallback }) => ({
+      name,
+      source,
+      ...(description !== undefined ? { description } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(modelFallback !== undefined ? { modelFallback } : {}),
+    })),
+  };
+}
+
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
@@ -262,6 +335,7 @@ function getWebAccessExtensionPath(startDir: string = process.cwd()): string | u
  */
 function getToolExtensionPath(tool: string, cwd?: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
+  if (tool === "codemode") return "builtin:codemode";
   // The spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
@@ -936,6 +1010,24 @@ function resolveResultPresentation(
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`);
 }
 
+type InterruptionActor =
+  | { kind: "main_agent" }
+  | { kind: "parent_subagent"; id: string; name?: string; agent?: string };
+
+interface InterruptionMetadata {
+  actor: InterruptionActor;
+  requestedAt: number;
+}
+
+/** Capture the caller identity from runtime state, never model-supplied tool arguments. */
+function captureInterruptionActor(env: NodeJS.ProcessEnv = process.env): InterruptionActor {
+  const id = env.PI_SUBAGENT_ID?.trim();
+  if (!id) return { kind: "main_agent" };
+  const name = env.PI_SUBAGENT_NAME?.trim();
+  const agent = env.PI_SUBAGENT_AGENT?.trim();
+  return { kind: "parent_subagent", id, ...(name ? { name } : {}), ...(agent ? { agent } : {}) };
+}
+
 /**
  * Result from running a single subagent.
  */
@@ -950,8 +1042,9 @@ interface SubagentResult {
   exitCode: number;
   elapsed: number;
   error?: string;
-  /** True when the parent cancelled the run with `subagent_interrupt`. */
+  /** True when the orchestration caller cancelled the run with `subagent_interrupt`. */
   interrupted?: boolean;
+  interruption?: InterruptionMetadata;
   /** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
   errorMessage?: string;
   /** Whether this run produced any non-whitespace assistant text. */
@@ -1001,13 +1094,12 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   /**
-   * Set when the parent cancels the run with `subagent_interrupt`. The pane is
+   * Captured when the orchestration caller cancels with `subagent_interrupt`. The pane is
    * being torn down: hide the widget entry, ignore status transitions and
    * pending questions, skip model fallback, and steer a concise interruption
    * notice instead of the full completion result.
    */
-  userInterrupted?: boolean;
-  interruptedAt?: number;
+  interruption?: InterruptionMetadata;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1337,7 +1429,7 @@ function applySandboxToParts(
     const extPaths = new Set<string>();
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool, loadout.cwd ?? undefined);
-      if (extPath && existsSync(extPath)) extPaths.add(extPath);
+      if (extPath && (extPath.startsWith("builtin:") || existsSync(extPath))) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
       parts.push("-e", shellEscape(extPath));
@@ -1544,7 +1636,7 @@ function resolveRunningByName(name: string):
 
 /** Running subagents that should still appear in the widget. Interrupted runs stay in the map until their watcher observes the torn-down surface and removes them. */
 function visibleRunningSubagents(): RunningSubagent[] {
-  return Array.from(runningSubagents.values()).filter((running) => !running.userInterrupted);
+  return Array.from(runningSubagents.values()).filter((running) => !running.interruption);
 }
 
 function runningTargetHint(): string {
@@ -1583,8 +1675,13 @@ function resolveRunningForInterrupt(params: { id?: unknown; name?: unknown }):
   return { running: running as RunningSubagent };
 }
 
-function formatInterruptedNotice(name: string, elapsed: number): string {
-  return `Sub-agent "${name}" was interrupted by the user after ${formatElapsed(elapsed)}. It did not produce a result.`;
+function formatInterruptedNotice(name: string, elapsed: number, actor?: InterruptionActor): string {
+  const attribution = actor?.kind === "main_agent"
+    ? " by the main agent"
+    : actor?.kind === "parent_subagent"
+      ? ` by parent subagent "${actor.name ?? actor.agent ?? actor.id}"`
+      : "";
+  return `Sub-agent "${name}" was interrupted${attribution} after ${formatElapsed(elapsed)}. It did not produce a result.`;
 }
 
 /**
@@ -1595,14 +1692,15 @@ function formatInterruptedNotice(name: string, elapsed: number): string {
 function finalizeInterruptedRun(
   pi: ExtensionAPI,
   running: RunningSubagent,
-  result: Pick<SubagentResult, "elapsed" | "exitCode" | "interrupted"> & { sessionId?: string },
+  result: Pick<SubagentResult, "elapsed" | "exitCode" | "interrupted" | "interruption"> & { sessionId?: string },
 ): boolean {
-  if (!running.userInterrupted && !result.interrupted) return false;
+  const interruption = running.interruption ?? result.interruption;
+  if (!interruption && !result.interrupted) return false;
   updateWidget();
   pi.sendMessage(
     {
       customType: "subagent_result",
-      content: formatInterruptedNotice(running.name, result.elapsed),
+      content: formatInterruptedNotice(running.name, result.elapsed, interruption?.actor),
       display: true,
       details: {
         name: running.name,
@@ -1613,6 +1711,7 @@ function finalizeInterruptedRun(
         sessionFile: running.sessionFile,
         ...(result.sessionId ? { sessionId: result.sessionId } : {}),
         interrupted: true,
+        ...(interruption ? { interruption } : {}),
       },
     },
     { triggerTurn: true, deliverAs: "steer" },
@@ -1676,7 +1775,7 @@ async function handleSubagentSteer(
   }
 
   const running = resolved.running;
-  if (running.userInterrupted) {
+  if (running.interruption) {
     const err = `Subagent "${running.name}" was interrupted and is shutting down; it cannot receive new messages.`;
     return {
       content: [{ type: "text" as const, text: err }],
@@ -1709,7 +1808,7 @@ async function handleSubagentSteer(
 }
 
 /**
- * Cancel a running Pi-backed subagent. The run is marked user-interrupted
+ * Cancel a running Pi-backed subagent. The runtime caller's interruption is recorded
  * before touching the surface so the watcher suppresses the normal completion
  * result, fallback retry, status transitions, and pending questions. Escape
  * (or SIGINT headless) cancels the in-flight turn; closing the surface
@@ -1718,6 +1817,7 @@ async function handleSubagentSteer(
  */
 async function handleSubagentInterrupt(
   params: { id?: unknown; name?: unknown },
+  actor: InterruptionActor,
   interrupt: (surface: string) => Promise<void> = interruptSurface,
   close: (surface: string) => Promise<void> = closeSurface,
 ) {
@@ -1737,7 +1837,7 @@ async function handleSubagentInterrupt(
       details: { error: err, id: running.id, name: running.name },
     };
   }
-  if (running.userInterrupted) {
+  if (running.interruption) {
     return {
       content: [{
         type: "text" as const,
@@ -1748,11 +1848,9 @@ async function handleSubagentInterrupt(
   }
 
   const now = Date.now();
-  const wasInterrupted = running.userInterrupted ?? false;
-  const wasInterruptedAt = running.interruptedAt;
+  const previousInterruption = running.interruption;
   const previousStatusState = running.statusState;
-  running.userInterrupted = true;
-  running.interruptedAt = now;
+  running.interruption = { actor, requestedAt: now };
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
 
@@ -1760,8 +1858,7 @@ async function handleSubagentInterrupt(
     await interrupt(running.surface);
     await close(running.surface);
   } catch (error: any) {
-    running.userInterrupted = wasInterrupted;
-    running.interruptedAt = wasInterruptedAt;
+    running.interruption = previousInterruption;
     running.statusState = previousStatusState;
     updateWidget();
     const message = error?.message ?? String(error);
@@ -1794,7 +1891,7 @@ function runStatusSupervisionTick(pi: ExtensionAPI, now: number): void {
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
-      if (running.userInterrupted) continue;
+      if (running.interruption) continue;
       observeRunningSubagent(running, now);
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
@@ -1855,6 +1952,10 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 }
 
 export const __test__ = {
+  SubagentActionOutputSchema,
+  SubagentListOutputSchema,
+  addStructuredSubagentResult,
+  listStructuredAgents,
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
@@ -1890,6 +1991,7 @@ export const __test__ = {
   steerSubagent,
   handleSubagentSteer,
   handleSubagentInterrupt,
+  captureInterruptionActor,
   resolveRunningForInterrupt,
   formatInterruptedNotice,
   finalizeInterruptedRun,
@@ -2330,7 +2432,7 @@ async function watchSubagent(
       completionFile: `${sessionFile}.complete`,
       onTick() {
         observeRunningSubagent(running);
-        if (!running.userInterrupted) deliverPendingQuestion(running);
+        if (!running.interruption) deliverPendingQuestion(running);
       },
     });
 
@@ -2376,7 +2478,8 @@ async function watchSubagent(
         exitCode: result.exitCode,
         elapsed,
         hasAssistantText: summary.trim().length > 0,
-        interrupted: running.userInterrupted === true,
+        interrupted: !!running.interruption,
+        ...(running.interruption ? { interruption: running.interruption } : {}),
         ...(sessionId ? { claudeSessionId: sessionId } : {}),
       };
     }
@@ -2425,7 +2528,8 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       hasAssistantText,
-      interrupted: running.userInterrupted === true,
+      interrupted: !!running.interruption,
+      ...(running.interruption ? { interruption: running.interruption } : {}),
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
@@ -2442,7 +2546,8 @@ async function watchSubagent(
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
-        interrupted: running.userInterrupted === true,
+        interrupted: !!running.interruption,
+        ...(running.interruption ? { interruption: running.interruption } : {}),
         sessionFile,
       };
     }
@@ -2453,7 +2558,8 @@ async function watchSubagent(
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
-      interrupted: running.userInterrupted === true,
+      interrupted: !!running.interruption,
+      ...(running.interruption ? { interruption: running.interruption } : {}),
     };
   }
 }
@@ -2523,8 +2629,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       parameters: SubagentParams,
+      outputSchema: SubagentActionOutputSchema,
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      execute: withSubagentStructuredOutput<typeof SubagentParams>(async (_toolCallId, params, _signal, _onUpdate, ctx) => {
         // Prevent self-spawning (e.g. planner spawning another planner)
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
         if (params.agent && currentAgent && params.agent === currentAgent) {
@@ -2774,7 +2881,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             status: "started",
           },
         };
-      },
+      }),
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
@@ -2855,8 +2962,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
       }),
 
+      outputSchema: SubagentActionOutputSchema,
+
       async execute(_toolCallId, params): Promise<any> {
-        return handleSubagentInterrupt(params);
+        const actor = captureInterruptionActor();
+        return addStructuredSubagentResult(await handleSubagentInterrupt(params, actor));
       },
 
       renderCall(args, theme) {
@@ -2917,6 +3027,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
+      outputSchema: SubagentListOutputSchema,
 
       async execute() {
         const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
@@ -2925,6 +3036,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return {
             content: [{ type: "text", text: "No subagent definitions found." }],
             details: { agents: [] },
+            structuredContent: listStructuredAgents(list),
           };
         }
 
@@ -2939,6 +3051,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: { agents: list },
+          structuredContent: listStructuredAgents(list),
         };
       },
 
@@ -2979,24 +3092,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Message a subagent by name (steers it if running, resumes it if finished), or resume a recorded session file via `sessionPath` when the name is not in this session's registry. " +
         "`message` is required; provide exactly one of `name` or `sessionPath`. Steering returns immediately; resuming delivers its result later as a steer message. " +
         "Do not poll or fabricate results.",
-      parameters: Type.Object({
-        name: Type.Optional(
-          Type.String({
-            description:
-              "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished. Mutually exclusive with `sessionPath`.",
-          }),
-        ),
-        sessionPath: Type.Optional(
-          Type.String({
-            description:
-              "Path to a recorded subagent session (.jsonl) file to resume directly, bypassing the name registry. Use when the subagent's name is not known in this session (e.g. after a pi restart). Mutually exclusive with `name`. Requires a `.loadout.json` sandbox snapshot beside the session file.",
-          }),
-        ),
-        message: Type.String({
-          description:
-            "The message to deliver: a follow-up instruction for a running subagent, or the next task for a resumed session.",
-        }),
-      }),
+      parameters: SubagentMessageParams,
 
       renderCall(args, theme) {
         const target = args.name ?? (args.sessionPath ? basename(args.sessionPath) : "(unknown)");
@@ -3038,7 +3134,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
-      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      outputSchema: SubagentActionOutputSchema,
+
+      execute: withSubagentStructuredOutput<typeof SubagentMessageParams>(async (_toolCallId, params, _signal, _onUpdate, ctx) => {
         const requestedName = params.name?.trim() || undefined;
         const requestedSessionPath = params.sessionPath?.trim() || undefined;
         if (requestedName && requestedSessionPath) {
@@ -3322,7 +3420,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           try { await closeSurface(surface); } catch {}
           throw error;
         }
-      },
+      }),
     });
 
   // /subagent command — request a model-owned tool call with optional overrides.

@@ -15,7 +15,7 @@
  *   PI_TEST_MODEL     — model for all pi sessions (default: wandb/deepseek-ai/DeepSeek-V4-Flash-0731)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
-import { describe, it, before, after } from "node:test";
+import { describe, it, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -54,6 +54,10 @@ for (const backend of backends) {
       process.env.PI_SUBAGENT_BACKEND = backend;
       setSurfaceBackendPreference(backend as any);
       env = createTestEnv();
+    });
+
+    afterEach((context) => {
+      if (!context.passed) env.preserveArtifacts = true;
     });
 
     after(async () => {

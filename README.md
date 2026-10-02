@@ -40,6 +40,31 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
+### Codemode (Pi 1.0)
+
+Codemode is **profile opt-in**: this extension does not enable it by default or add it to bundled profiles. Include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
+
+```yaml
+tools: read, grep, find, ls, codemode
+```
+
+Restricted launches explicitly load `-e builtin:codemode` despite `--no-extensions`; resume uses the same sandbox helper and recorded tool allowlist. Codemode does not grant extra tools or spawning permission. Pi's `codemode.mode` and `codemode.inlineBudget` presentation settings are left unchanged. For the parent session, enable codemode through Pi's own tool selection/settings.
+
+These tools declare output schemas, so `tools.<name>(args)` in codemode resolves to structured data instead of parsing acknowledgement text:
+
+- `subagents_list`: `{ agents: [{ name, source, description?, model?, modelFallback? }] }`. `source` is `package`, `global`, or `project`; an empty list is `{ agents: [] }`. This lists available definitions, **not running status**, and excludes profile bodies/private loadout data.
+- `subagent`, `subagent_message`, `subagent_interrupt`: `{ ok, status, id?, name?, agent?, sessionFile?, sessionId?, error? }`. Optional handles come from existing result details. Status is `started` (spawn or resume), `steered`, `interrupt_requested`, or `interrupt_already_requested`. Returned validation/operation errors have `ok: false`, `status: "error"`, and `error`; thrown failures still reject. Existing text, details, and error flags are unchanged.
+
+`ok: true` means only that the operation was acknowledged — **not that the child's task completed**. Spawn/resume completions arrive later as steer messages; a live message acknowledgement itself does not emit another result. Interruption acknowledgements precede the watcher's removal notice. Do not poll or infer completion from any acknowledgement.
+
+```js
+const { agents } = await tools.subagents_list({});
+text(agents.map(({ name }) => name));
+// Only in a session granted spawning tools:
+const ack = await tools.subagent({ agent: "scout", task: "Analyze the auth module" });
+text(ack); // acknowledgement only; the harness delivers the eventual result
+```
+
 ### Spawning
 
 ```typescript
@@ -85,15 +110,15 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 subagent_interrupt({ name: "scout" });
 ```
 
-This is cancellation, not a pause: it sends Escape (SIGINT for headless background runs) to stop the in-flight turn, terminates the child process, closes the pane, and removes the widget entry. The watcher then steers one concise interruption notice instead of the full completion result, and the run is excluded from model-fallback retry. Interrupting an unknown or already-finished `id`/`name` returns a clear error, as does a child running through the Claude Code CLI.
+This is cancellation, not a pause: it sends Escape (SIGINT for headless background runs) to stop the in-flight turn, terminates the child process, closes the pane, and removes the widget entry. The watcher then steers one concise interruption notice instead of the full completion result, and the run is excluded from model-fallback retry. The notice attributes cancellation to the runtime caller: the main agent in a top-level session, or the parent sub-agent (using its runtime name, profile, or ID) in a nested session—not to the human user. Attribution is captured from the caller's environment at tool entry, never from tool arguments. Final notification details include `interrupted: true` and `interruption: { actor, requestedAt }`; `actor` is `{ kind: "main_agent" }` or `{ kind: "parent_subagent", id, name?, agent? }`, and `requestedAt` is the request time in epoch milliseconds. Interrupting an unknown or already-finished `id`/`name` returns a clear error, as does a child running through the Claude Code CLI.
 
 **Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
 
 ### ask_question
 
-A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
+A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The `ask_question` tool call **waits for a reply**: the model cannot continue to its next provider request while it is pending. The parent is notified with the sub-agent's name and replies via `subagent_message({ name, message })`. The first valid reply for the current run is returned once as the tool's answer, not also injected as a custom message or a new turn. A human can answer through the child's input too.
 
-If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
+Different sub-agents can wait in parallel; each child permits only one pending question. Further messages follow the ordinary steer path. Abort or session shutdown releases the wait and removes the pending question file; abort parks the session rather than completing the task. If nobody replies or cancels, the tool keeps waiting. Only available inside sub-agent sessions.
 
 ## Bundled agents
 
@@ -133,7 +158,7 @@ You are a specialized agent that does X...
 | `model` | string | Primary/default model |
 | `model-fallback` | string | Optional one-shot fallback model. Use `inherit` to copy the immediate spawning session's live model, or provide a concrete model id |
 | `thinking` | string | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget) |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -185,11 +210,11 @@ The `/subagent` command sends an explicit tool-call request to the main model; i
 
 ### auto-exit
 
-With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
+With `auto-exit: true`, the session shuts down at Pi 1.0's final `agent_settled` boundary — after retries, recovery, and queued work have settled, not at the earlier `agent_end` telemetry event. The agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
 
 Notes:
 
-- **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
+- **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally. Normally aborted turns park instead of closing. **Pi 1.0 late-abort limitation:** an abort after the agent loop has completed, during final settlement callbacks, is not exposed by Pi's public API and may still auto-close the session; no private-API workaround is used.
 - **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
 
 ### interactive
@@ -273,7 +298,7 @@ Subagent artifacts are retained when their parent session is deleted. Cleanup is
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono)
+- [Pi 1.0](https://github.com/earendil-works/pi)
 - At least one execution surface:
   - [tmux](https://github.com/tmux/tmux) (tested with `tmux 3.7c`)
   - [Herdr](https://herdr.dev/docs/cli-reference/) (tested with `herdr 0.9.0`)
