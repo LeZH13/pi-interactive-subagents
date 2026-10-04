@@ -5,6 +5,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 // Tests run as top-level orchestrator tests; clear any inherited child subagent allowlist.
@@ -201,14 +202,22 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const eventHandlers = new Map<string, Array<(...args: any[]) => any>>();
   return {
+    async emit(event: string, ...args: any[]) {
+      for (const handler of eventHandlers.get(event) ?? []) await handler(...args);
+    },
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
     api: {
-      on() {},
+      on(event: string, handler: (...args: any[]) => any) {
+        const handlers = eventHandlers.get(event) ?? [];
+        handlers.push(handler);
+        eventHandlers.set(event, handlers);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -5894,6 +5903,21 @@ describe("resume command construction", () => {
 describe("Pi 1.0 sandbox and structured outputs", () => {
   const testApi = (subagentsModule as any).__test__;
 
+  it("bundled profiles include codemode without changing their underlying tool grants", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const expected: Record<string, string[]> = {
+        scout: ["read", "grep", "find", "ls", "codemode"],
+        researcher: ["web_search", "fetch_content", "get_search_content", "source_check", "safe_bash", "codemode"],
+        worker: ["read", "write", "edit", "bash", "web_search", "fetch_content", "get_search_content", "codemode"],
+      };
+      for (const [name, tools] of Object.entries(expected)) {
+        const profile = testApi.loadAgentDefaults(name);
+        assert.ok(profile, `expected bundled profile ${name}`);
+        assert.deepEqual(profile.tools?.split(",").map((tool: string) => tool.trim()), tools);
+      }
+    });
+  });
+
   it("loads builtin codemode only for opted-in profile allowlists on launch and persisted resume", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir, projectDir }) => {
       assert.equal(testApi.getToolExtensionPath("codemode"), "builtin:codemode");
@@ -5974,5 +5998,247 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
     assert.equal(result.structuredContent.status, "error");
     assert.equal(result.structuredContent.error, result.details.error);
     assert.ok(result.content[0].text);
+  });
+});
+
+describe("subagent badge rendering and conciseness rules", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function createTheme() {
+    return {
+      fg(_color: string, text: string) {
+        return text;
+      },
+      bg(_color: string, text: string) {
+        return text;
+      },
+      bold(text: string) {
+        return text;
+      },
+    };
+  }
+
+  it("formatStatusLine and formatTransitionLine format badge when name !== agent and omit when same", () => {
+    const statusState = createStatusState({ source: "pi", startTimeMs: 0 });
+    const snapshot = classifyStatus(statusState, 60_000);
+    assert.equal(snapshot.kind, "stalled", "unseen activity stalls at the one-minute boundary");
+
+    // Distinct name and agent: badge included
+    const distinctLine = formatStatusLine("explore-codebase", snapshot, "scout");
+    assert.match(distinctLine, /^explore-codebase \(scout\) running 1m, stalled\./);
+
+    const distinctRecovered = formatTransitionLine("explore-codebase", snapshot, "recovered", "scout");
+    assert.match(distinctRecovered, /^explore-codebase \(scout\) running 1m, recovered;/);
+
+    // Identical name and agent: badge omitted (conciseness rule)
+    const sameLine = formatStatusLine("scout", snapshot, "scout");
+    assert.match(sameLine, /^scout running 1m, stalled\./);
+    assert.doesNotMatch(sameLine, /\(scout\)/);
+
+    const sameRecovered = formatTransitionLine("scout", snapshot, "recovered", "scout");
+    assert.match(sameRecovered, /^scout running 1m, recovered;/);
+    assert.doesNotMatch(sameRecovered, /\(scout\)/);
+
+    // No agent supplied: no badge.
+    const plainLine = formatStatusLine("scout", snapshot);
+    assert.match(plainLine, /^scout running 1m, stalled\./);
+  });
+
+  it("renderSubagentWidgetLines shows badge when distinct and omits when same", () => {
+    const now = 1_000_000;
+    const theme = {
+      getThinkingBorderColor: (_level: string) => (text: string) => text,
+    };
+    const statusState = createStatusState({ source: "pi", startTimeMs: now - 10_000 });
+
+    const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+
+    // Distinct: explore-codebase (scout)
+    const distinctLines = testApi.renderSubagentWidgetLines([{
+      id: "a1",
+      name: "explore-codebase",
+      agent: "scout",
+      task: "",
+      surface: "s1",
+      startTime: now - 10_000,
+      sessionFile: "s1",
+      statusState,
+    }], 80, theme).map(stripAnsi);
+    assert.match(distinctLines[1], /explore-codebase \(scout\)/);
+
+    // Same: scout
+    const sameLines = testApi.renderSubagentWidgetLines([{
+      id: "a2",
+      name: "scout",
+      agent: "scout",
+      task: "",
+      surface: "s2",
+      startTime: now - 10_000,
+      sessionFile: "s2",
+      statusState,
+    }], 80, theme).map(stripAnsi);
+    assert.match(sameLines[1], /scout /);
+    assert.doesNotMatch(sameLines[1], /scout \(scout\)/);
+  });
+
+  it("subagent tool renderResult displays badge when distinct and omits when same", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const subagentTool = registeredTools.find((t) => t.name === "subagent");
+    assert.ok(subagentTool);
+    const theme = createTheme();
+
+    // Distinct: explore-codebase (scout)
+    const distinctRendered = subagentTool.renderResult({
+      content: [{ type: "text", text: "launched" }],
+      details: { name: "explore-codebase", agent: "scout", status: "started" },
+    }, {}, theme);
+    const distinctText = distinctRendered.render(80).join("\n");
+    assert.match(distinctText, /explore-codebase \(scout\) — started/);
+
+    // Same: scout
+    const sameRendered = subagentTool.renderResult({
+      content: [{ type: "text", text: "launched" }],
+      details: { name: "scout", agent: "scout", status: "started" },
+    }, {}, theme);
+    const sameText = sameRendered.render(80).join("\n");
+    assert.match(sameText, /scout — started/);
+    assert.doesNotMatch(sameText, /\(scout\)/);
+  });
+
+  it("subagent_message tool renderResult displays badge when distinct and omits when same", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const messageTool = registeredTools.find((t) => t.name === "subagent_message");
+    assert.ok(messageTool);
+    const theme = createTheme();
+
+    // Steered distinct
+    const steeredDistinct = messageTool.renderResult({
+      content: [{ type: "text", text: "steered" }],
+      details: { name: "explore-codebase", agent: "scout", status: "steered" },
+    }, {}, theme).render(80).join("\n");
+    assert.match(steeredDistinct, /explore-codebase \(scout\) — message delivered/);
+
+    // Steered same
+    const steeredSame = messageTool.renderResult({
+      content: [{ type: "text", text: "steered" }],
+      details: { name: "scout", agent: "scout", status: "steered" },
+    }, {}, theme).render(80).join("\n");
+    assert.match(steeredSame, /scout — message delivered/);
+    assert.doesNotMatch(steeredSame, /\(scout\)/);
+
+    // Resumed distinct
+    const resumedDistinct = messageTool.renderResult({
+      content: [{ type: "text", text: "resumed" }],
+      details: { name: "explore-codebase", agent: "scout", status: "started" },
+    }, {}, theme).render(80).join("\n");
+    assert.match(resumedDistinct, /explore-codebase \(scout\) — resumed/);
+
+    // Resumed same
+    const resumedSame = messageTool.renderResult({
+      content: [{ type: "text", text: "resumed" }],
+      details: { name: "scout", agent: "scout", status: "started" },
+    }, {}, theme).render(80).join("\n");
+    assert.match(resumedSame, /scout — resumed/);
+    assert.doesNotMatch(resumedSame, /\(scout\)/);
+  });
+
+  it("subagent_result renderer applies conciseness omission rule", () => {
+    initTheme("dark", false);
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(rendererEntry);
+    const theme = createTheme();
+
+    // Distinct
+    const distinctRendered = rendererEntry.renderer({
+      content: "done",
+      details: { name: "explore-codebase", agent: "scout", exitCode: 0, elapsed: 10 },
+    }, { expanded: false }, theme).render(80).join("\n");
+    assert.match(distinctRendered, /explore-codebase \(scout\)/);
+
+    // Same
+    const sameRendered = rendererEntry.renderer({
+      content: "done",
+      details: { name: "scout", agent: "scout", exitCode: 0, elapsed: 10 },
+    }, { expanded: false }, theme).render(80).join("\n");
+    assert.match(sameRendered, /scout/);
+    assert.doesNotMatch(sameRendered, /scout \(scout\)/);
+  });
+
+  it("headless resume propagates the agent and completes without leaking widget timers", { timeout: 5_000 }, async (t) => {
+    const dir = createTestDir();
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const mock = createMockExtensionApi();
+    const oldPath = process.env.PATH;
+    const oldBackend = getSurfaceBackendPreference();
+    t.after(async () => {
+      try {
+        await mock.emit("session_shutdown", {}, {});
+      } finally {
+        restoreEnvVar("PATH", oldPath);
+        setSurfaceBackendPreference(oldBackend);
+        testApi.setTestContext(null);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // Never launch the user's real Pi CLI or depend on terminal/provider state.
+    const binDir = join(dir, "bin");
+    mkdirSync(binDir);
+    const fakePi = join(binDir, "pi");
+    writeFileSync(fakePi, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakePi, 0o755);
+    process.env.PATH = `${binDir}:${oldPath ?? ""}`;
+    setSurfaceBackendPreference("background");
+    const ctx = {
+      hasUI: false,
+      sessionManager: { getSessionDir: () => dir, getSessionId: () => "p-1", getSessionFile: () => join(dir, "parent.jsonl") },
+    } as any;
+    (subagentsModule as any).default(mock.api);
+    await mock.emit("session_start", {}, ctx);
+    const messageTool = mock.registeredTools.find((tool) => tool.name === "subagent_message");
+    assert.ok(messageTool);
+
+    let resolveCompletion!: (message: any) => void;
+    const completion = new Promise<any>((resolve) => { resolveCompletion = resolve; });
+    const sendMessage = mock.api.sendMessage;
+    mock.api.sendMessage = (message: any, options?: any) => {
+      sendMessage(message, options);
+      if (message.customType === "subagent_result") resolveCompletion(message);
+    };
+
+    const sessionFile = join(dir, "subagent-res.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-res" }) + "\n");
+    writeSubagentLoadout(sessionFile, {
+      agent: "scout",
+      toolAllowlist: "read",
+      model: null,
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      spawnable: null,
+      autoExit: true,
+      cwd: dir,
+      agentDir: null,
+    });
+
+    const result = await messageTool.execute("c-1", { sessionPath: sessionFile, message: "continue" }, undefined, undefined, ctx);
+    assert.equal(result.details?.agent, "scout");
+    const runningEntry = Array.from(runningMap.values()).find((entry) => entry.sessionFile === sessionFile);
+    assert.ok(runningEntry, "expected running entry to be registered");
+    assert.equal(runningEntry.agent, "scout");
+    assert.equal((globalThis as any)[Symbol.for("pi-subagents/widget-interval")] ?? null, null,
+      "headless runs must not start a UI refresh timer");
+
+    const completed = await completion;
+    assert.equal(completed.details?.agent, "scout");
+    assert.equal(completed.details?.exitCode, 0);
+    assert.equal(runningMap.size, 0, "watcher removes the completed run");
   });
 });

@@ -11,14 +11,14 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux o
 
 ```
 ╭─ Subagents ───────────────────────────────────────────────────────────── 2 running ─╮
-│ ⟳ 00:23  scout (scout)                                             active · bash 7s │
+│ ⟳ 00:23  scout                                                     active · bash 7s │
 │          ↳ ↑14k↓420  $0.008                            gemini-3.7-flash · 7.1%/1M │
 │ ○ 00:45  cleanup-design (worker)                                  waiting 2m · done │
 │          ↳ ↑39k↓1.6k  R12k  $0.042                        gpt-5.6-sol · 19.6%/200k │
 ╰─────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
+Agent badges appear only when the display name differs from the agent profile name. Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
 Panes are kept evenly sized after every spawn and exit (debounced). The extension reads the tmux window dimensions and applies `even-horizontal` (equal columns) when columns are at least twice the row count (accounting for character cell aspect ratio), or `even-vertical` (equal rows) for portrait/square dimensions. Resizing alone does not trigger a rebalance; the new aspect ratio takes effect on the next spawn or exit.
 
@@ -42,7 +42,7 @@ There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for re
 
 ### Codemode (Pi 1.0)
 
-Codemode is **profile opt-in**: this extension does not enable it by default or add it to bundled profiles. Include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
+Codemode is included in the bundled **scout**, **researcher**, and **worker** profiles for batching independent calls and filtering large results. Custom profiles remain **opt-in**: include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
 
 ```yaml
 tools: read, grep, find, ls, codemode
@@ -124,9 +124,9 @@ Different sub-agents can wait in parallel; each child permits only one pending q
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `get_search_content` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls`, `codemode` | Fast read-only codebase recon |
+| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `codemode` | Web research, synthesized into a sourced brief |
+| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `get_search_content`, `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if GLM-5.3 fails.
 

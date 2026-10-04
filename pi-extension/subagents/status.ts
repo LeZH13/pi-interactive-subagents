@@ -398,8 +398,13 @@ function formatStalledDetail(snapshot: StatusSnapshot): string {
   return `stalled${duration}${detail}`;
 }
 
-export function formatStatusLine(name: string, snapshot: StatusSnapshot): string {
-  const boundedName = normalizeStatusName(name);
+function formatDisplayName(name: string, agent?: string): string {
+  const agentTag = agent && name !== agent ? ` (${agent})` : "";
+  return `${name}${agentTag}`;
+}
+
+export function formatStatusLine(name: string, snapshot: StatusSnapshot, agent?: string): string {
+  const boundedName = normalizeStatusName(formatDisplayName(name, agent));
 
   if (snapshot.kind === "starting") {
     const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
@@ -430,15 +435,16 @@ export function formatTransitionLine(
   name: string,
   snapshot: StatusSnapshot,
   transition: Exclude<SubagentStatusTransition, null>,
+  agent?: string,
 ): string {
-  const boundedName = normalizeStatusName(name);
+  const boundedName = normalizeStatusName(formatDisplayName(name, agent));
 
   if (transition === "recovered") {
     const detail = snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`);
   }
 
-  return formatStatusLine(boundedName, snapshot);
+  return formatStatusLine(name, snapshot, agent);
 }
 
 export function capStatusLines(lines: string[], lineLimit: number): CappedStatusLines {
