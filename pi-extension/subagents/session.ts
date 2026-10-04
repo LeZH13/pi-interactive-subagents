@@ -3,6 +3,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -174,6 +175,8 @@ export interface SubagentLoadout {
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
   toolAllowlist: string | null;
+  /** Resolved backing extension entries, frozen at launch rather than rediscovered on resume. */
+  toolExtensionPaths?: string[];
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -222,6 +225,11 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object") return null;
+    if (parsed.toolExtensionPaths !== undefined &&
+      (!Array.isArray(parsed.toolExtensionPaths) ||
+        parsed.toolExtensionPaths.some((path: unknown) => typeof path !== "string" || !path.trim()))) {
+      return null;
+    }
     return parsed as SubagentLoadout;
   } catch {
     return null;
@@ -792,6 +800,10 @@ export interface CleanDirResult {
   preservedForeignEntries: string[];
 }
 
+function isRealDirectory(path: string): boolean {
+  try { return lstatSync(path).isDirectory(); } catch { return false; }
+}
+
 /**
  * Clean ONLY extension-owned files in an orphan artifact directory, preserving any
  * foreign files, unexpected folders, or foreign context files.
@@ -806,11 +818,13 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
     preservedForeignEntries: [],
   };
 
-  if (!existsSync(artifactDirPath)) return result;
+  // Never traverse directory symlinks: recognized names do not authorize
+  // deleting files outside the selected artifact tree.
+  if (!isRealDirectory(artifactDirPath)) return result;
 
   // 1. Clean subagents/
   const subagentsDir = join(artifactDirPath, "subagents");
-  if (existsSync(subagentsDir)) {
+  if (isRealDirectory(subagentsDir)) {
     try {
       const entries = readdirSync(subagentsDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -872,7 +886,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
 
   // 2. Clean subagent-activity/
   const activityDir = join(artifactDirPath, "subagent-activity");
-  if (existsSync(activityDir)) {
+  if (isRealDirectory(activityDir)) {
     try {
       const entries = readdirSync(activityDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -893,7 +907,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
 
   // 3. Clean subagent-scripts/
   const scriptsDir = join(artifactDirPath, "subagent-scripts");
-  if (existsSync(scriptsDir)) {
+  if (isRealDirectory(scriptsDir)) {
     try {
       const entries = readdirSync(scriptsDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -914,7 +928,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
 
   // 4. Clean subagent-resume/
   const resumeDir = join(artifactDirPath, "subagent-resume");
-  if (existsSync(resumeDir)) {
+  if (isRealDirectory(resumeDir)) {
     try {
       const entries = readdirSync(resumeDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -935,7 +949,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
 
   // 5. Clean context/ (ONLY delete matching extension files; preserve foreign user/custom files)
   const contextDir = join(artifactDirPath, "context");
-  if (existsSync(contextDir)) {
+  if (isRealDirectory(contextDir)) {
     try {
       const entries = readdirSync(contextDir, { withFileTypes: true });
       for (const entry of entries) {
@@ -1074,6 +1088,8 @@ export interface OrphanArtifactCandidate {
 }
 
 export interface OrphanGcOptions {
+  /** Limit cleanup to this parent session, rechecking normal orphan eligibility. */
+  targetSessionId?: string;
   dryRun?: boolean;
   minAgeMs?: number;
   currentSessionId?: string | null;
@@ -1124,7 +1140,7 @@ export function findOrphanArtifactDirs(
   options?: OrphanGcOptions,
 ): OrphanArtifactCandidate[] {
   const artifactsRoot = join(sessionDir, "artifacts");
-  if (!existsSync(artifactsRoot)) return [];
+  if (!isRealDirectory(artifactsRoot)) return [];
 
   const candidates: OrphanArtifactCandidate[] = [];
   const minAgeMs = options?.minAgeMs ?? (24 * 60 * 60 * 1000);
@@ -1223,9 +1239,10 @@ export function cleanOrphanArtifactDirs(
     errors: [],
   };
 
-  if (!existsSync(artifactsRoot)) return result;
+  if (!isRealDirectory(artifactsRoot)) return result;
 
-  const candidates = findOrphanArtifactDirs(sessionDir, options);
+  const candidates = findOrphanArtifactDirs(sessionDir, options)
+    .filter((candidate) => !options?.targetSessionId || candidate.sessionId === options.targetSessionId);
   result.candidates = candidates;
   result.orphanCount = candidates.length;
 

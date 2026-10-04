@@ -159,7 +159,7 @@ You are a specialized agent that does X...
 | `model-fallback` | string | Optional one-shot fallback model. Use `inherit` to copy the immediate spawning session's live model, or provide a concrete model id |
 | `thinking` | string | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget) |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
-| `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
+| `subagent_agents` | string | Comma-separated agent names this agent may spawn. A nonempty effective list grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts targets to that list within the parent's allowed agents. Settings can override the list; an empty list disables spawning |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
@@ -177,24 +177,35 @@ With `model-fallback: inherit`, nested agents inherit from their **immediate spa
 
 ## Configuration (agent-dir `config.json` + `/subagent-settings`)
 
-The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.json` (`status`, `multiplexing.backend`, per-agent `agents` overrides), honoring `PI_CODING_AGENT_DIR`. This keeps settings outside the installed package, so reinstalling or replacing the package does not erase them. Package-local `config.json` is obsolete and is no longer read; `config.json.example` remains the committed template. Every `/subagent-settings` change applies live and is written immediately (atomic write); overrides for deleted agents are pruned on save.
+The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.json` (`status`, `multiplexing.backend`, per-agent `agents` overrides), honoring `PI_CODING_AGENT_DIR`. This keeps settings outside the installed package, so reinstalling or replacing the package does not erase them. Package-local `config.json` is obsolete and is no longer read; `config.json.example` remains the committed template. Every successful selection or list toggle is saved immediately with an atomic write; no separate Apply step is required. Agent overrides apply to **new spawns only**; running agents and resumed sessions keep their original loadouts. General settings still apply live.
 
 ```json
 {
   "status": { "enabled": true },
   "multiplexing": { "backend": "auto" },
-  "agents": { "worker": { "model": "openai/gpt-5", "thinking": "high" } }
+  "agents": {
+    "worker": {
+      "model": "openai/gpt-5",
+      "thinking": "high",
+      "tools": ["read", "bash", "edit", "write"],
+      "subagentAgents": ["scout", "researcher"],
+      "skills": [],
+      "modelFallback": "inherit"
+    }
+  }
 }
 ```
 
 ### Settings page (`/subagent-settings`)
 
-`/subagent-settings` opens a settings page (same style as pi's `/settings`) with four groups:
+`/subagent-settings` opens a settings page (same style as pi's `/settings`) with two tabs:
 
-- **Backend** — `auto | tmux | herdr | background` surface preference for new subagents. Applies live and persists.
-- **Status widget** — show or hide the live subagent widget above the editor.
-- **One row per agent** (`scout`, `researcher`, `worker`, plus custom agents) — each opens a submenu with **Model** (type-to-filter regex list over registered `provider/model` ids), **Thinking** (level list, locked to `off` for non-reasoning models), and **Reset to markdown**.
-- **Orphan cleanup** — shows `N orphans · X files · Y KB`; Enter previews candidate dirs, then a confirm dialog deletes.
+- **Agents** (default) — search `scout`, `researcher`, `worker`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above tools/spawnable agents/skills, with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, or **Pi default**) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. The new controls support Pi-backed agents only and are marked unsupported for `cli: claude`.
+- **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved.
+
+Use **← / →** for the previous / next panel when the search is empty, **Tab / Shift+Tab** to cycle forward / backward, or click a tab. When a search query exists, horizontal arrows move its cursor—even at the query's beginning or end—while Tab / Shift+Tab still switch panels. Each panel retains its selection, and Agents retains its search. Panel switching is disabled in nested screens, which replace tabs with breadcrumbs; **Esc** returns one level, then closes the page from a panel's list. Search errors and empty results explain how to recover. In list pickers, **Space / Enter** or a checkbox click toggles and saves immediately; **Esc** returns without undoing saved changes. The concise footer shows move, toggle, and back shortcuts. Keyboard hints wrap at narrow widths.
+
+Absent override fields use the agent Markdown defaults. Explicit `tools: []` grants no optional tools, `skills: []` invokes no startup skills, `subagentAgents: []` disables spawning, and `modelFallback: null` disables fallback. If neither the definition nor settings specify tools, new agents inherit the spawner's active optional tools. `ask_question` remains a managed control tool; spawning tools are managed automatically from the effective spawnable-agent list, which cannot widen an inherited agent restriction. The Tools picker includes supported Pi built-ins even when excluded or inactive in the parent, built-in extensions `codemode` and `tool_search`, bundled `safe_bash`, and registered workspace extension tools, deduplicated by name. Other pickers use current-session discoveries. Unavailable existing entries are preserved rather than silently deleted. Adding tools to the catalog does not change the inherited active-tool defaults. Child tools remain independently configurable; parent CLI tool exclusions are not a delegation ceiling. `safe_bash` and native `bash` are independent grants: allowing native `bash` bypasses `safe_bash` command filters.
 
 Model/thinking precedence is **explicit spawn args > settings-page override > agent markdown default**. The old `/subagent-mux` and `/subagent-sessions` commands are removed; explicit `/subagent agent@model:thinking` args still win for a single spawn.
 
@@ -223,9 +234,9 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Pi sub-agent access is **whitelist-only**. Each new process uses `--no-extensions` and an explicit `--tools <allowlist>`; only backing extensions for allowed tools are reloaded. Settings override the frontmatter tool list. If neither specifies tools, the spawner's active optional tools are inherited. Managed control/spawning tools are added separately. Registered file-backed and built-in extension tools can be selected; tools without a reloadable source are marked unavailable. The resolved restriction survives resume via the loadout snapshot.
 
-Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn the agents in its `subagent_agents` list (enforced via `PI_SUBAGENT_ALLOWED`). Presence of that field also grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
+Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn agents in its effective `subagent_agents` list, intersected with the spawner's inherited restriction (enforced via `PI_SUBAGENT_ALLOWED`). A nonempty effective list grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`). There is no agentless spawn route.
 
 Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
 
@@ -289,7 +300,7 @@ Sub-agent session transcripts (`.jsonl`) and their sandbox loadout sidecars (`.l
 
 ### Orphan cleanup
 
-Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the **Orphan cleanup** row in `/subagent-settings` when you want to inspect and remove them. The row shows a live `N orphans · X files · Y KB` summary; Enter previews the candidate dirs, then a confirm dialog deletes them.
+Subagent artifacts are retained when their parent session is deleted. Cleanup is never run automatically: use the **Orphan cleanup** row in `/subagent-settings` when you want to inspect and remove them. The row shows an `N orphans · X files · Y KB` summary, refreshed when entering General or returning from cleanup. Enter previews candidate directories, then a confirmation deletes recognized extension artifacts only in the selected directory.
 
 - **Marker-Only Ownership**: Cleanup considers only directories with a valid extension ownership marker matching the parent session ID. Familiar filenames alone are not treated as proof of ownership.
 - **Preview First**: Cleanup defaults to a read-only, directory-level summary. It reports candidate directories, total stored file counts, and approximate sizes; it does not enumerate every file that will be removed.

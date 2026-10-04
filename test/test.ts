@@ -1,10 +1,10 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
@@ -91,7 +91,7 @@ import {
   serializeSubagentsConfig,
   writeSubagentsConfig,
 } from "../pi-extension/subagents/config.ts";
-import { regexFilterModels } from "../pi-extension/subagents/settings.ts";
+import { regexFilterModels, showSubagentSettings, type SubagentSettingsDeps } from "../pi-extension/subagents/settings.ts";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -235,6 +235,12 @@ function createMockExtensionApi() {
         sentMessages.push({ message, options });
       },
       getAllTools() {
+        return [];
+      },
+      getActiveTools() {
+        return ["read", "bash", "edit", "write"];
+      },
+      getCommands() {
         return [];
       },
     } as any,
@@ -1243,6 +1249,62 @@ describe("session.ts", () => {
       });
     });
 
+    it("limits cleanup to the selected orphan and rechecks parent eligibility", () => {
+      const dir = mkdtempSync(join(tmpdir(), "subagent-targeted-cleanup-"));
+      try {
+        for (const id of ["orphan-a", "orphan-b"]) {
+          const artifactDir = join(dir, "artifacts", id);
+          mkdirSync(artifactDir, { recursive: true });
+          writeArtifactOwnershipMarker(artifactDir, id);
+          writeFileSync(join(artifactDir, "subagent-registry.json"), "{}");
+        }
+        const options = { targetSessionId: "orphan-a", minAgeMs: 0 };
+        const preview = cleanOrphanArtifactDirs(dir, { ...options, dryRun: true });
+        assert.deepEqual(preview.candidates.map((candidate) => candidate.sessionId), ["orphan-a"]);
+        assert.equal(existsSync(join(dir, "artifacts", "orphan-a")), true);
+        writeFileSync(join(dir, "orphan-a.jsonl"), JSON.stringify({ type: "session", id: "orphan-a" }) + "\n");
+        const result = cleanOrphanArtifactDirs(dir, options);
+        assert.equal(result.orphanCount, 0);
+        assert.equal(existsSync(join(dir, "artifacts", "orphan-a")), true);
+        assert.equal(existsSync(join(dir, "artifacts", "orphan-b")), true);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
+    it("preserves directory symlinks instead of cleaning their external targets", () => {
+      const dir = mkdtempSync(join(tmpdir(), "subagent-symlink-cleanup-"));
+      try {
+        const artifactDir = join(dir, "artifacts", "orphan");
+        mkdirSync(artifactDir, { recursive: true });
+        writeArtifactOwnershipMarker(artifactDir, "orphan");
+        const fixtures = [
+          ["subagents", "child.jsonl"],
+          ["subagent-activity", "child.json"],
+          ["subagent-scripts", "child.sh"],
+          ["subagent-resume", "child.md"],
+          ["context", "2026-10-04T12-00-00.md"],
+        ];
+        for (const [name, filename] of fixtures) {
+          const external = join(dir, "external", name);
+          mkdirSync(external, { recursive: true });
+          writeFileSync(join(external, filename), "keep");
+          symlinkSync(external, join(artifactDir, name), "dir");
+        }
+        const result = cleanOrphanArtifactDirs(dir, { targetSessionId: "orphan", minAgeMs: 0 });
+        assert.deepEqual(result.preservedForeignDirs, [artifactDir]);
+        for (const [name, filename] of fixtures) {
+          assert.equal(readFileSync(join(dir, "external", name, filename), "utf8"), "keep");
+          assert.equal(existsSync(join(artifactDir, name)), true);
+        }
+        // A symlinked artifacts root must not authorize cleanup of another tree.
+        writeArtifactOwnershipMarker(artifactDir, "orphan");
+        assert.equal(findOrphanArtifactDirs(dir, { minAgeMs: 0 }).length, 1);
+        const redirected = join(dir, "redirected");
+        mkdirSync(redirected);
+        symlinkSync(join(dir, "artifacts"), join(redirected, "artifacts"), "dir");
+        assert.deepEqual(findOrphanArtifactDirs(redirected, { minAgeMs: 0 }), []);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+
     it("preserves foreign files and hidden custom content in orphan artifact directories", () => {
       withTempDir((tDir) => {
         const parentDeadId = "parent-with-foreign-data";
@@ -1860,7 +1922,494 @@ describe("settings page model filtering", () => {
     const models = ["openai/gpt-5", "anthropic/claude-sonnet", "openrouter/z-ai/glm-5.3"];
     assert.deepEqual(regexFilterModels(models, "^(openai|anthropic)/").matches, models.slice(0, 2));
     assert.deepEqual(regexFilterModels(models, "GLM").matches, [models[2]]);
-    assert.match(regexFilterModels(models, "[").error ?? "", /Invalid regular expression/);
+    assert.match(regexFilterModels(models, "[").error ?? "", /Invalid regex.*clear the search/);
+  });
+});
+
+describe("tabbed subagent settings", () => {
+  async function withSettingsUi(
+    run: (ui: {
+      component: Component;
+      render: (width?: number) => string;
+      configState: ReturnType<typeof createSubagentsConfigState>;
+      configPath: string;
+      backends: string[];
+      statusChanges: boolean[];
+      closed: () => boolean;
+      renderRequests: () => number;
+      deps: SubagentSettingsDeps;
+      context: any;
+    }) => void | Promise<void>,
+    agents = ["scout", "worker"],
+  ) {
+    await withTempDir(async (dir) => {
+      initTheme("dark", false);
+      const configPath = join(dir, "config.json");
+      const configState = createSubagentsConfigState(DEFAULT_SUBAGENTS_CONFIG, configPath);
+      const backends: string[] = [];
+      const statusChanges: boolean[] = [];
+      const theme = {
+        fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+      };
+      let component!: Component;
+      let finish!: () => void;
+      let closed = false;
+      let renderRequests = 0;
+      const ctx = {
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async confirm() { return true; },
+          custom(factory: any) {
+            return new Promise<void>((resolve) => {
+              finish = () => { closed = true; resolve(); };
+              component = factory({ requestRender: () => { renderRequests++; } }, theme, {}, finish);
+            });
+          },
+        },
+      } as any;
+      const deps: SubagentSettingsDeps = {
+        discoverAgents: () => agents.map((name) => ({ name })),
+        markdownDefaults: () => ({ model: "test/a", thinking: "medium" }),
+        registryModels: () => ["test/a", "test/b"],
+        toolCatalog: () => [{ name: "read" }, { name: "bash" }],
+        skillCatalog: () => [],
+        parentActiveTools: () => ["read", "bash"],
+        modelSupportsReasoning: () => true,
+        configState,
+        setBackendPreference: (backend) => { backends.push(backend); },
+        setStatusEnabled: (enabled) => { statusChanges.push(enabled); },
+        sessionDirs: () => null,
+        runningSessionFiles: () => [],
+        artifactDirFor: (_sessionDir, _sessionId) => dir,
+      };
+      const showing = showSubagentSettings(ctx, deps);
+      try {
+        await run({
+          component,
+          render: (width = 100) => component.render(width).join("\n").replace(/\x1b\[[0-9;]*m/g, ""),
+          configState, configPath, backends, statusChanges,
+          closed: () => closed,
+          renderRequests: () => renderRequests,
+          deps, context: ctx,
+        });
+      } finally {
+        finish();
+        await showing;
+      }
+    });
+  }
+
+  it("separates panels without writing config on tab switches or renders", async () => {
+    await withSettingsUi(({ component, render, configPath, renderRequests }) => {
+      assert.match(render(), /\[Agents\]  General/);
+      assert.match(render(), /Search agents/);
+      assert.match(render(), /scout/);
+      assert.match(render(), /worker/);
+      assert.doesNotMatch(render(), /Launch surface|Status widget|Orphan cleanup/);
+      component.handleInput!("\t");
+      assert.match(render(), /Agents  \[General\]/);
+      assert.match(render(), /Launch surface\s+Automatic \(/);
+      assert.match(render(), /Status widget\s+On/);
+      assert.match(render(), /Orphan cleanup/);
+      assert.doesNotMatch(render(), /scout|worker/);
+      assert.equal(render(), render(), "rendering must not accumulate labels");
+      component.handleInput!("\x1b[Z");
+      assert.match(render(), /\[Agents\]  General/);
+      assert.equal(existsSync(configPath), false);
+      assert.ok(renderRequests() >= 2);
+    });
+  });
+
+  it("cycles panels with horizontal arrows and Tab / Shift+Tab without saving config", async () => {
+    await withSettingsUi(({ component, render, configPath }) => {
+      const input = (data: string) => component.handleInput!(data);
+      assert.match(render(), /←→ Panel/);
+      assert.match(render(), /Tab\/Shift\+Tab Panel/);
+      input("\x1b[C"); // next: General
+      assert.match(render(), /Agents  \[General\]/);
+      input("\x1b[C"); // wrap: Agents
+      assert.match(render(), /\[Agents\]  General/);
+      input("\x1b[D"); // previous wraps: General
+      assert.match(render(), /Agents  \[General\]/);
+      input("\x1b[D");
+      assert.match(render(), /\[Agents\]  General/);
+      input("\t");
+      assert.match(render(), /Agents  \[General\]/);
+      input("\x1b[Z");
+      assert.match(render(), /\[Agents\]  General/);
+      input("\x02"); // Ctrl+B remains a cursor binding, not a panel shortcut
+      assert.match(render(), /\[Agents\]  General/);
+      assert.equal(existsSync(configPath), false);
+    });
+  });
+
+  it("keeps horizontal arrows with nonempty searches, even at cursor boundaries", async () => {
+    await withSettingsUi(({ component, render, configPath }) => {
+      const input = (data: string) => component.handleInput!(data);
+      for (const char of "sco") input(char);
+      assert.match(render(), /←→ Cursor/);
+      assert.doesNotMatch(render(), /←→ Panel/);
+      input("\x01"); input("\x1b[D"); // beginning of query
+      assert.match(render(), /\[Agents\]  General/);
+      input("\x05"); input("\x1b[C"); // end of query
+      assert.match(render(), /\[Agents\]  General/);
+      input("\x1b[D"); input("x");
+      assert.match(render(), /scxo/);
+      input("\x1b[C"); input("y");
+      assert.match(render(), /scxoy/);
+      input("\t"); input("\x1b[D"); // switching from General preserves query
+      assert.match(render(), /\[Agents\]  General/);
+      assert.match(render(), /scxoy/);
+      input("\x15"); // clear the query: arrows can switch panels again
+      assert.match(render(), /←→ Panel/);
+      input("\x1b[C");
+      assert.match(render(), /Agents  \[General\]/);
+      assert.equal(existsSync(configPath), false);
+    });
+  });
+
+  it("preserves selection and agent search across panel switches", async () => {
+    await withSettingsUi(({ component, render, statusChanges }) => {
+      const input = (data: string) => component.handleInput!(data);
+      input("\x1b[B"); // worker
+      input("\t");
+      input("\x1b[B"); // status widget
+      input("\t");
+      input("\r");
+      assert.match(render(), /Agents › worker/);
+      input("\x1b");
+      input("\t");
+      input("\r"); // direct toggle, still on General
+      assert.deepEqual(statusChanges, [false]);
+      assert.match(render(), /Status widget\s+Off/);
+      input("\t");
+      for (const char of "sco") input(char);
+      assert.match(render(), /scout/);
+      assert.doesNotMatch(render(), /worker/);
+      input("\t"); input("\t");
+      assert.match(render(), /sco/);
+      assert.match(render(), /1 of 2 agents/);
+      assert.doesNotMatch(render(), /worker/);
+    });
+  });
+
+  it("shows breadcrumbs instead of inactive tabs and Escape returns one level", async () => {
+    await withSettingsUi(({ component, render, closed }) => {
+      const input = (data: string) => component.handleInput!(data);
+      input("\r");
+      assert.match(render(), /Agents › scout/);
+      assert.doesNotMatch(render(), /\[Agents\]|General|Tab Panel/);
+      for (const key of ["\t", "\x1b[Z", "\x1b[D", "\x1b[C"]) input(key);
+      assert.match(render(), /Agents › scout/);
+      input("\r");
+      assert.match(render(), /Agents › scout › Model/);
+      assert.match(render(), /Search models \(regex\)/);
+      for (const key of ["\t", "\x1b[Z", "\x1b[D", "\x1b[C"]) input(key);
+      assert.match(render(), /Agents › scout › Model/);
+      assert.doesNotMatch(render(), /←→ Panel|Shift\+Tab Panel/);
+      input("ab"); input("\x1b[D"); input("x");
+      assert.match(render(), /axb/);
+      input("\x1b");
+      assert.match(render(), /Agents › scout\n/);
+      input("\x1b");
+      assert.match(render(), /\[Agents\]  General/);
+      assert.equal(closed(), false);
+      input("\t");
+      assert.match(render(), /Agents  \[General\]/);
+      input("\x1b");
+      assert.equal(closed(), true);
+    });
+  });
+
+  it("persists edits while staying on the agent page, then resets both overrides", async () => {
+    await withSettingsUi(({ component, render, configState, configPath, backends, statusChanges }) => {
+      const input = (data: string) => component.handleInput!(data);
+      input("\r"); input("\r");
+      input("\x1b[B"); input("\r"); // model test/b
+      assert.equal(configState.get().agents.scout.model, "test/b");
+      assert.match(render(), /Agents › scout\n/);
+      assert.match(render(), /Model\s+test\/b/);
+      assert.match(render(), /Source: Custom override/);
+      assert.match(render(), /Thinking\s+medium/);
+      input("\x1b[B"); // focus thinking
+      assert.match(render(), /Source: Agent default/);
+      input("\r"); // thinking picker
+      input("\x1b[B"); input("\r"); // off
+      assert.equal(configState.get().agents.scout.thinking, "off");
+      assert.match(render(), /Agents › scout\n/);
+      assert.match(render(), /Thinking\s+off/);
+      assert.match(render(), /Source: Custom override/);
+      input("\x1b"); input("\t");
+      input("\r");
+      input("\x1b[B"); input("\x1b[B"); input("\x1b[B");
+      input("\r"); // background
+      input("\x1b[B"); input("\r"); // status toggle
+      const saved = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.deepEqual(saved.agents.scout, { model: "test/b", thinking: "off" });
+      assert.equal(saved.multiplexing.backend, "background");
+      assert.equal(saved.status.enabled, false);
+      assert.deepEqual(backends, ["background"]);
+      assert.deepEqual(statusChanges, [false]);
+      input("\t"); input("\r");
+      for (let i = 0; i < 6; i++) input("\x1b[B"); // Reset is the final detail row.
+      input("\r");
+      assert.equal(configState.get().agents.scout, undefined);
+      assert.match(render(), /Agents › scout\n/);
+      assert.match(render(), /Already using agent defaults/);
+      assert.match(render(), /Model\s+test\/a/);
+      assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).agents, {});
+    });
+  });
+
+  it("aligns agent model and thinking columns across different values and search matches", async () => {
+    await withSettingsUi(({ component, render, deps }) => {
+      const values: Record<string, { model: string; thinking: string }> = {
+        scout: { model: "provider/short", thinking: "high" },
+        worker: { model: "provider/a-much-longer-model-name", thinking: "max" },
+        "研究员": { model: "provider/medium", thinking: "off" },
+      };
+      deps.markdownDefaults = (name) => values[name];
+      for (const width of [40, 80]) {
+        const rows = render(width).split("\n").filter((line) => /(?:scout|worker|研究员)\s+\S+.*(?:high|max|off)$/.test(line));
+        assert.equal(rows.length, 3);
+        for (const row of rows) {
+          assert.match(row, /(?:scout|worker|研究员)\s{4,}\S/);
+          assert.match(row, /\S\s{4,}(?:high|max|off)$/);
+        }
+        const modelColumns = rows.map((line) => {
+          const match = /(?:scout|worker|研究员)\s+(\S+)/.exec(line)!;
+          return visibleWidth(line.slice(0, match.index + match[0].length - match[1].length));
+        });
+        const thinkingColumns = rows.map((line) => {
+          const match = /(?:high|max|off)$/.exec(line)!;
+          return visibleWidth(line.slice(0, match.index));
+        });
+        assert.equal(new Set(modelColumns).size, 1, rows.join("\n"));
+        assert.equal(new Set(thinkingColumns).size, 1, rows.join("\n"));
+        component.handleInput!("s");
+        const filtered = render(width).split("\n").find((line) => /scout\s+.*high$/.test(line))!;
+        assert.equal(visibleWidth(filtered.slice(0, filtered.lastIndexOf("high"))), thinkingColumns[0]);
+        component.handleInput!("\x15");
+      }
+    }, ["scout", "worker", "研究员"]);
+  });
+
+  it("clearly separates and aligns general setting names and values", async () => {
+    await withSettingsUi(({ component, render }) => {
+      component.handleInput!("\t");
+      for (const width of [40, 80]) {
+        const rows = render(width).split("\n").filter((line) => /(?:Launch surface|Status widget|Orphan cleanup)\s{4,}/.test(line));
+        assert.equal(rows.length, 3);
+        const columns = rows.map((line) => {
+          const value = /Auto(?:matic)? \(|On$|No session$/.exec(line)!;
+          return visibleWidth(line.slice(0, value.index));
+        });
+        assert.equal(new Set(columns).size, 1, rows.join("\n"));
+        assert.doesNotMatch(render(width), /[│|]/);
+        assert.match(rows[0], width === 40 ? /\s{4,}Auto \(/ : /\s{4,}Automatic \(/);
+        assert.match(rows[1], /\s{4,}On$/);
+        assert.match(rows[2], /\s{4,}No session$/);
+        assert.doesNotMatch(rows[0], /→ (?:Herdr|Background|tmux)/);
+      }
+    });
+  });
+
+  it("shows the inherited model for a thinking-only override, even at 40 columns", async () => {
+    await withSettingsUi(({ component, render, configState, deps }) => {
+      deps.markdownDefaults = () => ({ model: "openrouter/z-ai/glm-5.3", thinking: "medium" });
+      configState.update((draft) => { draft.agents.scout = { thinking: "max" }; });
+      const row = render(40).split("\n").find((line) => line.includes("→ scout"))!;
+      assert.match(row, /glm.*max/);
+      component.handleInput!("\r");
+      assert.match(render(), /Model\s+openrouter\/z-ai\/glm-5.3/);
+      assert.match(render(), /Source: Agent default/);
+      assert.match(render(), /Thinking\s+max/);
+      component.handleInput!("\x1b[B");
+      assert.match(render(), /Source: Custom override/);
+    });
+  });
+
+  it("explains missing defaults and non-reasoning models without opening a misleading picker", async () => {
+    await withSettingsUi(({ component, render, deps, configState }) => {
+      deps.markdownDefaults = () => ({});
+      component.handleInput!("\r");
+      assert.match(render(), /Model\s+Pi default/);
+      assert.match(render(), /Thinking\s+Pi default/);
+      component.handleInput!("\x1b");
+      deps.markdownDefaults = () => ({ model: "test/a", thinking: "high" });
+      deps.modelSupportsReasoning = () => false;
+      component.handleInput!("\r");
+      component.handleInput!("\x1b[B");
+      component.handleInput!("\r");
+      assert.match(render(), /Agents › scout\n/);
+      assert.match(render(), /Thinking\s+off/);
+      assert.match(render(), /does not support reasoning/);
+      assert.deepEqual(configState.get().agents, {});
+    });
+  });
+
+  it("gives regex errors and no-match searches a recovery path without changing config", async () => {
+    await withSettingsUi(({ component, render, configPath }) => {
+      const input = (data: string) => component.handleInput!(data);
+      for (const char of "missing") input(char);
+      assert.match(render(), /No matching agents.*change the search/);
+      input("\r"); input("\x1b[B");
+      assert.equal(existsSync(configPath), false);
+      input("\x15"); // clear query
+      input("\r"); input("\r");
+      input("[");
+      assert.match(render(), /Invalid regex.*clear the search/);
+      assert.doesNotMatch(render(), /No matching commands/);
+      input("\r");
+      assert.equal(existsSync(configPath), false);
+      input("\x15");
+      assert.match(render(), /test\/a/);
+      input("missing");
+      assert.match(render(), /No matching models.*change the search/);
+      input("\x1b");
+      assert.match(render(), /Agents › scout\n/);
+    });
+  });
+
+  it("supports inset mouse coordinates, direct toggles, and clicks on compact detail rows", async () => {
+    await withSettingsUi(({ component, render, statusChanges }) => {
+      const click = (x: number, y: number, width = 100) => component.handleMouse!({
+        type: "click", button: "left", x, y, screenX: x, screenY: y,
+        width, height: 40, shift: false, alt: false, ctrl: false,
+      } satisfies TuiMouseEvent);
+      assert.equal(click(13, 2)?.handled, true);
+      assert.match(render(), /Agents  \[General\]/);
+      assert.equal(click(3, 5)?.handled, true);
+      assert.deepEqual(statusChanges, [false]);
+      assert.match(render(), /Status widget\s+Off/);
+      click(3, 4); // launch surface
+      assert.match(render(), /General › Launch surface/);
+      click(3, 2); // breadcrumb is not an active tab
+      assert.match(render(), /General › Launch surface/);
+      component.handleInput!("\x1b");
+      assert.equal(click(3, 2)?.handled, true);
+      assert.match(render(), /\[Agents\]  General/);
+      click(3, 7); // first agent after search label/input/spacer
+      const thinkingRow = render(40).split("\n").findIndex((line) => line.includes("Thinking"));
+      assert.equal(click(3, thinkingRow, 40)?.handled, true); // Only the compact field row is selectable.
+      assert.match(render(), /Agents › scout › Thinking/);
+    });
+  });
+
+  it("forwards focus to active search inputs, including nested model pickers", async () => {
+    await withSettingsUi(({ component }) => {
+      const focusable = component as Component & { focused: boolean };
+      focusable.focused = true;
+      assert.ok(component.render(80).join("\n").includes(CURSOR_MARKER));
+      component.handleInput!("\r");
+      assert.ok(!component.render(80).join("\n").includes(CURSOR_MARKER));
+      component.handleInput!("\r");
+      assert.ok(component.render(80).join("\n").includes(CURSOR_MARKER));
+      focusable.focused = false;
+      assert.ok(!component.render(80).join("\n").includes(CURSOR_MARKER));
+    });
+  });
+
+  it("keeps the help area and footer stable between general rows", async () => {
+    await withSettingsUi(({ component }) => {
+      component.handleInput!("\t");
+      const initialHeight = component.render(40).length;
+      component.handleInput!("\x1b[B");
+      assert.equal(component.render(40).length, initialHeight);
+      component.handleInput!("\x1b[B");
+      assert.equal(component.render(40).length, initialHeight);
+      assert.match(component.render(40).join("\n"), /Esc Close/);
+    });
+  });
+
+  it("bounds rendering at narrow widths, including long names and model IDs", async () => {
+    await withSettingsUi(({ component, deps }) => {
+      deps.markdownDefaults = () => ({ model: "provider/a-very-long-model-name-with-extra-版本", thinking: "medium" });
+      const check = () => {
+        for (const width of [1, 4, 18, 40, 80, 100]) {
+          for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width, line);
+          component.invalidate();
+        }
+      };
+      check();
+      component.handleInput!("\r"); check();
+      component.handleInput!("\r"); check();
+      component.handleInput!("\x1b"); component.handleInput!("\x1b");
+      component.handleInput!("\t"); check();
+    }, ["研究助手-with-a-very-long-name"]);
+  });
+
+  it("gives an empty agent list a useful next step", async () => {
+    await withSettingsUi(({ component, render }) => {
+      assert.match(render(), /No agents found.*Add an agent definition/);
+      component.handleInput!("\r");
+      component.handleInput!("\x1b[B");
+      assert.match(render(), /No agents found/);
+      component.handleInput!("\t");
+      assert.match(render(), /Launch surface/);
+    }, []);
+  });
+
+  it("keeps orphan artifacts intact when confirmation is cancelled", async () => {
+    await withSettingsUi(async ({ component, render, configPath, deps, context }) => {
+      const dir = dirname(configPath);
+      const artifactDir = join(dir, "artifacts", "orphan");
+      mkdirSync(artifactDir, { recursive: true });
+      writeArtifactOwnershipMarker(artifactDir, "orphan");
+      writeFileSync(join(artifactDir, "subagent-registry.json"), "{}");
+      deps.sessionDirs = () => ({ sessionDir: dir, sessionId: "current" });
+      context.ui.confirm = async () => false;
+      component.handleInput!("\t");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\r"); component.handleInput!("\r");
+      await Promise.resolve();
+      assert.equal(existsSync(join(artifactDir, "subagent-registry.json")), true);
+      assert.match(render(), /General › Orphan cleanup/);
+      component.handleInput!("\x1b");
+      assert.match(render(), /Agents  \[General\]/);
+    });
+  });
+
+  it("explains unavailable cleanup and lets Enter return to General", async () => {
+    await withSettingsUi(({ component, render }) => {
+      component.handleInput!("\t");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\r");
+      assert.match(render(), /Open a persistent session/);
+      component.handleInput!("\r");
+      assert.match(render(), /Agents  \[General\]/);
+    });
+  });
+
+  it("deletes only the confirmed orphan directory and preserves foreign files", async () => {
+    await withSettingsUi(async ({ component, render, configPath, deps, context }) => {
+      const dir = dirname(configPath);
+      for (const id of ["orphan-a", "orphan-b"]) {
+        const artifactDir = join(dir, "artifacts", id);
+        mkdirSync(artifactDir, { recursive: true });
+        writeArtifactOwnershipMarker(artifactDir, id);
+        writeFileSync(join(artifactDir, "subagent-registry.json"), "{}");
+        writeFileSync(join(artifactDir, "notes.txt"), "keep");
+      }
+      deps.sessionDirs = () => ({ sessionDir: dir, sessionId: "current" });
+      let confirmation = "";
+      context.ui.confirm = async (_title: string, message: string) => { confirmation = message; return true; };
+      component.handleInput!("\t");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\r");
+      assert.match(render(), /orphan-a/);
+      assert.match(render(), /orphan-b/);
+      component.handleInput!("\r");
+      await Promise.resolve();
+      assert.match(confirmation, /only in orphan-a/);
+      assert.equal(existsSync(join(dir, "artifacts", "orphan-a", "subagent-registry.json")), false);
+      assert.equal(existsSync(join(dir, "artifacts", "orphan-a", "notes.txt")), true);
+      assert.equal(existsSync(join(dir, "artifacts", "orphan-b", "subagent-registry.json")), true);
+      assert.match(render(), /Agents  \[General\]/);
+    });
   });
 });
 

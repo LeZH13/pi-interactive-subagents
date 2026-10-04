@@ -1,10 +1,10 @@
 /**
  * Unified subagent configuration: status widget, surface backend preference,
- * and per-agent model/thinking overrides.
+ * and per-agent launch overrides.
  *
  * The durable store is `<agentDir>/extensions/pi-interactive-subagents/config.json`,
  * edited via `/subagent-settings` (live-apply + immediate atomic write) and read at
- * spawn/resume time. Package-local `config.json` is not used. Every accessor tolerates
+ * new-spawn time (resumes replay their original sandbox snapshot). Package-local `config.json` is not used. Every accessor tolerates
  * a missing file or legacy content: absent keys fall back to defaults and the legacy
  * `picker` key is ignored.
  */
@@ -32,6 +32,12 @@ export function defaultSubagentsConfigPath(): string {
 export type AgentOverride = {
   model?: string;
   thinking?: string;
+  /** Undefined uses the profile; an empty array explicitly grants nothing. */
+  tools?: string[];
+  skills?: string[];
+  subagentAgents?: string[];
+  /** Undefined uses the profile, "inherit" uses the parent model, null disables retry. */
+  modelFallback?: string | null;
 };
 
 export interface SubagentsConfig {
@@ -81,6 +87,34 @@ function rejectUnsupportedKeys(
   if (unsupported.length > 0) {
     throw invalid(source, `${field} has unsupported key(s): ${unsupported.join(", ")}`);
   }
+}
+
+function optionalStringArray(value: unknown, source: string, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
+    throw invalid(source, `${field} must be an array of strings`);
+  }
+  return [...new Set(value.map((entry: string) => entry.trim()).filter(Boolean))];
+}
+
+/** Validate and normalize one override without losing explicit empty/disabled values. */
+export function parseAgentOverride(raw: unknown, source = "config.json", field = "agent"): AgentOverride {
+  const value = requireObject(raw, source, field);
+  rejectUnsupportedKeys(value, ["model", "thinking", "tools", "skills", "subagentAgents", "modelFallback"], source, field);
+  const override: AgentOverride = {};
+  for (const key of ["model", "thinking"] as const) {
+    const normalized = optionalTrimmedString(value[key], source, `${field}.${key}`);
+    if (normalized !== undefined) override[key] = normalized;
+  }
+  for (const key of ["tools", "skills", "subagentAgents"] as const) {
+    const normalized = optionalStringArray(value[key], source, `${field}.${key}`);
+    if (normalized !== undefined) override[key] = normalized;
+  }
+  const fallback = value.modelFallback === null
+    ? null
+    : optionalTrimmedString(value.modelFallback, source, `${field}.modelFallback`);
+  if (fallback !== undefined) override.modelFallback = fallback;
+  return override;
 }
 
 /**
@@ -135,13 +169,8 @@ export function parseSubagentsConfig(raw: unknown, source = "config.json"): Suba
     const agentsRaw = requireObject(root.agents, source, "agents");
     for (const [name, entry] of Object.entries(agentsRaw)) {
       if (entry === undefined || entry === null) continue;
-      const override = requireObject(entry, source, `agents.${name}`);
-      rejectUnsupportedKeys(override, ["model", "thinking"], source, `agents.${name}`);
-      const model = optionalTrimmedString(override.model, source, `agents.${name}.model`);
-      const thinking = optionalTrimmedString(override.thinking, source, `agents.${name}.thinking`);
-      if (model !== undefined || thinking !== undefined) {
-        agents[name] = { ...(model !== undefined ? { model } : {}), ...(thinking !== undefined ? { thinking } : {}) };
-      }
+      const override = parseAgentOverride(entry, source, `agents.${name}`);
+      if (Object.keys(override).length > 0) agents[name] = override;
     }
   }
 
@@ -189,11 +218,8 @@ export function loadSubagentsConfig(
 export function serializeSubagentsConfig(config: SubagentsConfig): string {
   const agents: Record<string, AgentOverride> = {};
   for (const [name, override] of Object.entries(config.agents)) {
-    const model = override.model?.trim();
-    const thinking = override.thinking?.trim();
-    if (model || thinking) {
-      agents[name] = { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
-    }
+    const normalized = parseAgentOverride(override, "config.json", `agents.${name}`);
+    if (Object.keys(normalized).length > 0) agents[name] = normalized;
   }
   return JSON.stringify(
     {
@@ -228,7 +254,7 @@ export function hasSubagentsConfigFile(configPath = defaultSubagentsConfigPath()
 /**
  * Shared mutable runtime state for the unified config. Created once per
  * extension load from disk; mutated live by `/subagent-settings` (each
- * mutation persists immediately) and read by spawn/resume resolution.
+ * mutation persists immediately) and read by new-spawn resolution.
  */
 export function createSubagentsConfigState(
   initial: SubagentsConfig,
@@ -254,13 +280,12 @@ export function createSubagentsConfigState(
       }
       // Drop empty overrides and normalize whitespace.
       for (const [name, override] of Object.entries(draft.agents)) {
-        const model = override.model?.trim();
-        const thinking = override.thinking?.trim();
-        if (!model && !thinking) delete draft.agents[name];
-        else draft.agents[name] = { ...(model ? { model } : {}), ...(thinking ? { thinking } : {}) };
+        const normalized = parseAgentOverride(override, configPath, `agents.${name}`);
+        if (Object.keys(normalized).length === 0) delete draft.agents[name];
+        else draft.agents[name] = normalized;
       }
+      writeSubagentsConfig(draft, configPath);
       current = draft;
-      writeSubagentsConfig(current, configPath);
     },
     replace(next: SubagentsConfig): void {
       current = structuredClone(next);

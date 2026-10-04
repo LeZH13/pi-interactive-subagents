@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { getPowerShellConfig, keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { basename, dirname, join, resolve } from "node:path";
@@ -56,6 +56,7 @@ import {
 import {
   createSubagentsConfigState,
   loadSubagentsConfig,
+  type AgentOverride,
   type SubagentsConfigState,
 } from "./config.ts";
 import { registerSubagentSettingsCommand } from "./settings.ts";
@@ -251,7 +252,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 /**
  * The full subagent lifecycle/spawning toolset registered by this extension.
  * An agent is granted these (and this extension is loaded into its child
- * process) only when its frontmatter declares a non-empty `subagent_agents`.
+ * process) only when its effective spawnable list is non-empty.
  */
 const SPAWNING_TOOLS = [
   "subagent",
@@ -261,7 +262,7 @@ const SPAWNING_TOOLS = [
 ] as const;
 
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
-const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"]);
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
 function getAgentConfigDir(): string {
@@ -276,8 +277,102 @@ function getAgentConfigDir(): string {
 // `--no-extensions` + an explicit `-e <path>` for it. Mirrors the legacy
 // `subagents` extension's `registerToolExtension` hook.
 const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
+const RUNTIME_TOOL_EXTENSIONS = new Map<string, string>();
+const UNRELOADABLE_RUNTIME_TOOLS = new Set<string>();
 
-/** Register (or re-register) a custom tool's backing extension file. */
+/** Freeze file sources relative to their registration context, never the child's cwd. */
+function absoluteToolExtensionPath(path: string, baseDir = process.cwd()): string {
+  return path.startsWith("builtin:") ? path : resolve(baseDir, path);
+}
+
+/** Capture reloadable sources, including tools currently inactive in the parent. */
+function captureRuntimeToolExtensions(pi: ExtensionAPI): void {
+  RUNTIME_TOOL_EXTENSIONS.clear();
+  UNRELOADABLE_RUNTIME_TOOLS.clear();
+  for (const tool of pi.getAllTools()) {
+    if (BUILTIN_TOOLS.has(tool.name) || (SPAWNING_TOOLS as readonly string[]).includes(tool.name) ||
+      (SUBAGENT_CONTROL_TOOLS as readonly string[]).includes(tool.name)) continue;
+    const sourcePath = tool.sourceInfo?.path;
+    const path = sourcePath && !sourcePath.startsWith("<")
+      ? absoluteToolExtensionPath(sourcePath, tool.sourceInfo.baseDir)
+      : undefined;
+    if (path && (path.startsWith("builtin:") || existsSync(path))) {
+      RUNTIME_TOOL_EXTENSIONS.set(tool.name, path);
+    } else {
+      UNRELOADABLE_RUNTIME_TOOLS.add(tool.name);
+    }
+  }
+}
+
+function getSubagentToolCatalog(pi: ExtensionAPI, cwd: string): Array<{ name: string; description?: string; available: boolean }> {
+  captureRuntimeToolExtensions(pi);
+  const builtinDescriptions: Record<string, string> = {
+    read: "Read file contents.", write: "Create or overwrite files.", edit: "Make precise file edits.",
+    bash: "Execute bash commands.", powershell: "Execute PowerShell commands on Windows.",
+    grep: "Search file contents.", find: "Find files by name.", ls: "List directory contents.",
+  };
+  let powerShellAvailable = false;
+  try {
+    getPowerShellConfig();
+    powerShellAvailable = true;
+  } catch {}
+  const catalog = new Map<string, { name: string; description?: string; available: boolean }>();
+  for (const tool of pi.getAllTools()) {
+    if ((SPAWNING_TOOLS as readonly string[]).includes(tool.name) ||
+      (SUBAGENT_CONTROL_TOOLS as readonly string[]).includes(tool.name)) continue;
+    catalog.set(tool.name, {
+      name: tool.name,
+      description: tool.description,
+      available: tool.name === "powershell" ? powerShellAvailable :
+        BUILTIN_TOOLS.has(tool.name) || !!getToolExtensionPath(tool.name, cwd),
+    });
+  }
+  // CLI restrictions can remove built-ins from the parent's registry; explicit
+  // child grants remain independent of that registry and of the parent's active set.
+  for (const name of BUILTIN_TOOLS) {
+    if (!catalog.has(name)) catalog.set(name, {
+      name, description: builtinDescriptions[name], available: name !== "powershell" || powerShellAvailable,
+    });
+  }
+  const bundledDescriptions: Record<string, string> = {
+    codemode: "Execute code over allowed tools; does not grant additional tools.",
+    tool_search: "Find registered tools by name or purpose.",
+    safe_bash: "Execute bash commands with dangerous-command filtering.",
+  };
+  for (const [name, description] of Object.entries(bundledDescriptions)) {
+    if (!catalog.has(name)) catalog.set(name, {
+      name, description, available: !!getToolExtensionPath(name, cwd),
+    });
+  }
+  for (const name of ["bash", "safe_bash"]) {
+    const tool = catalog.get(name)!;
+    tool.description = `${tool.description ?? builtinDescriptions[name] ?? ""} Granting native bash bypasses safe_bash's command filters.`.trim();
+  }
+  return [...catalog.values()];
+}
+
+function getSubagentSkillCatalog(pi: ExtensionAPI): Array<{ name: string; description?: string }> {
+  return pi.getCommands().filter((command) => command.source === "skill")
+    .map((command) => ({ name: command.name.replace(/^skill:/, ""), description: command.description }));
+}
+
+function snapshotToolExtensionPaths(tools: string[], cwd: string): string[] {
+  validateSubagentTools(tools, cwd);
+  return [...new Set(tools.map((tool) => getToolExtensionPath(tool, cwd))
+    .filter((path): path is string => !!path)
+    .map((path) => absoluteToolExtensionPath(path)))];
+}
+
+function validateSubagentTools(tools: string[], cwd: string): void {
+  for (const tool of tools) {
+    if (BUILTIN_TOOLS.has(tool) || (SUBAGENT_CONTROL_TOOLS as readonly string[]).includes(tool)) continue;
+    if (!getToolExtensionPath(tool, cwd)) {
+      throw new Error(`Cannot load subagent tool "${tool}": no reloadable backing extension. Register its source with registerToolExtension().`);
+    }
+  }
+}
+
+/** Register a backing source; relative file paths use the registration process's cwd. */
 export function registerToolExtension(name: string, extensionPath: string): void {
   if (BUILTIN_TOOLS.has(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a built-in pi tool`);
@@ -285,6 +380,7 @@ export function registerToolExtension(name: string, extensionPath: string): void
   if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
   }
+  extensionPath = absoluteToolExtensionPath(extensionPath);
   const existing = EXTRA_TOOL_EXTENSIONS.get(name);
   if (existing === extensionPath) return; // idempotent / reload-safe
   if (existing !== undefined) {
@@ -331,11 +427,18 @@ function getWebAccessExtensionPath(startDir: string = process.cwd()): string | u
  * Map a custom (non-built-in) tool name to the pi-extension file that
  * registers it. Used to build the child's `--extension` whitelist after
  * `--no-extensions` disables global discovery. Returns undefined for built-in
- * tools and for unknown names (which simply won't be granted).
+ * tools and for unknown names (which are refused when building a sandbox).
  */
 function getToolExtensionPath(tool: string, cwd?: string): string | undefined {
   if (BUILTIN_TOOLS.has(tool)) return undefined;
+  const runtimePath = RUNTIME_TOOL_EXTENSIONS.get(tool);
+  if (runtimePath && (runtimePath.startsWith("builtin:") || existsSync(runtimePath))) return runtimePath;
+  if (UNRELOADABLE_RUNTIME_TOOLS.has(tool)) {
+    const registered = EXTRA_TOOL_EXTENSIONS.get(tool);
+    return registered && (registered.startsWith("builtin:") || existsSync(registered)) ? registered : undefined;
+  }
   if (tool === "codemode") return "builtin:codemode";
+  if (tool === "tool_search") return "builtin:tool-search";
   // The spawning tools are registered by THIS extension.
   if ((SPAWNING_TOOLS as readonly string[]).includes(tool)) {
     return fileURLToPath(import.meta.url);
@@ -358,19 +461,20 @@ function getToolExtensionPath(tool: string, cwd?: string): string | undefined {
   // was disabled/removed but a project-local extension re-registered it).
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  const registered = EXTRA_TOOL_EXTENSIONS.get(tool);
+  return registered && (registered.startsWith("builtin:") || existsSync(registered)) ? registered : undefined;
 }
 
 /**
  * When this process was spawned as a restricted subagent, the parent pins the
- * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. `null` means no
- * restriction (top-level session, or an unrestricted child).
+ * set of agents it may itself spawn via PI_SUBAGENT_ALLOWED. An empty value
+ * denies spawning; `null` means no restriction (top-level session).
  */
 function getSubagentAllowlist(): Set<string> | null {
   const raw = process.env.PI_SUBAGENT_ALLOWED;
-  if (!raw) return null;
+  if (raw === undefined) return null;
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  return list.length > 0 ? new Set(list) : null;
+  return new Set(list);
 }
 
 function getBundledAgentsDir(): string {
@@ -391,6 +495,22 @@ function parseCommaList(value: string | undefined): string[] | undefined {
   if (value == null) return undefined;
   const list = value.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? list : undefined;
+}
+
+/** Resolve Pi-only profile overrides, preserving empty selections and parent restrictions. */
+function resolveEffectiveAgentLoadout(
+  profile: AgentDefaults | null,
+  override: AgentOverride | undefined,
+  parentTools: readonly string[],
+  parentAllowed: ReadonlySet<string> | null,
+): { tools: string[]; skills: string[] | undefined; subagentAgents: string[]; modelFallback: string | null | undefined } {
+  const requestedAgents = override?.subagentAgents ?? profile?.subagentAgents ?? [];
+  return {
+    tools: override?.tools ?? parseCommaList(profile?.tools) ?? [...parentTools],
+    skills: override?.skills ?? parseCommaList(profile?.skills),
+    subagentAgents: [...new Set(requestedAgents)].filter((name) => !parentAllowed || parentAllowed.has(name)),
+    modelFallback: override?.modelFallback !== undefined ? override.modelFallback : profile?.modelFallback,
+  };
 }
 
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
@@ -699,7 +819,10 @@ function resolveFallbackModelAndThinking(
   agentDefs: AgentDefaults | null,
   parent: ParentModelDefaults,
 ): { model: string | undefined; thinking: string | undefined } | undefined {
-  const rawFallback = agentDefs?.modelFallback?.trim();
+  const override = agentDefs?.cli !== "claude" ? configState.get().agents[params.agent] : undefined;
+  const rawFallback = (override?.modelFallback !== undefined
+    ? override.modelFallback
+    : agentDefs?.modelFallback)?.trim();
   if (!rawFallback) return undefined;
   const fallbackModel = rawFallback.toLowerCase() === "inherit"
     ? { model: parent.model, thinking: undefined }
@@ -1358,21 +1481,21 @@ const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
  * manually resumed or user-touched subagent unable to call ask_question.
  */
 function buildSubagentToolAllowlist(
-  effectiveTools?: string,
+  effectiveTools?: string | readonly string[],
   opts?: { grantSpawning?: boolean },
 ): string | null {
-  const requested = (effectiveTools ?? "")
-    .split(",")
+  const requested = (typeof effectiveTools === "string" ? effectiveTools.split(",") : effectiveTools ?? [])
     .map((tool) => tool.trim())
     .filter(Boolean);
 
   const grantSpawning = opts?.grantSpawning ?? false;
 
-  // No explicit tool restriction and no spawning grant → don't pass --tools at
-  // all (the child keeps its default toolset).
-  if (requested.length === 0 && !grantSpawning) return null;
+  // An absent historical selection remains unrestricted on replay. New Pi
+  // launches always supply an array, including [] for no optional tools.
+  if (!Array.isArray(effectiveTools) && requested.length === 0 && !grantSpawning) return null;
 
-  const allow = new Set(requested);
+  // Listing a spawning tool never grants delegation by itself.
+  const allow = new Set(requested.filter((tool) => !(SPAWNING_TOOLS as readonly string[]).includes(tool)));
   if (grantSpawning) {
     for (const tool of SPAWNING_TOOLS) allow.add(tool);
   }
@@ -1421,17 +1544,20 @@ function applySandboxToParts(
 
   // Default-deny: disable global extension discovery and re-enable only the
   // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  // belongs to an existing intentionally-unrestricted snapshot, replayed as-is.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const extPaths = new Set<string>();
-    for (const tool of loadout.toolAllowlist.split(",")) {
-      const extPath = getToolExtensionPath(tool, loadout.cwd ?? undefined);
-      if (extPath && (extPath.startsWith("builtin:") || existsSync(extPath))) extPaths.add(extPath);
-    }
-    for (const extPath of extPaths) {
+    // New snapshots pin backing sources, not just tool names: a fresh parent
+    // can replay custom tools even when it has not loaded their extensions.
+    const extPaths = loadout.toolExtensionPaths ?? snapshotToolExtensionPaths(
+      loadout.toolAllowlist.split(","), loadout.cwd ?? process.cwd(),
+    );
+    for (const extPath of new Set(extPaths)) {
+      if (!extPath.startsWith("builtin:") && !existsSync(extPath)) {
+        throw new Error(`Cannot replay subagent tool extension "${extPath}": the recorded source is unavailable.`);
+      }
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -1481,12 +1607,11 @@ function buildResumeCommandParts(
 }
 
 function buildPiPromptArgs(params: {
-  effectiveSkills?: string;
+  effectiveSkills?: string | readonly string[];
   taskDelivery: "direct" | "artifact";
   taskArg: string;
 }): string[] {
-  const skillPrompts = (params.effectiveSkills ?? "")
-    .split(",")
+  const skillPrompts = (typeof params.effectiveSkills === "string" ? params.effectiveSkills.split(",") : params.effectiveSkills ?? [])
     .map((s) => s.trim())
     .filter(Boolean)
     .map((skill) => `/skill:${skill}`);
@@ -1974,7 +2099,20 @@ export const __test__ = {
   },
   parseSubagentSpec,
   resolveEffectiveModelAndThinking,
+  resolveEffectiveAgentLoadout,
+  getSubagentAllowlist,
+  captureRuntimeToolExtensions,
+  clearToolExtensions: () => {
+    EXTRA_TOOL_EXTENSIONS.clear();
+    RUNTIME_TOOL_EXTENSIONS.clear();
+    UNRELOADABLE_RUNTIME_TOOLS.clear();
+  },
+  getSubagentToolCatalog,
+  getSubagentSkillCatalog,
+  validateSubagentTools,
+  snapshotToolExtensionPaths,
   getSubagentsConfigState: () => configState,
+  launchSubagent,
   resolveParentModelDefaults,
   resolveFallbackModelAndThinking,
   shouldRetryWithFallback,
@@ -2038,7 +2176,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: ExtensionContext,
-  options?: { surface?: string; parentLeafId?: string | null },
+  options?: { surface?: string; parentLeafId?: string | null; piTools?: readonly string[] },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -2049,8 +2187,14 @@ async function launchSubagent(
   const displayName = params.name ?? params.agent ?? "subagent";
   const { model: effectiveModel, thinking: effectiveThinking } =
     resolveEffectiveModelAndThinking(params, agentDefs);
-  const effectiveTools = agentDefs?.tools;
-  const effectiveSkills = agentDefs?.skills;
+  const piLoadout = agentDefs?.cli === "claude" ? undefined : resolveEffectiveAgentLoadout(
+    agentDefs,
+    configState.get().agents[params.agent],
+    options?.piTools ?? [],
+    getSubagentAllowlist(),
+  );
+  const effectiveTools = piLoadout?.tools;
+  const effectiveSkills = piLoadout?.skills;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -2060,6 +2204,11 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
+  const grantSpawning = !!piLoadout?.subagentAgents.length;
+  const toolAllowlist = piLoadout ? buildSubagentToolAllowlist(effectiveTools, { grantSpawning }) : null;
+  const toolExtensionPaths = toolAllowlist
+    ? snapshotToolExtensionPaths(toolAllowlist.split(","), targetCwdForSession)
+    : [];
 
   // Generate a deterministic session file path for this subagent scoped inside
   // the parent session's artifact directory (artifacts/<parentSessionId>/subagents/).
@@ -2118,9 +2267,8 @@ async function launchSubagent(
   // Build the task message
   // Only full-context fork mode inherits prior conversation state.
   // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  // An agent with a non-empty subagent_agents list is granted the spawning
-  // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  // An agent with a non-empty effective spawnable list is granted the spawning
+  // toolset, bounded by its parent's restriction (enforced via PI_SUBAGENT_ALLOWED).
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -2214,11 +2362,8 @@ async function launchSubagent(
       ? localAgentDir
       : process.env.PI_CODING_AGENT_DIR ?? null;
 
-  // Default-deny model: when an agent restricts its tools (or is granted the
-  // spawning toolset), we disable global extension discovery and re-enable only
-  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-  // restriction keep their full default toolset and all global extensions.
-  const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
+  // New Pi launches always pin optional tools plus the managed controls.
+  // An absent profile selection inherits the parent's active optional tools.
 
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
@@ -2226,11 +2371,12 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
+    toolExtensionPaths,
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
-    spawnable: agentDefs?.subagentAgents ?? null,
+    spawnable: piLoadout!.subagentAgents,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
@@ -2248,9 +2394,8 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
   }
 
-  if (grantSpawning && agentDefs?.subagentAgents) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
+  // Explicit empty denies delegation rather than inheriting a wider parent env.
+  envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(piLoadout!.subagentAgents.join(","))}`);
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(displayName)}`);
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
@@ -2655,14 +2800,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
         //   • a top-level session → every discoverable agent, i.e. exactly what
         //     `subagents_list` shows.
-        // Every spawn must name an agent in that set. The lone exception is a
-        // top-level `fork: true` clone, which has no role and inherits the
-        // caller's own already-trusted toolset. Without this guard a missing or
-        // unknown `agent` silently launches an unrestricted, full-toolset child.
+        // Every spawn must name a discoverable agent in that set; unknown or
+        // missing roles cannot bypass the profile sandbox.
         const allowlist = getSubagentAllowlist();
-        const permittedAgents = allowlist
-          ? [...allowlist]
-          : discoverAgentDefinitions().map((a) => a.name);
+        const permittedAgents = discoverAgentDefinitions().map((a) => a.name);
         const permittedSet = new Set(permittedAgents);
         const permittedList = permittedAgents.join(", ") || "(none)";
 
@@ -2717,6 +2858,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const parentDefaults = resolveParentModelDefaults(ctx, pi);
         const primarySelection = resolveEffectiveModelAndThinking(params, agentDefs);
         const fallbackSelection = resolveFallbackModelAndThinking(params, agentDefs, parentDefaults);
+        if (agentDefs?.cli !== "claude") captureRuntimeToolExtensions(pi);
+        const piTools = agentDefs?.cli === "claude" ? undefined : pi.getActiveTools();
 
         // This spawner session's artifact dir hosts its persistent name
         // registry (artifacts/<parentSessionId>/subagent-registry.json).
@@ -2745,7 +2888,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx, { parentLeafId: spawnParentLeafId });
+          running = await launchSubagent(params, ctx, { parentLeafId: spawnParentLeafId, piTools });
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -2796,7 +2939,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 thinking: fallbackSelection.thinking,
               };
               try {
-                finalRunning = await launchSubagent(retryParams, ctx, { parentLeafId: spawnParentLeafId });
+                finalRunning = await launchSubagent(retryParams, ctx, { parentLeafId: spawnParentLeafId, piTools });
                 finalRunning.abortController = watcherAbort;
                 startWidgetRefresh();
                 startStatusRefresh(pi);
@@ -3489,7 +3632,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // `/subagent-settings` — backend, status widget, per-agent model/thinking
+  // `/subagent-settings` — backend, status widget, per-agent launch
   // defaults, and orphan cleanup. Replaces `/subagent-mux` and
   // `/subagent-sessions` (both removed, no shims). The page is also the
   // model picker: per-agent overrides persist to the user agent config and outrank
@@ -3505,8 +3648,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       return {
         model: split.model,
         thinking: split.thinking ?? normalizeThinking(defs?.thinking),
+        tools: parseCommaList(defs?.tools),
+        skills: parseCommaList(defs?.skills),
+        subagentAgents: defs?.subagentAgents,
+        modelFallback: defs?.modelFallback,
+        cli: defs?.cli,
       };
     },
+    toolCatalog: () => getSubagentToolCatalog(pi, latestCtx?.cwd ?? process.cwd()),
+    skillCatalog: () => getSubagentSkillCatalog(pi),
+    parentActiveTools: () => pi.getActiveTools().filter((tool) =>
+      !(SPAWNING_TOOLS as readonly string[]).includes(tool) && !(SUBAGENT_CONTROL_TOOLS as readonly string[]).includes(tool)),
     registryModels: (preferred) => {
       const models: string[] = [];
       try {
