@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { getPowerShellConfig, keyHint } from "@earendil-works/pi-coding-agent";
 import { Type, type Static, type TSchema } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
@@ -60,6 +60,7 @@ import {
   type SubagentsConfigState,
 } from "./config.ts";
 import { registerSubagentSettingsCommand } from "./settings.ts";
+import { formatSubagentIdentity } from "./identity.ts";
 import {
   DEFAULT_STATUS_LINE_LIMIT,
   type StatusSnapshot,
@@ -1401,7 +1402,11 @@ function formatWidgetTelemetryLine(
   return { left, right };
 }
 
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, theme: ThinkingTheme): string[] {
+function renderSubagentWidgetLines(
+  agents: RunningSubagent[],
+  width: number,
+  theme: ThinkingTheme & Pick<Theme, "fg" | "bold">,
+): string[] {
   const count = agents.length;
   const title = "Subagents";
   const info = `${count} running`;
@@ -1410,10 +1415,10 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number, the
 
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
-    const agentTag = agent.agent && agent.name !== agent.agent ? ` (${agent.agent})` : "";
+    const identity = formatSubagentIdentity(agent.name, agent.agent, theme);
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
-    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    const left = ` ${icon} ${elapsed}  ${identity} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"
@@ -1446,7 +1451,7 @@ function updateWidget() {
 
   latestCtx.ui.setWidget(
     "subagent-status",
-    (_tui: any, theme: ThinkingTheme) => {
+    (_tui, theme) => {
       return {
         invalidate() {},
         render(width: number) {
@@ -1964,7 +1969,7 @@ async function handleSubagentInterrupt(
     const err = `Subagent "${running.name}" runs via the Claude Code CLI and cannot be interrupted from here. Close its pane manually.`;
     return {
       content: [{ type: "text" as const, text: err }],
-      details: { error: err, id: running.id, name: running.name },
+      details: { error: err, id: running.id, name: running.name, ...(running.agent ? { agent: running.agent } : {}) },
     };
   }
   if (running.interruption) {
@@ -1973,7 +1978,7 @@ async function handleSubagentInterrupt(
         type: "text" as const,
         text: `Interrupt already requested for subagent "${running.name}". Its pane is shutting down; the watcher will confirm removal.`,
       }],
-      details: { id: running.id, name: running.name, status: "interrupt_already_requested" },
+      details: { id: running.id, name: running.name, ...(running.agent ? { agent: running.agent } : {}), status: "interrupt_already_requested" },
     };
   }
 
@@ -1995,7 +2000,7 @@ async function handleSubagentInterrupt(
     const err = `Failed to interrupt subagent "${running.name}": ${message}`;
     return {
       content: [{ type: "text" as const, text: err }],
-      details: { error: err, id: running.id, name: running.name, status: "interrupt_failed" },
+      details: { error: err, id: running.id, name: running.name, ...(running.agent ? { agent: running.agent } : {}), status: "interrupt_failed" },
     };
   }
 
@@ -2006,7 +2011,7 @@ async function handleSubagentInterrupt(
         `Interrupt requested for subagent "${running.name}". Its turn was cancelled and its pane closed. ` +
         `The watcher will confirm removal and steer a concise interruption notice; no result will follow.`,
     }],
-    details: { id: running.id, name: running.name, status: "interrupt_requested" },
+    details: { id: running.id, name: running.name, ...(running.agent ? { agent: running.agent } : {}), status: "interrupt_requested" },
   };
 }
 
@@ -3040,16 +3045,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             ? partialArgs.name
             : agentName || "(unnamed)";
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        // Only show the agent tag separately when a distinct cosmetic name was given.
-        const agent =
-          agentName && name !== agentName ? theme.fg("dim", ` (${agentName})`) : "";
+        const identity = formatSubagentIdentity(name, agentName, theme);
         const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
           ? theme.fg("dim", ` in ${partialArgs.cwd}`)
           : "";
         let text =
           "○ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          agent +
+          theme.fg("dim", "subagent · ") +
+          identity +
           cwdHint;
 
         // Show a one-line task preview. renderCall is called repeatedly as the
@@ -3074,15 +3077,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const details = result.details as any;
         const name = details?.name ?? "(unnamed)";
         const agent = typeof details?.agent === "string" ? details.agent : "";
-        const agentTag = agent && name !== agent ? theme.fg("dim", ` (${agent})`) : "";
+        const identity = formatSubagentIdentity(name, agent, theme);
 
         // "Started" result — tool returned immediately
         if (details?.status === "started") {
           return new Text(
             theme.fg("accent", "⟳") +
               " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              agentTag +
+              theme.fg("dim", "subagent · ") +
+              identity +
               theme.fg("dim", " — started"),
             0,
             0,
@@ -3122,14 +3125,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as { id?: unknown; name?: unknown };
-        const target =
-          typeof partialArgs.id === "string" && partialArgs.id
-            ? partialArgs.id
-            : typeof partialArgs.name === "string" && partialArgs.name
-              ? partialArgs.name
-              : "(unknown)";
+        const id = typeof partialArgs.id === "string" && partialArgs.id ? partialArgs.id : "";
+        const nameArg = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "";
+        // Resolve by id (exact map key) when present, else by name; display the
+        // stable name handle rather than a cryptic per-launch id.
+        const running = id
+          ? runningSubagents.get(id)
+          : Array.from(runningSubagents.values()).find((r) => r.name === nameArg);
+        const target = running?.name ?? (id || nameArg || "(unknown)");
+        const agent = running?.agent;
+        const identity = formatSubagentIdentity(target, agent, theme);
         return new Text(
-          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — interrupt"),
+          "○ " + theme.fg("dim", "subagent · ") + identity + theme.fg("dim", " — interrupt"),
           0,
           0,
         );
@@ -3137,12 +3144,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderResult(result, _opts, theme) {
         const details = result.details as any;
+        // Render recorded identity so completed runs stay stable after removal or resume.
         const name = details?.name ?? details?.id ?? "subagent";
+        const agent = typeof details?.agent === "string" ? details.agent : "";
+        const identity = formatSubagentIdentity(name, agent, theme);
+        const channel = theme.fg("dim", "subagent · ");
         if (details?.status === "interrupt_requested") {
           return new Text(
             theme.fg("warning", "!") +
               " " +
-              theme.fg("toolTitle", theme.bold(name)) +
+              channel +
+              identity +
               theme.fg("dim", " — interrupt requested"),
             0,
             0,
@@ -3152,7 +3164,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return new Text(
             theme.fg("warning", "!") +
               " " +
-              theme.fg("toolTitle", theme.bold(name)) +
+              channel +
+              identity +
               theme.fg("dim", " — interrupt already requested"),
             0,
             0,
@@ -3247,16 +3260,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const target = args.name ?? (args.sessionPath ? basename(args.sessionPath) : "(unknown)");
-        let agentTag = "";
-        if (typeof args.name === "string" && args.name) {
-          const running = Array.from(runningSubagents.values()).find((r) => r.name === args.name);
-          const agent = running?.agent;
-          if (agent && args.name !== agent) {
-            agentTag = theme.fg("dim", ` (${agent})`);
-          }
-        }
+        const running = typeof args.name === "string" && args.name
+          ? Array.from(runningSubagents.values()).find((r) => r.name === args.name)
+          : undefined;
+        const identity = formatSubagentIdentity(target, running?.agent, theme);
         return new Text(
-          "○ " + theme.fg("toolTitle", theme.bold(target)) + agentTag + theme.fg("dim", " — message"),
+          "○ " + theme.fg("dim", "subagent · ") + identity + theme.fg("dim", " — message"),
           0,
           0,
         );
@@ -3266,14 +3275,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const details = result.details as any;
         const name = details?.name ?? (details?.status === "started" ? "Resume" : "subagent");
         const agent = typeof details?.agent === "string" ? details.agent : "";
-        const agentTag = agent && name !== agent ? theme.fg("dim", ` (${agent})`) : "";
+        const identity = formatSubagentIdentity(name, agent, theme);
 
         if (details?.status === "steered") {
           return new Text(
             theme.fg("success", "✓") +
               " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              agentTag +
+              theme.fg("dim", "subagent · ") +
+              identity +
               theme.fg("dim", " — message delivered"),
             0,
             0,
@@ -3284,8 +3293,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return new Text(
             theme.fg("accent", "⟳") +
               " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              agentTag +
+              theme.fg("dim", "subagent · ") +
+              identity +
               theme.fg("dim", " — resumed"),
             0,
             0,
@@ -3726,9 +3735,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const icon = failed
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
-        const agentTag = details.agent && name !== details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-        const modelTag = stats?.model ? theme.fg("dim", ` (${stats.model})`) : "";
-        const titleSegment = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag}${modelTag} ${theme.fg("dim", "—")} `;
+        const identity = formatSubagentIdentity(name, details.agent, theme);
+        const titleSegment = `${icon} ${theme.fg("dim", "subagent · ")}${identity} ${theme.fg("dim", "—")} `;
 
         // Success: icon already conveys "completed", so show "N tools · duration"
         // like the in-process extension. Failure: surface the failure reason.
@@ -3741,7 +3749,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           header = `${titleSegment}${theme.fg("dim", toolPart)}`;
         }
 
-        // Usage line: ↑in ↓out R… W… $cost · context-gauge (color-coded by %).
+        // Metadata line: model · ↑in ↓out R… W… $cost context-gauge (color-coded by %).
         let usageLine: string | null = null;
         if (stats) {
           const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
@@ -3753,7 +3761,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
             segs.push(coloredCtx);
           }
-          if (segs.length > 0) usageLine = segs.join(theme.fg("dim", " "));
+          const model = stats.model ? theme.fg("dim", stats.model) : "";
+          const usage = segs.join(theme.fg("dim", " "));
+          usageLine = [model, usage].filter(Boolean).join(theme.fg("dim", " · ")) || null;
         }
 
         const rawContent = typeof message.content === "string" ? message.content : "";
@@ -3857,11 +3867,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     return {
       render(width: number): string[] {
         const name = details.name ?? "subagent";
-        const agentTag = details.agent && name !== details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
+        const identity = formatSubagentIdentity(name, details.agent, theme);
         const bgFn = (text: string) => theme.bg("toolSuccessBg", text);
 
         const icon = theme.fg("accent", "?");
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks a question")}`;
+        const header = `${icon} ${theme.fg("dim", "subagent · ")}${identity} ${theme.fg("dim", "— asks a question")}`;
 
         const contentLines = [header];
 

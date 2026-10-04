@@ -1,3 +1,5 @@
+import { formatSubagentIdentity } from "./identity.ts";
+
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
@@ -398,13 +400,8 @@ function formatStalledDetail(snapshot: StatusSnapshot): string {
   return `stalled${duration}${detail}`;
 }
 
-function formatDisplayName(name: string, agent?: string): string {
-  const agentTag = agent && name !== agent ? ` (${agent})` : "";
-  return `${name}${agentTag}`;
-}
-
 export function formatStatusLine(name: string, snapshot: StatusSnapshot, agent?: string): string {
-  const boundedName = normalizeStatusName(formatDisplayName(name, agent));
+  const boundedName = normalizeStatusName(formatSubagentIdentity(name, agent));
 
   if (snapshot.kind === "starting") {
     const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
@@ -437,7 +434,7 @@ export function formatTransitionLine(
   transition: Exclude<SubagentStatusTransition, null>,
   agent?: string,
 ): string {
-  const boundedName = normalizeStatusName(formatDisplayName(name, agent));
+  const boundedName = normalizeStatusName(formatSubagentIdentity(name, agent));
 
   if (transition === "recovered") {
     const detail = snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);

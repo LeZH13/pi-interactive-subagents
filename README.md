@@ -13,12 +13,12 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux o
 ╭─ Subagents ───────────────────────────────────────────────────────────── 2 running ─╮
 │ ⟳ 00:23  scout                                                     active · bash 7s │
 │          ↳ ↑14k↓420  $0.008                            gemini-3.7-flash · 7.1%/1M │
-│ ○ 00:45  cleanup-design (worker)                                  waiting 2m · done │
+│ ○ 00:45  cleanup-design [worker]                                  waiting 2m · done │
 │          ↳ ↑39k↓1.6k  R12k  $0.042                        gpt-5.6-sol · 19.6%/200k │
 ╰─────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Agent badges appear only when the display name differs from the agent profile name. Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
+Agent profiles appear as dim `[worker]` badges only when the display name differs from the profile name (ignoring case). Transcript headers use `subagent · name [profile] — state`; completion model information appears on the metadata line instead of the header. Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
 Panes are kept evenly sized after every spawn and exit (debounced). The extension reads the tmux window dimensions and applies `even-horizontal` (equal columns) when columns are at least twice the row count (accounting for character cell aspect ratio), or `even-vertical` (equal rows) for portrait/square dimensions. Resizing alone does not trigger a rebalance; the new aspect ratio takes effect on the next spawn or exit.
 

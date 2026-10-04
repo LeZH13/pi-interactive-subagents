@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { formatSubagentIdentity } from "../pi-extension/subagents/identity.ts";
 
 // Tests run as top-level orchestrator tests; clear any inherited child subagent allowlist.
 delete process.env.PI_SUBAGENT_ALLOWED;
@@ -5604,6 +5605,8 @@ describe("subagent startup delay", () => {
 });
 const levels = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const thinkingTheme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
   getThinkingBorderColor: (level: string) => (text: string) => `\x1b[38;5;${levels.indexOf(level) + 1}m${text}\x1b[0m`,
 };
 
@@ -5690,7 +5693,7 @@ describe("subagents widget rendering", () => {
     const plain = lines.map(stripAnsi);
 
     assert.equal(lines.length, 4);
-    assert.match(plain[1], /⟳ 02:24  cleanup-design \(worker\)/);
+    assert.match(plain[1], /⟳ 02:24  cleanup-design \[worker\]/);
     assert.match(plain[1], /active · streaming 12s/);
     assert.match(plain[2], /^│ {10}↳ ↑39k↓1\.6k  R12k  \$0\.042/);
     assert.match(plain[2], /gpt-5\.6-sol · 19\.6%\/200k/);
@@ -5757,10 +5760,11 @@ describe("subagents widget rendering", () => {
       now,
     );
 
-    for (const width of [0, 1, 2, 8, 16]) {
+    for (const width of [0, 1, 2, 8, 16, 32, 48, 80]) {
       const lines = testApi.renderSubagentWidgetLines([{
         id: "a1",
-        name: "long-running-agent-name",
+        name: "long-running-界面-agent-name",
+        agent: "worker",
         task: "",
         surface: "s1",
         startTime: now - 5_000,
@@ -6567,6 +6571,28 @@ describe("subagent badge rendering and conciseness rules", () => {
     };
   }
 
+  it("shares identity formatting, omits duplicate profiles, and styles names separately from badges", () => {
+    assert.equal(formatSubagentIdentity("settings-controls", "worker"), "settings-controls [worker]");
+    assert.equal(formatSubagentIdentity("worker", "worker"), "worker");
+    assert.equal(formatSubagentIdentity("worker-2", "worker"), "worker-2 [worker]");
+    assert.equal(formatSubagentIdentity("Scout", "scout"), "Scout");
+    assert.equal(formatSubagentIdentity("scout", "SCOUT"), "scout");
+    assert.equal(formatSubagentIdentity("Scout-2", "scout"), "Scout-2 [scout]");
+    assert.equal(formatSubagentIdentity("settings-controls"), "settings-controls");
+    assert.equal(formatSubagentIdentity("settings-controls", ""), "settings-controls");
+
+    const theme = {
+      fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+      bold: (text: string) => `<bold>${text}</bold>`,
+    };
+    assert.equal(
+      formatSubagentIdentity("settings-controls", "worker", theme),
+      "<toolTitle><bold>settings-controls</bold></toolTitle><dim> [worker]</dim>",
+    );
+    assert.equal(formatSubagentIdentity("worker", "worker", theme), "<toolTitle><bold>worker</bold></toolTitle>");
+    assert.equal(formatSubagentIdentity("Scout", "scout", theme), "<toolTitle><bold>Scout</bold></toolTitle>");
+  });
+
   it("formatStatusLine and formatTransitionLine format badge when name !== agent and omit when same", () => {
     const statusState = createStatusState({ source: "pi", startTimeMs: 0 });
     const snapshot = classifyStatus(statusState, 60_000);
@@ -6574,19 +6600,19 @@ describe("subagent badge rendering and conciseness rules", () => {
 
     // Distinct name and agent: badge included
     const distinctLine = formatStatusLine("explore-codebase", snapshot, "scout");
-    assert.match(distinctLine, /^explore-codebase \(scout\) running 1m, stalled\./);
+    assert.match(distinctLine, /^explore-codebase \[scout\] running 1m, stalled\./);
 
     const distinctRecovered = formatTransitionLine("explore-codebase", snapshot, "recovered", "scout");
-    assert.match(distinctRecovered, /^explore-codebase \(scout\) running 1m, recovered;/);
+    assert.match(distinctRecovered, /^explore-codebase \[scout\] running 1m, recovered;/);
 
     // Identical name and agent: badge omitted (conciseness rule)
     const sameLine = formatStatusLine("scout", snapshot, "scout");
     assert.match(sameLine, /^scout running 1m, stalled\./);
-    assert.doesNotMatch(sameLine, /\(scout\)/);
+    assert.doesNotMatch(sameLine, /\[scout\]/);
 
     const sameRecovered = formatTransitionLine("scout", snapshot, "recovered", "scout");
     assert.match(sameRecovered, /^scout running 1m, recovered;/);
-    assert.doesNotMatch(sameRecovered, /\(scout\)/);
+    assert.doesNotMatch(sameRecovered, /\[scout\]/);
 
     // No agent supplied: no badge.
     const plainLine = formatStatusLine("scout", snapshot);
@@ -6596,13 +6622,14 @@ describe("subagent badge rendering and conciseness rules", () => {
   it("renderSubagentWidgetLines shows badge when distinct and omits when same", () => {
     const now = 1_000_000;
     const theme = {
+      ...createTheme(),
       getThinkingBorderColor: (_level: string) => (text: string) => text,
     };
     const statusState = createStatusState({ source: "pi", startTimeMs: now - 10_000 });
 
     const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
 
-    // Distinct: explore-codebase (scout)
+    // Distinct: explore-codebase [scout]
     const distinctLines = testApi.renderSubagentWidgetLines([{
       id: "a1",
       name: "explore-codebase",
@@ -6613,7 +6640,8 @@ describe("subagent badge rendering and conciseness rules", () => {
       sessionFile: "s1",
       statusState,
     }], 80, theme).map(stripAnsi);
-    assert.match(distinctLines[1], /explore-codebase \(scout\)/);
+    assert.match(distinctLines[1], /explore-codebase \[scout\]/);
+    assert.doesNotMatch(distinctLines.join("\n"), /subagent ·/, "labelled widgets do not repeat the transcript prefix");
 
     // Same: scout
     const sameLines = testApi.renderSubagentWidgetLines([{
@@ -6627,7 +6655,7 @@ describe("subagent badge rendering and conciseness rules", () => {
       statusState,
     }], 80, theme).map(stripAnsi);
     assert.match(sameLines[1], /scout /);
-    assert.doesNotMatch(sameLines[1], /scout \(scout\)/);
+    assert.doesNotMatch(sameLines[1], /scout \[scout\]/);
   });
 
   it("subagent tool renderResult displays badge when distinct and omits when same", () => {
@@ -6638,13 +6666,13 @@ describe("subagent badge rendering and conciseness rules", () => {
     assert.ok(subagentTool);
     const theme = createTheme();
 
-    // Distinct: explore-codebase (scout)
+    // Distinct: explore-codebase [scout]
     const distinctRendered = subagentTool.renderResult({
       content: [{ type: "text", text: "launched" }],
       details: { name: "explore-codebase", agent: "scout", status: "started" },
     }, {}, theme);
     const distinctText = distinctRendered.render(80).join("\n");
-    assert.match(distinctText, /explore-codebase \(scout\) — started/);
+    assert.match(distinctText, /subagent · explore-codebase \[scout\] — started/);
 
     // Same: scout
     const sameRendered = subagentTool.renderResult({
@@ -6652,8 +6680,8 @@ describe("subagent badge rendering and conciseness rules", () => {
       details: { name: "scout", agent: "scout", status: "started" },
     }, {}, theme);
     const sameText = sameRendered.render(80).join("\n");
-    assert.match(sameText, /scout — started/);
-    assert.doesNotMatch(sameText, /\(scout\)/);
+    assert.match(sameText, /subagent · scout — started/);
+    assert.doesNotMatch(sameText, /\[scout\]/);
   });
 
   it("subagent_message tool renderResult displays badge when distinct and omits when same", () => {
@@ -6669,30 +6697,71 @@ describe("subagent badge rendering and conciseness rules", () => {
       content: [{ type: "text", text: "steered" }],
       details: { name: "explore-codebase", agent: "scout", status: "steered" },
     }, {}, theme).render(80).join("\n");
-    assert.match(steeredDistinct, /explore-codebase \(scout\) — message delivered/);
+    assert.match(steeredDistinct, /subagent · explore-codebase \[scout\] — message delivered/);
 
     // Steered same
     const steeredSame = messageTool.renderResult({
       content: [{ type: "text", text: "steered" }],
       details: { name: "scout", agent: "scout", status: "steered" },
     }, {}, theme).render(80).join("\n");
-    assert.match(steeredSame, /scout — message delivered/);
-    assert.doesNotMatch(steeredSame, /\(scout\)/);
+    assert.match(steeredSame, /subagent · scout — message delivered/);
+    assert.doesNotMatch(steeredSame, /\[scout\]/);
 
     // Resumed distinct
     const resumedDistinct = messageTool.renderResult({
       content: [{ type: "text", text: "resumed" }],
       details: { name: "explore-codebase", agent: "scout", status: "started" },
     }, {}, theme).render(80).join("\n");
-    assert.match(resumedDistinct, /explore-codebase \(scout\) — resumed/);
+    assert.match(resumedDistinct, /subagent · explore-codebase \[scout\] — resumed/);
 
     // Resumed same
     const resumedSame = messageTool.renderResult({
       content: [{ type: "text", text: "resumed" }],
       details: { name: "scout", agent: "scout", status: "started" },
     }, {}, theme).render(80).join("\n");
-    assert.match(resumedSame, /scout — resumed/);
-    assert.doesNotMatch(resumedSame, /\(scout\)/);
+    assert.match(resumedSame, /subagent · scout — resumed/);
+    assert.doesNotMatch(resumedSame, /\[scout\]/);
+  });
+
+  it("subagent_interrupt renderers resolve by id but display name with agent badge", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+
+    const interruptTool = registeredTools.find((t) => t.name === "subagent_interrupt");
+    assert.ok(interruptTool);
+    const theme = createTheme();
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.set("abc123", { id: "abc123", name: "settings-controls", agent: "worker" });
+    try {
+      const callText = interruptTool.renderCall({ id: "abc123" }, theme).render(80).join("\n");
+      assert.match(callText, /subagent · settings-controls \[worker\] — interrupt/);
+      assert.doesNotMatch(callText, /abc123/);
+
+      const recordedResult = {
+        content: [{ type: "text", text: "interrupted" }],
+        details: { id: "abc123", name: "settings-controls", agent: "worker", status: "interrupt_requested" },
+      };
+      const renderResult = () => interruptTool.renderResult(recordedResult, {}, theme).render(80).join("\n");
+      const resultText = renderResult();
+      assert.match(resultText, /subagent · settings-controls \[worker\] — interrupt requested/);
+
+      // Recorded identity survives live-state changes and removal.
+      runningMap.set("abc123", { id: "abc123", name: "different-run", agent: "scout" });
+      assert.equal(renderResult(), resultText);
+      const idOnlyText = interruptTool.renderResult({
+        content: [], details: { id: "abc123", status: "interrupt_requested" },
+      }, {}, theme).render(80).join("\n");
+      assert.match(idOnlyText, /subagent · abc123 — interrupt requested/);
+      assert.doesNotMatch(idOnlyText, /different-run|\[scout\]/);
+      runningMap.delete("abc123");
+      assert.equal(renderResult(), resultText);
+
+      // Unknown id falls back to the raw id.
+      const fallbackText = interruptTool.renderCall({ id: "gone" }, theme).render(80).join("\n");
+      assert.match(fallbackText, /subagent · gone — interrupt/);
+    } finally {
+      runningMap.delete("abc123");
+    }
   });
 
   it("subagent_result renderer applies conciseness omission rule", () => {
@@ -6709,7 +6778,7 @@ describe("subagent badge rendering and conciseness rules", () => {
       content: "done",
       details: { name: "explore-codebase", agent: "scout", exitCode: 0, elapsed: 10 },
     }, { expanded: false }, theme).render(80).join("\n");
-    assert.match(distinctRendered, /explore-codebase \(scout\)/);
+    assert.match(distinctRendered, /subagent · explore-codebase \[scout\]/);
 
     // Same
     const sameRendered = rendererEntry.renderer({
@@ -6717,7 +6786,118 @@ describe("subagent badge rendering and conciseness rules", () => {
       details: { name: "scout", agent: "scout", exitCode: 0, elapsed: 10 },
     }, { expanded: false }, theme).render(80).join("\n");
     assert.match(sameRendered, /scout/);
-    assert.doesNotMatch(sameRendered, /scout \(scout\)/);
+    assert.doesNotMatch(sameRendered, /scout \[scout\]/);
+  });
+
+  it("keeps completion model information on the metadata line, including model-only stats", () => {
+    initTheme("dark", false);
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const theme = createTheme();
+    const stats = {
+      model: "provider/a-very-long-model-name",
+      toolCount: 12, inputTokens: 3200, outputTokens: 500,
+      cacheReadTokens: 0, cacheWriteTokens: 0, contextTokens: 0, cost: 0,
+    };
+
+    for (const exitCode of [0, 1]) {
+      const lines = renderer({
+        content: "done",
+        details: { name: "settings-controls", agent: "worker", exitCode, elapsed: 38, stats },
+      }, { expanded: false }, theme).render(160);
+      const headerIndex = lines.findIndex((line: string) => line.includes("subagent ·"));
+      const header = lines[headerIndex];
+      assert.match(header, /subagent · settings-controls \[worker\] —/);
+      assert.match(header, exitCode === 0 ? /12 tools · 38s/ : /failed \(exit 1\) · 38s/);
+      assert.doesNotMatch(header, /model-name/);
+      assert.match(lines[headerIndex + 1], /provider\/a-very-long-model-name · ↑3\.2k ↓500/);
+    }
+
+    const modelOnly = renderer({
+      content: "done",
+      details: { name: "worker", agent: "worker", elapsed: 1, stats: { ...stats, inputTokens: 0, outputTokens: 0 } },
+    }, { expanded: false }, theme).render(160);
+    const modelLine = modelOnly.find((line: string) => line.includes(stats.model));
+    assert.ok(modelLine);
+    assert.doesNotMatch(modelLine, / · /, "model-only metadata has no dangling separator");
+  });
+
+  it("question headers use the same identity and duplicate-profile omission", () => {
+    initTheme("dark", false);
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_question")!.renderer;
+    for (const expanded of [false, true]) {
+      for (const name of ["settings-controls", "worker"]) {
+        const text = renderer({
+          content: "question", details: { name, agent: "worker", question: "Which approach?" },
+        }, { expanded }, createTheme()).render(100).join("\n");
+        assert.ok(text.includes(`? subagent · ${formatSubagentIdentity(name, "worker")} — asks a question`));
+        assert.match(text, /Which approach\?/);
+        if (name === "worker") assert.doesNotMatch(text, /\[worker\]/);
+      }
+    }
+  });
+
+  it("wraps long transcript identities and models within narrow widths without dropping state", () => {
+    initTheme("dark", false);
+    const { api, registeredTools, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const theme = {
+      ...createTheme(),
+      fg: (_color: string, text: string) => `\x1b[2m${text}\x1b[0m`,
+      bold: (text: string) => `\x1b[1m${text}\x1b[0m`,
+    };
+    const name = "settings-controls-界面-refactoring-with-a-long-name";
+    const agent = "worker";
+    const model = "provider/a-very-long-model-name-with-a-version-suffix";
+    const subagent = registeredTools.find((tool) => tool.name === "subagent")!;
+    const interrupt = registeredTools.find((tool) => tool.name === "subagent_interrupt")!;
+    const message = registeredTools.find((tool) => tool.name === "subagent_message")!;
+    const result = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const question = registeredMessageRenderers.find((entry) => entry.name === "subagent_question")!.renderer;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    runningMap.set("narrow-run", { id: "narrow-run", name, agent });
+    try {
+      const cases = [
+        { component: subagent.renderCall({ name, agent, task: "Implement the controls" }, theme), state: "Implement the controls" },
+        { component: subagent.renderResult({ content: [], details: { name, agent, status: "started" } }, {}, theme), state: "started" },
+        { component: interrupt.renderCall({ id: "narrow-run" }, theme), state: "interrupt" },
+        ...["interrupt_requested", "interrupt_already_requested"].map((status) => ({
+          component: interrupt.renderResult({ content: [], details: { name, agent, status } }, {}, theme),
+          state: status.replaceAll("_", " "),
+        })),
+        { component: message.renderCall({ name, message: "Continue" }, theme), state: "message" },
+        ...["steered", "started"].map((status) => ({
+          component: message.renderResult({ content: [], details: { name, agent, status } }, {}, theme),
+          state: status === "steered" ? "message delivered" : "resumed",
+        })),
+      ];
+      for (const expanded of [false, true]) {
+        cases.push(
+          { component: result({
+            content: "Done", details: { name, agent, elapsed: 38, stats: {
+              model, toolCount: 12, inputTokens: 3200, outputTokens: 500,
+              cacheReadTokens: 0, cacheWriteTokens: 0, contextTokens: 0, cost: 0,
+            } },
+          }, { expanded }, theme), state: "12 tools · 38s" },
+          { component: question({ content: "question", details: { name, agent, question: "Which approach?" } }, { expanded }, theme), state: "asks a question" },
+        );
+      }
+      for (const width of [32, 48, 80, 32]) {
+        for (const { component, state } of cases) {
+          const lines = component.render(width);
+          for (const line of lines) assert.ok(visibleWidth(line) <= width, `${state}: line exceeded ${width} columns`);
+          const text = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "").replace(/\s/g, "");
+          assert.ok(text.includes(`subagent·${name}[worker]`), `${state}: identity was lost at width ${width}`);
+          assert.ok(text.includes(state.replace(/\s/g, "")), `${state}: state was lost at width ${width}`);
+          if (state === "12 tools · 38s") assert.ok(text.includes(model), "model remains available below the header");
+        }
+      }
+    } finally {
+      runningMap.delete("narrow-run");
+    }
   });
 
   it("headless resume propagates the agent and completes without leaking widget timers", { timeout: 5_000 }, async (t) => {
