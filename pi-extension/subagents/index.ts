@@ -3438,7 +3438,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       outputSchema: SubagentListOutputSchema,
 
       async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        const overrides = configState.get().agents;
+        const list = discoverAgentDefinitions().filter((agent) =>
+          !(overrides[agent.name]?.disableModelInvocation ?? agent.disableModelInvocation));
 
         if (list.length === 0) {
           return {
@@ -3969,6 +3971,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         modelFallback: defs?.modelFallback,
         maxConcurrent: defs?.maxConcurrent,
         maxConcurrentError: defs?.maxConcurrentError,
+        disableModelInvocation: defs?.disableModelInvocation,
         cli: defs?.cli,
       };
     },

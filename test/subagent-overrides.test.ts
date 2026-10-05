@@ -53,6 +53,27 @@ describe("persisted subagent launch overrides", () => {
     assert.equal(Object.hasOwn(parsed.agents.parent, "tools"), false);
   });
 
+  it("round-trips visibility overrides and rejects non-boolean values atomically", () => withTempDir((dir) => {
+    const path = join(dir, "config.json");
+    const parsed = parseSubagentsConfig({ agents: {
+      hidden: { disableModelInvocation: true }, visible: { disableModelInvocation: false }, inherited: { tools: [] },
+    } });
+    assert.deepEqual(parseSubagentsConfig(JSON.parse(serializeSubagentsConfig(parsed))), parsed);
+    assert.equal(Object.hasOwn(parsed.agents.inherited, "disableModelInvocation"), false);
+    const state = createSubagentsConfigState(parsed, path);
+    state.update((draft) => { draft.agents.hidden.disableModelInvocation = false; });
+    const saved = loadSubagentsConfig(path);
+    for (const value of [null, "true", "false", 0, 1, [], {}]) {
+      assert.throws(() => state.update((draft) => {
+        draft.agents.hidden.disableModelInvocation = value as any;
+      }), /agents.hidden.disableModelInvocation must be a boolean/);
+      assert.deepEqual(state.get(), saved);
+      assert.deepEqual(loadSubagentsConfig(path), saved);
+    }
+    state.update((draft) => { delete draft.agents.hidden.disableModelInvocation; });
+    assert.equal(loadSubagentsConfig(path).agents.hidden, undefined);
+  }));
+
   it("round-trips positive safe concurrency limits and explicit unlimited without inventing absent values", () => withTempDir((dir) => {
     const parsed = parseSubagentsConfig({ agents: {
       finite: { maxConcurrent: 3 }, unlimited: { maxConcurrent: null }, omitted: { tools: [] },

@@ -112,6 +112,66 @@ async function withUi(
 }
 
 describe("per-agent settings loadout controls", () => {
+  it("toggles visibility immediately, persists both boolean values, and keeps the agent in settings", async () => {
+    await withUi(async ({ click, focus, input, render, saved, state, reopen }) => {
+      click(/Visible to model\s+On/);
+      assert.equal(saved()?.disableModelInvocation, true);
+      assert.match(render(), /Visible to model\s+Off/);
+      assert.match(render(), /Source: Custom override/);
+      assert.match(render(), /explicit spawning by name still works/);
+      input(ESC);
+      assert.match(render(), /worker\*/);
+      input(ENTER);
+      click(/Visible to model\s+Off/);
+      assert.equal(saved()?.disableModelInvocation, false);
+      await reopen();
+      assert.match(render(), /worker\*/);
+      input(ENTER);
+      focus(/Visible to model\s+On/);
+      input(DELETE);
+      assert.equal(saved(), undefined);
+      assert.equal(state.get().agents.worker, undefined);
+      assert.match(render(), /Source: Agent default/);
+      assert.match(render(), /Visible to model\s+On/);
+    });
+  });
+
+  it("overrides a hidden profile default for either backend and reset restores it", async () => {
+    for (const cli of [undefined, "claude"]) {
+      await withUi(({ click, focus, input, render, saved }) => {
+        focus(/Visible to model\s+Off/);
+        assert.match(render(), /Source: Agent default/);
+        click(/Visible to model\s+Off/);
+        assert.deepEqual(saved(), { skills: [], disableModelInvocation: false });
+        assert.match(render(), /Visible to model\s+On/);
+        assert.doesNotMatch(render(), /Source: Custom override · Unsupported/);
+        input(" ");
+        assert.deepEqual(saved(), { skills: [], disableModelInvocation: true });
+        input(DELETE);
+        assert.deepEqual(saved(), { skills: [] });
+        assert.match(render(), /Visible to model\s+Off/);
+        click(/Visible to model\s+Off/);
+        click(/Reset to agent defaults/);
+        assert.equal(saved(), undefined);
+        assert.match(render(), /Visible to model\s+Off/);
+      }, { defaults: { cli, disableModelInvocation: true }, override: { skills: [] } });
+    }
+  });
+
+  it("retains visibility and unrelated overrides when saving the toggle or reset fails", async () => {
+    await withUi(({ click, input, render, state, configPath, notifications }) => {
+      state.update = () => { throw new Error("Disk full"); };
+      click(/Visible to model\s+Off/);
+      assert.match(render(), /Visible to model\s+Off/);
+      input(DELETE);
+      assert.deepEqual(state.get().agents.worker, { disableModelInvocation: true, tools: [] });
+      assert.equal(existsSync(configPath), false);
+      assert.equal(notifications.length, 2);
+      assert.match(notifications[0].message, /Could not save Visible to model: Disk full/);
+      assert.match(notifications[1].message, /Could not reset Visible to model: Disk full/);
+    }, { override: { disableModelInvocation: true, tools: [] } });
+  });
+
   it("marks any saved field, including empty lists, disabled fallback, and definition-equal values", async () => {
     await withUi(({ input, render, state, configPath }) => {
       input(ESC);
@@ -124,6 +184,7 @@ describe("per-agent settings loadout controls", () => {
         { model: "test/a" }, { thinking: "medium" }, { tools: [] }, { skills: [] },
         { subagentAgents: [] }, { modelFallback: null }, { modelFallback: "inherit" },
         { maxConcurrent: null }, { maxConcurrent: 1 },
+        { disableModelInvocation: true }, { disableModelInvocation: false },
       ]) {
         state.replace({ ...state.get(), agents: { worker: override } });
         assert.match(render(), /worker\*\s+/);
@@ -235,13 +296,13 @@ describe("per-agent settings loadout controls", () => {
   it("groups compact aligned rows, puts reset last, and shows only focused provenance", async () => {
     await withUi(({ render, focus, configPath }) => {
       const lines = render().split("\n");
-      const detail = lines.slice(4, 14);
+      const detail = lines.slice(4, 16);
       assert.deepEqual(detail.map((line) => line.trim().replace(/^→ /, "").split(/\s{4,}/)[0]), [
-        "Model", "Thinking", "Model fallback", "", "Tools", "Skills", "Spawnable agents", "Max concurrent", "", "Reset to agent defaults",
+        "Model", "Thinking", "Model fallback", "", "Tools", "Skills", "Spawnable agents", "Max concurrent", "", "Visible to model", "", "Reset to agent defaults",
       ]);
       const fieldRows = detail.filter((line) => line.trim() && !line.includes("Reset"));
       const valueColumns = fieldRows.map((line) => {
-        const match = /(?:Model fallback|Spawnable agents|Thinking|Model|Tools|Skills|Max concurrent)\s{4,}(\S)/.exec(line)!;
+        const match = /(?:Model fallback|Spawnable agents|Visible to model|Thinking|Model|Tools|Skills|Max concurrent)\s{4,}(\S)/.exec(line)!;
         return visibleWidth(line.slice(0, match.index + match[0].length - match[1].length));
       });
       assert.equal(new Set(valueColumns).size, 1);
@@ -287,7 +348,7 @@ describe("per-agent settings loadout controls", () => {
   it("does not select or edit blank group gaps or shared help through mouse input", async () => {
     await withUi(({ component, render, configPath }) => {
       render();
-      for (const y of [7, 12, 14, 15, 16, 17, 18, 19, 20]) {
+      for (const y of [7, 12, 14, 16, 17, 18, 19, 20, 21, 22]) {
         const event: TuiMouseEvent = {
           type: "click", button: "left", x: 3, y, screenX: 3, screenY: y,
           width: 110, height: 40, shift: false, alt: false, ctrl: false,
@@ -483,7 +544,7 @@ describe("per-agent settings loadout controls", () => {
       input(DOWN, DELETE); // Thinking is locked, but its stale override is still resettable.
       assert.equal(state.get().agents.worker.thinking, undefined);
       assert.equal(state.get().agents.worker.model, "test/b");
-      input(DOWN, DOWN, DOWN, DOWN, DOWN, DOWN, ENTER); // Last row: reset all.
+      input(DOWN, DOWN, DOWN, DOWN, DOWN, DOWN, DOWN, ENTER); // Last row: reset all.
       assert.equal(state.get().agents.worker, undefined);
       assert.equal(saved(), undefined);
       assert.match(render(), /Already using agent defaults/);
@@ -652,7 +713,7 @@ describe("per-agent settings loadout controls", () => {
       input(DELETE);
       assert.deepEqual(state.get().agents.worker, otherFields);
       assert.deepEqual(saved(), otherFields);
-      input(DOWN, ENTER);
+      input(DOWN, DOWN, ENTER);
       assert.equal(saved(), undefined);
     }, { override: otherFields });
     await withUi(({ click, focus, input, render, saved }) => {
@@ -737,7 +798,7 @@ describe("per-agent settings loadout controls", () => {
       focus(/Max concurrent\s+3/);
       input(DELETE);
       unchanged();
-      input(DOWN, ENTER);
+      input(DOWN, DOWN, ENTER);
       unchanged();
       assert.equal(notifications.length, 5);
       state.update = update;

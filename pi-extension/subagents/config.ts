@@ -33,6 +33,8 @@ export function defaultSubagentsConfigPath(): string {
 export type AgentOverride = {
   model?: string;
   thinking?: string;
+  /** Undefined uses the profile; true hides only from model discovery, not explicit spawning. */
+  disableModelInvocation?: boolean;
   /** Undefined uses the profile; an empty array explicitly grants nothing. */
   tools?: string[];
   skills?: string[];
@@ -103,8 +105,11 @@ function optionalStringArray(value: unknown, source: string, field: string): str
 /** Validate and normalize one override without losing explicit empty/disabled values. */
 export function parseAgentOverride(raw: unknown, source = "config.json", field = "agent"): AgentOverride {
   const value = requireObject(raw, source, field);
-  rejectUnsupportedKeys(value, ["model", "thinking", "tools", "skills", "subagentAgents", "modelFallback", "maxConcurrent"], source, field);
+  rejectUnsupportedKeys(value, ["model", "thinking", "disableModelInvocation", "tools", "skills", "subagentAgents", "modelFallback", "maxConcurrent"], source, field);
   const override: AgentOverride = {};
+  if (value.disableModelInvocation !== undefined) {
+    override.disableModelInvocation = requireBoolean(value.disableModelInvocation, source, `${field}.disableModelInvocation`);
+  }
   for (const key of ["model", "thinking"] as const) {
     const normalized = optionalTrimmedString(value[key], source, `${field}.${key}`);
     if (normalized !== undefined) override[key] = normalized;

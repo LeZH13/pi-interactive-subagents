@@ -32,6 +32,7 @@ export interface SubagentSettingsDeps {
   /** Profile defaults, before persistent overrides; cli identifies unsupported controls. */
   markdownDefaults: (agentName: string) => {
     model?: string; thinking?: string; cli?: string; maxConcurrent?: number; maxConcurrentError?: string;
+    disableModelInvocation?: boolean;
     tools?: string[]; skills?: string[]; subagentAgents?: string[]; modelFallback?: string | null;
   };
   /** Discovered choices only. Managed orchestration tools are excluded by the UI. */
@@ -209,9 +210,11 @@ function selectionView(
 
 const MANAGED_TOOLS = new Set(["ask_question", "subagent", "subagent_interrupt", "subagent_message", "subagents_list"]);
 type ListField = "tools" | "skills" | "subagentAgents";
-type AgentField = "model" | "thinking" | "modelFallback" | "maxConcurrent" | ListField;
+type AgentField = "model" | "thinking" | "modelFallback" | "maxConcurrent" | "disableModelInvocation" | ListField;
+const PI_ONLY_FIELDS = new Set<AgentField>(["thinking", "modelFallback", "tools", "skills", "subagentAgents"]);
 const FIELD_LABELS: Record<AgentField, string> = {
   model: "Model", thinking: "Thinking", tools: "Tools", skills: "Skills",
+  disableModelInvocation: "Visible to model",
   subagentAgents: "Spawnable agents", modelFallback: "Model fallback", maxConcurrent: "Max concurrent",
 };
 const FIELD_HELP: Record<ListField, string> = {
@@ -237,6 +240,7 @@ function agentValues(deps: SubagentSettingsDeps, name: string) {
   const maxConcurrent = override.maxConcurrent !== undefined ? override.maxConcurrent : defaults.maxConcurrent;
   const source = (field: AgentField) => override[field] !== undefined ? "Custom override" : "Agent default";
   return {
+    disableModelInvocation: (override.disableModelInvocation ?? defaults.disableModelInvocation ?? false) ? "Off" : "On",
     model: model ?? "Pi default",
     modelSource: override.model ? "Custom override" : defaults.model ? "Agent default" : "Pi default",
     thinking: supportsThinking ? override.thinking ?? defaults.thinking ?? "Pi default" : "off",
@@ -492,6 +496,7 @@ function agentView(
     { value: "skills", label: FIELD_LABELS.skills },
     { value: "subagentAgents", label: FIELD_LABELS.subagentAgents },
     { value: "maxConcurrent", label: FIELD_LABELS.maxConcurrent },
+    { value: "disableModelInvocation", label: FIELD_LABELS.disableModelInvocation },
     { value: "reset", label: "Reset to agent defaults" },
   ];
   const list = new SelectList(items, items.length, getSelectListTheme());
@@ -515,6 +520,10 @@ function agentView(
       if (!Object.keys(values.override).length) return;
       try { deps.configState.update((draft) => { delete draft.agents[name]; }); }
       catch (error) { ctx.ui.notify(`Could not reset agent defaults: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+    } else if (item.value === "disableModelInvocation") {
+      const disabled = values.override.disableModelInvocation ?? values.defaults.disableModelInvocation ?? false;
+      try { update("disableModelInvocation", !disabled); }
+      catch (error) { ctx.ui.notify(`Could not save Visible to model: ${error instanceof Error ? error.message : String(error)}`, "error"); }
     } else if (item.value === "maxConcurrent") {
       const current = values.override.maxConcurrent !== undefined ? values.override.maxConcurrent : values.defaults.maxConcurrent;
       const unlimitedId = "\u0000unlimited";
@@ -610,6 +619,7 @@ function agentView(
         skills: values.override.skills ?? values.defaults.skills ?? [],
       };
       const explanations: Record<AgentField, string> = {
+        disableModelInvocation: "Shown in subagents_list. Off hides this agent from model discovery; explicit spawning by name still works. Takes effect immediately.",
         model: "Primary model for new launches. Delete restores the profile default.",
         thinking: values.supportsThinking ? "Reasoning effort for new launches." : values.thinkingSource,
         modelFallback: "Used when the primary model cannot be used. Inherit uses the parent model; Disabled means no fallback.",
@@ -619,14 +629,14 @@ function agentView(
       const lines: string[] = [];
       rowLines = [];
       for (const [index, item] of items.entries()) {
-        if (index === 3 || index === 7) lines.push("");
+        if (index === 3 || item.value === "disableModelInvocation" || item.value === "reset") lines.push("");
         rowLines.push(lines.length);
         const active = item.value === selected;
         const prefix = active ? "→ " : "  ";
         let value = "";
         if (item.value !== "reset") {
           const field = item.value as AgentField;
-          value = !values.piAgent && field !== "model" && field !== "thinking" && field !== "maxConcurrent" ? "Unsupported for cli:claude" : values[field];
+          value = !values.piAgent && PI_ONLY_FIELDS.has(field) && field !== "thinking" ? "Unsupported for cli:claude" : values[field];
           if (values.piAgent && field in memberships) {
             const entries = memberships[field as ListField];
             if (entries.length && visibleWidth(value) > valueWidth) {
@@ -655,10 +665,10 @@ function agentView(
         const hasOverrides = Object.keys(values.override).length > 0;
         lines.push(...helpLines(hasOverrides ? "Remove all custom overrides" : "Already using agent defaults", 1),
           ...helpLines("Restore every field to its profile default.", 2),
-          ...helpLines("Sandbox changes: new launches only. Limits: next spawn/resume; running agents are not stopped.", 2));
+          ...helpLines("Visibility: immediate. Sandbox: new launches only. Limits: next spawn/resume; running agents are not stopped.", 2));
       } else if (selected) {
         const field = selected as AgentField;
-        const unsupported = !values.piAgent && field !== "model" && field !== "maxConcurrent";
+        const unsupported = !values.piAgent && PI_ONLY_FIELDS.has(field);
         const source = field === "maxConcurrent" ? values.maxConcurrentSource : values.override[field] !== undefined ? "Custom override" :
           field === "tools" && values.defaults.tools === undefined ? "Parent default" :
           (field === "model" && values.defaults.model === undefined || field === "thinking" && values.defaults.thinking === undefined) ? "Pi default" : "Agent default";
@@ -676,7 +686,7 @@ function agentView(
       if (matchesKey(data, Key.delete)) {
         const field = list.getSelectedItem()?.value as AgentField | "reset" | undefined;
         const values = agentValues(deps, name);
-        if (field && field !== "reset" && (values.piAgent || field === "model" || field === "maxConcurrent")) {
+        if (field && field !== "reset" && (values.piAgent || !PI_ONLY_FIELDS.has(field))) {
           try { update(field, undefined); }
           catch (error) { ctx.ui.notify(`Could not reset ${FIELD_LABELS[field]}: ${error instanceof Error ? error.message : String(error)}`, "error"); }
         }

@@ -2159,7 +2159,7 @@ describe("tabbed subagent settings", () => {
       assert.deepEqual(backends, ["background"]);
       assert.deepEqual(statusChanges, [false]);
       input("\t"); input("\r");
-      for (let i = 0; i < 7; i++) input("\x1b[B"); // Reset follows the concurrency detail row.
+      for (let i = 0; i < 8; i++) input("\x1b[B"); // Reset follows concurrency and visibility.
       input("\r");
       assert.equal(configState.get().agents.scout, undefined);
       assert.match(render(), /Agents › scout\n/);
@@ -3208,6 +3208,44 @@ describe("subagent discovery", () => {
       assert.equal(loaded.model, "anthropic/test-hidden");
       assert.equal(loaded.body, "You are the hidden agent.");
       assert.equal(loaded.disableModelInvocation, true);
+    });
+  });
+
+  it("applies visibility overrides live without changing discovery or direct loading", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      const state = testApi.getSubagentsConfigState();
+      const original = state.get();
+      const visible = "visible-override-test-agent";
+      const hidden = "hidden-override-test-agent";
+      writeAgentFile(projectAgentsDir, visible, `name: ${visible}\nmodel: test/visible`);
+      writeAgentFile(projectAgentsDir, hidden, `name: ${hidden}\ndisable-model-invocation: true\ncli: claude`);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list")!;
+      const check = async (visibleExpected: boolean, hiddenExpected: boolean) => {
+        const result = await tool.execute();
+        for (const [name, expected] of [[visible, visibleExpected], [hidden, hiddenExpected]] as const) {
+          assert.equal(result.details.agents.some((agent: any) => agent.name === name), expected);
+          assert.equal(result.structuredContent.agents.some((agent: any) => agent.name === name), expected);
+          assert.equal(result.content[0].text.includes(name), expected);
+          assert.ok(testApi.discoverAgentDefinitions().some((agent: any) => agent.name === name));
+          assert.ok(testApi.loadAgentDefaults(name));
+        }
+      };
+      try {
+        await check(true, false);
+        state.replace({ ...original, agents: { ...original.agents,
+          [visible]: { disableModelInvocation: true }, [hidden]: { disableModelInvocation: false },
+        } });
+        await check(false, true);
+        assert.equal(testApi.loadAgentDefaults(hidden).disableModelInvocation, true);
+        state.replace({ ...original, agents: { ...original.agents,
+          [visible]: { disableModelInvocation: false }, [hidden]: { disableModelInvocation: true },
+        } });
+        await check(true, false);
+        state.replace(original);
+        await check(true, false);
+      } finally { state.replace(original); }
     });
   });
 
