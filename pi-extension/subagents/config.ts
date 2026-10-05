@@ -4,7 +4,8 @@
  *
  * The durable store is `<agentDir>/extensions/pi-interactive-subagents/config.json`,
  * edited via `/subagent-settings` (live-apply + immediate atomic write) and read at
- * new-spawn time (resumes replay their original sandbox snapshot). Package-local `config.json` is not used. Every accessor tolerates
+ * admission time (spawn and resume); resumes replay their original sandbox snapshot.
+ * Package-local `config.json` is not used. Every accessor tolerates
  * a missing file or legacy content: absent keys fall back to defaults and the legacy
  * `picker` key is ignored.
  */
@@ -38,6 +39,8 @@ export type AgentOverride = {
   subagentAgents?: string[];
   /** Undefined uses the profile, "inherit" uses the parent model, null disables retry. */
   modelFallback?: string | null;
+  /** Undefined uses the profile default; null explicitly permits unlimited runs. */
+  maxConcurrent?: number | null;
 };
 
 export interface SubagentsConfig {
@@ -100,7 +103,7 @@ function optionalStringArray(value: unknown, source: string, field: string): str
 /** Validate and normalize one override without losing explicit empty/disabled values. */
 export function parseAgentOverride(raw: unknown, source = "config.json", field = "agent"): AgentOverride {
   const value = requireObject(raw, source, field);
-  rejectUnsupportedKeys(value, ["model", "thinking", "tools", "skills", "subagentAgents", "modelFallback"], source, field);
+  rejectUnsupportedKeys(value, ["model", "thinking", "tools", "skills", "subagentAgents", "modelFallback", "maxConcurrent"], source, field);
   const override: AgentOverride = {};
   for (const key of ["model", "thinking"] as const) {
     const normalized = optionalTrimmedString(value[key], source, `${field}.${key}`);
@@ -114,6 +117,13 @@ export function parseAgentOverride(raw: unknown, source = "config.json", field =
     ? null
     : optionalTrimmedString(value.modelFallback, source, `${field}.modelFallback`);
   if (fallback !== undefined) override.modelFallback = fallback;
+  if (value.maxConcurrent !== undefined) {
+    if (value.maxConcurrent !== null &&
+        (typeof value.maxConcurrent !== "number" || !Number.isSafeInteger(value.maxConcurrent) || value.maxConcurrent <= 0)) {
+      throw invalid(source, `${field}.maxConcurrent must be a positive safe integer or null`);
+    }
+    override.maxConcurrent = value.maxConcurrent as number | null;
+  }
   return override;
 }
 
@@ -254,7 +264,7 @@ export function hasSubagentsConfigFile(configPath = defaultSubagentsConfigPath()
 /**
  * Shared mutable runtime state for the unified config. Created once per
  * extension load from disk; mutated live by `/subagent-settings` (each
- * mutation persists immediately) and read by new-spawn resolution.
+ * mutation persists immediately) and read by launch resolution and concurrency admission.
  */
 export function createSubagentsConfigState(
   initial: SubagentsConfig,

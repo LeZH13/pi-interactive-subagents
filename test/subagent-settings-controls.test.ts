@@ -61,7 +61,7 @@ async function withUi(
     })),
     markdownDefaults: () => options.defaults ?? {
       model: "test/a", thinking: "medium", tools: ["read"], skills: ["review"],
-      subagentAgents: ["scout"], modelFallback: "inherit",
+      subagentAgents: ["scout"], modelFallback: "inherit", maxConcurrent: 1,
     },
     toolCatalog: () => [
       { name: "read", description: "Read files" }, { name: "write" },
@@ -123,6 +123,7 @@ describe("per-agent settings loadout controls", () => {
       for (const override of [
         { model: "test/a" }, { thinking: "medium" }, { tools: [] }, { skills: [] },
         { subagentAgents: [] }, { modelFallback: null }, { modelFallback: "inherit" },
+        { maxConcurrent: null }, { maxConcurrent: 1 },
       ]) {
         state.replace({ ...state.get(), agents: { worker: override } });
         assert.match(render(), /worker\*\s+/);
@@ -234,13 +235,13 @@ describe("per-agent settings loadout controls", () => {
   it("groups compact aligned rows, puts reset last, and shows only focused provenance", async () => {
     await withUi(({ render, focus, configPath }) => {
       const lines = render().split("\n");
-      const detail = lines.slice(4, 13);
+      const detail = lines.slice(4, 14);
       assert.deepEqual(detail.map((line) => line.trim().replace(/^→ /, "").split(/\s{4,}/)[0]), [
-        "Model", "Thinking", "Model fallback", "", "Tools", "Spawnable agents", "Skills", "", "Reset to agent defaults",
+        "Model", "Thinking", "Model fallback", "", "Tools", "Skills", "Spawnable agents", "Max concurrent", "", "Reset to agent defaults",
       ]);
       const fieldRows = detail.filter((line) => line.trim() && !line.includes("Reset"));
       const valueColumns = fieldRows.map((line) => {
-        const match = /(?:Model fallback|Spawnable agents|Thinking|Model|Tools|Skills)\s{4,}(\S)/.exec(line)!;
+        const match = /(?:Model fallback|Spawnable agents|Thinking|Model|Tools|Skills|Max concurrent)\s{4,}(\S)/.exec(line)!;
         return visibleWidth(line.slice(0, match.index + match[0].length - match[1].length));
       });
       assert.equal(new Set(valueColumns).size, 1);
@@ -269,7 +270,7 @@ describe("per-agent settings loadout controls", () => {
       assert.match(render(), /Skills\s+60 skills/);
       assert.doesNotMatch(render(), /secret-member-/);
       const heights = new Map([18, 40, 110].map((width) => [width, component.render(width).length]));
-      for (const field of ["Thinking", "Model fallback", "Tools", "Spawnable agents", "Skills", "Reset to agent defaults"]) {
+      for (const field of ["Thinking", "Model fallback", "Tools", "Spawnable agents", "Skills", "Max concurrent", "Reset to agent defaults"]) {
         focus(new RegExp(`^\\s+(?:→ )?${field}(?:\\s|$)`, "m"));
         for (const width of heights.keys()) {
           assert.equal(component.render(width).length, heights.get(width));
@@ -286,7 +287,7 @@ describe("per-agent settings loadout controls", () => {
   it("does not select or edit blank group gaps or shared help through mouse input", async () => {
     await withUi(({ component, render, configPath }) => {
       render();
-      for (const y of [7, 11, 13, 14, 15, 16, 17, 18]) {
+      for (const y of [7, 12, 14, 15, 16, 17, 18, 19, 20]) {
         const event: TuiMouseEvent = {
           type: "click", button: "left", x: 3, y, screenX: 3, screenY: y,
           width: 110, height: 40, shift: false, alt: false, ctrl: false,
@@ -482,7 +483,7 @@ describe("per-agent settings loadout controls", () => {
       input(DOWN, DELETE); // Thinking is locked, but its stale override is still resettable.
       assert.equal(state.get().agents.worker.thinking, undefined);
       assert.equal(state.get().agents.worker.model, "test/b");
-      input(DOWN, DOWN, DOWN, DOWN, DOWN, ENTER); // Last row: reset all.
+      input(DOWN, DOWN, DOWN, DOWN, DOWN, DOWN, ENTER); // Last row: reset all.
       assert.equal(state.get().agents.worker, undefined);
       assert.equal(saved(), undefined);
       assert.match(render(), /Already using agent defaults/);
@@ -586,6 +587,269 @@ describe("per-agent settings loadout controls", () => {
       input(ESC);
       assert.equal(existsSync(configPath), false);
     }, { defaults: {} });
+  });
+
+  it("shows finite profile limits and the extension's omitted Unlimited default with accurate provenance", async () => {
+    await withUi(({ focus, render, configPath }) => {
+      focus(/Max concurrent\s+1/);
+      assert.match(render(), /Source: Agent default/);
+      assert.match(render(), /next spawn or resume/);
+      assert.match(render(), /Running agents are not stopped/);
+      assert.equal(existsSync(configPath), false);
+    });
+    await withUi(({ focus, render, configPath }) => {
+      focus(/Max concurrent\s+Unlimited/);
+      assert.match(render(), /Source: Extension default/);
+      assert.doesNotMatch(render(), /Source: Pi default/);
+      assert.equal(existsSync(configPath), false);
+    }, { defaults: {} });
+    await withUi(({ focus, render }) => {
+      focus(/Max concurrent\s+7/);
+      assert.match(render(), /Source: Agent default/);
+    }, { defaults: { maxConcurrent: 7 } });
+  });
+
+  it("saves preset and arbitrary safe-integer limits, including definition-equal custom markers", async () => {
+    await withUi(({ click, input, render, saved, state }) => {
+      click(/Max concurrent\s+1/);
+      click(/1 run$/);
+      assert.equal(saved()?.maxConcurrent, 1);
+      assert.match(render(), /Agents › worker\n/);
+      assert.match(render(), /Source: Custom override/);
+      input(ESC);
+      assert.match(render(), /worker\*/);
+      input(ENTER);
+      for (const value of [17, Number.MAX_SAFE_INTEGER]) {
+        click(/Max concurrent\s+/);
+        click(/Custom limit/);
+        input(CLEAR, String(value), ENTER);
+        assert.equal(saved()?.maxConcurrent, value);
+        assert.equal(state.get().agents.worker.maxConcurrent, value);
+        assert.match(render(), /Agents › worker\n/);
+      }
+      click(/Max concurrent\s+/);
+      assert.match(render(), /9007199254740991 runs/);
+      input(ESC);
+    });
+  });
+
+  it("saves explicit Unlimited as null and restores just the profile default with picker reset or Delete", async () => {
+    const otherFields = { tools: [], skills: ["review"], modelFallback: null };
+    await withUi(({ click, input, focus, render, saved, state }) => {
+      click(/Max concurrent\s+1/);
+      click(/Unlimited$/);
+      assert.deepEqual(saved(), { ...otherFields, maxConcurrent: null });
+      assert.match(render(), /Max concurrent\s+Unlimited/);
+      assert.match(render(), /Source: Custom override/);
+      click(/Max concurrent\s+Unlimited/);
+      click(/Reset field to agent defaults/);
+      assert.deepEqual(saved(), otherFields);
+      assert.match(render(), /Max concurrent\s+1/);
+      assert.match(render(), /Source: Agent default/);
+      click(/Max concurrent\s+1/);
+      click(/Unlimited$/);
+      focus(/Max concurrent\s+Unlimited/);
+      input(DELETE);
+      assert.deepEqual(state.get().agents.worker, otherFields);
+      assert.deepEqual(saved(), otherFields);
+      input(DOWN, ENTER);
+      assert.equal(saved(), undefined);
+    }, { override: otherFields });
+    await withUi(({ click, focus, input, render, saved }) => {
+      click(/Max concurrent\s+Unlimited/);
+      click(/Unlimited$/);
+      assert.equal(saved()?.maxConcurrent, null);
+      input(ESC);
+      assert.match(render(), /worker\*/);
+      input(ENTER);
+      focus(/Max concurrent\s+Unlimited/);
+      input(DELETE);
+      assert.equal(saved(), undefined);
+      assert.match(render(), /Source: Extension default/);
+    }, { defaults: {} });
+  });
+
+  it("cancels concurrency pickers and numeric drafts without changing the previous override", async () => {
+    await withUi(({ click, input, render, state, configPath }) => {
+      click(/Max concurrent\s+3/);
+      input(ESC);
+      assert.match(render(), /Max concurrent\s+3/);
+      click(/Max concurrent\s+3/);
+      click(/Custom limit/);
+      input(CLEAR, "99", ESC);
+      assert.match(render(), /Agents › worker › Max concurrent\n/);
+      input(ESC);
+      assert.match(render(), /Max concurrent\s+3/);
+      assert.deepEqual(state.get().agents.worker, { maxConcurrent: 3 });
+      assert.equal(existsSync(configPath), false);
+    }, { override: { maxConcurrent: 3 } });
+  });
+
+  it("keeps invalid numeric values editable and never changes the saved limit", async () => {
+    await withUi(({ click, input, render, state, saved, configPath, notifications }) => {
+      click(/Max concurrent\s+3/);
+      click(/3 runs$/);
+      const previous = readFileSync(configPath, "utf8");
+      click(/Max concurrent\s+3/);
+      click(/Custom limit/);
+      for (const value of ["", "0", "-1", "1.5", "1.0", "NaN", "Infinity", "garbage", "2e3", "9007199254740992"]) {
+        input(CLEAR, value, ENTER);
+        assert.match(render(), /Enter a positive safe integer/);
+        assert.match(render(), /Agents › worker › Max concurrent › Custom limit/);
+        assert.equal(state.get().agents.worker.maxConcurrent, 3);
+        assert.equal(saved()?.maxConcurrent, 3);
+        assert.equal(readFileSync(configPath, "utf8"), previous);
+      }
+      assert.equal(notifications.length, 0, "validation errors stay inline");
+      input(CLEAR, "23");
+      assert.doesNotMatch(render(), /Enter a positive safe integer/);
+      input(ENTER);
+      assert.equal(saved()?.maxConcurrent, 23);
+      assert.match(render(), /Max concurrent\s+23/);
+    }, { override: { maxConcurrent: 3 } });
+  });
+
+  it("retains saved values and navigation through numeric, Unlimited, field-reset, Delete, and reset-all save failures", async () => {
+    await withUi(({ click, input, render, focus, saved, state, configPath, notifications }) => {
+      click(/Max concurrent\s+3/);
+      click(/3 runs$/);
+      const previous = readFileSync(configPath, "utf8");
+      const update = state.update;
+      state.update = () => { throw new Error("Disk full"); };
+      const unchanged = () => {
+        assert.equal(saved()?.maxConcurrent, 3);
+        assert.deepEqual(state.get().agents.worker, { maxConcurrent: 3, skills: [] });
+        assert.equal(readFileSync(configPath, "utf8"), previous);
+      };
+      click(/Max concurrent\s+3/);
+      click(/Custom limit/);
+      input(CLEAR, "7", ENTER);
+      assert.match(render(), /Could not save Max concurrent: Disk full/);
+      assert.match(render(), /Custom limit/);
+      unchanged();
+      input(ESC);
+      for (const choice of [/Unlimited$/, /Reset field to agent defaults/]) {
+        click(choice);
+        assert.match(render(), /Agents › worker › Max concurrent\n/);
+        unchanged();
+      }
+      input(ESC);
+      focus(/Max concurrent\s+3/);
+      input(DELETE);
+      unchanged();
+      input(DOWN, ENTER);
+      unchanged();
+      assert.equal(notifications.length, 5);
+      state.update = update;
+      click(/Max concurrent\s+3/);
+      click(/Custom limit/);
+      input(CLEAR, "8", ENTER);
+      assert.equal(saved()?.maxConcurrent, 8);
+      assert.deepEqual(saved()?.skills, []);
+    }, { override: { maxConcurrent: 3, skills: [] } });
+  });
+
+  it("supports concurrency editing and Delete for Claude CLI without changing Pi-only saved fields", async () => {
+    const piOnly = { tools: [], skills: [], subagentAgents: [], modelFallback: null };
+    await withUi(({ click, input, focus, render, saved, state }) => {
+      focus(/Max concurrent\s+2/);
+      assert.match(render(), /Source: Agent default/);
+      assert.doesNotMatch(render(), /Source: Agent default · Unsupported/);
+      click(/Max concurrent\s+2/);
+      click(/Custom limit/);
+      input(CLEAR, "9", ENTER);
+      assert.deepEqual(saved(), { ...piOnly, maxConcurrent: 9 });
+      assert.match(render(), /Tools\s+Unsupported for cli:claude/);
+      click(/Max concurrent\s+9/);
+      click(/Unlimited$/);
+      assert.deepEqual(saved(), { ...piOnly, maxConcurrent: null });
+      focus(/Max concurrent\s+Unlimited/);
+      input(DELETE);
+      assert.deepEqual(state.get().agents.worker, piOnly);
+      assert.deepEqual(saved(), piOnly);
+      assert.match(render(), /Max concurrent\s+2/);
+    }, { defaults: { cli: "claude", maxConcurrent: 2 }, override: piOnly });
+  });
+
+  it("preserves hidden-agent overrides, global settings, and unrelated fields through concurrency mutations", async () => {
+    await withUi(({ state, click, input, saved, configPath }) => {
+      const hidden = { maxConcurrent: null, model: "other/model", tools: [] };
+      const other = { model: "test/b", thinking: "high", tools: [], skills: ["review"], subagentAgents: [], modelFallback: null };
+      state.replace({ status: { enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
+      const check = (expected: AgentOverride | undefined) => {
+        const config = JSON.parse(readFileSync(configPath, "utf8"));
+        assert.deepEqual(config.status, { enabled: false });
+        assert.deepEqual(config.multiplexing, { backend: "background" });
+        assert.deepEqual(config.agents.hidden, hidden);
+        assert.deepEqual(state.get().agents.hidden, hidden);
+        assert.deepEqual(saved(), expected);
+      };
+      click(/Max concurrent\s+1/);
+      click(/1 run$/);
+      check({ ...other, maxConcurrent: 1 });
+      click(/Max concurrent\s+1/);
+      click(/Unlimited$/);
+      check({ ...other, maxConcurrent: null });
+      click(/Max concurrent\s+Unlimited/);
+      click(/Reset field to agent defaults/);
+      check(other);
+      click(/Max concurrent\s+1/);
+      click(/Unlimited$/);
+      click(/Reset to agent defaults/);
+      check(undefined);
+      input(ESC);
+    });
+  });
+
+  it("identifies invalid profile limits instead of displaying an effective Unlimited default", async () => {
+    const error = 'Invalid max-concurrent in agent profile "worker": must be a positive safe integer.';
+    await withUi(({ click, focus, input, render, saved }) => {
+      focus(/Max concurrent\s+Invalid profile limit/);
+      assert.match(render(), /Source: Agent default/);
+      assert.match(render(), /Invalid max-concurrent/);
+      assert.match(render(), /Fix the agent file\s+before spawning or resuming/);
+      click(/Max concurrent\s+Invalid profile limit/);
+      assert.match(render(), /Invalid max-concurrent/);
+      click(/Custom limit/);
+      assert.match(render(), /Fix the agent file\s+before spawning or resuming/);
+      input(CLEAR, "8", ENTER);
+      assert.equal(saved()?.maxConcurrent, 8);
+      assert.match(render(), /Max concurrent\s+Invalid profile limit/);
+      assert.match(render(), /Source: Custom override/);
+      assert.doesNotMatch(render(), /Max concurrent\s+Unlimited/);
+    }, { defaults: { maxConcurrentError: error } });
+  });
+
+  it("uses in-stack numeric focus, cursor keys, mouse handling, and bounded rendering without switching panels", async () => {
+    await withUi(({ component, click, focus, input, render, saved }) => {
+      const focused = component as Component & { focused: boolean };
+      const check = () => {
+        for (const width of [1, 4, 18, 40, 80, 110]) {
+          for (const line of component.render(width)) assert.ok(visibleWidth(line) <= width, line);
+          component.invalidate();
+        }
+      };
+      focus(/Max concurrent\s+17/);
+      input(ENTER);
+      check();
+      click(/Custom limit/);
+      focused.focused = true;
+      assert.ok(component.render(110).join("\n").includes(CURSOR_MARKER));
+      assert.match(render(), /←→ Cursor · Enter Save · Esc Back/);
+      assert.doesNotMatch(render(), /↑↓ Move/);
+      check();
+      focused.focused = false;
+      assert.ok(!component.render(110).join("\n").includes(CURSOR_MARKER));
+      const event: TuiMouseEvent = {
+        type: "press", button: "left", x: 8, y: 5, screenX: 8, screenY: 5,
+        width: 110, height: 30, shift: false, alt: false, ctrl: false,
+      };
+      assert.equal(component.handleMouse!(event)?.handled, true);
+      input(CLEAR, "17", "\x1b[D", "2", ENTER);
+      assert.equal(saved()?.maxConcurrent, 127);
+      assert.match(render(), /Agents › worker\n/);
+      assert.match(render(), /Max concurrent\s+127/);
+    }, { override: { maxConcurrent: 17 } });
   });
 
   it("propagates search focus and bounds every checkbox/model line at narrow widths", async () => {

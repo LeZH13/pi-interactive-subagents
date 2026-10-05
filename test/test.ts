@@ -8,9 +8,13 @@ import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from 
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { formatSubagentIdentity } from "../pi-extension/subagents/identity.ts";
+import { claimSession, enqueueMessage, recordCompletion, protocolDir, pendingMessages, authorizeLaunch } from "../pi-extension/subagents/protocol.ts";
 
-// Tests run as top-level orchestrator tests; clear any inherited child subagent allowlist.
+// Tests run as top-level orchestrators, never against an inherited live child session.
 delete process.env.PI_SUBAGENT_ALLOWED;
+delete process.env.PI_SUBAGENT_SESSION;
+delete process.env.PI_SUBAGENT_RUN_ID;
+delete process.env.PI_SUBAGENT_OWNER_TOKEN;
 
 // The extension reads persisted settings at import. Unit expectations must not
 // depend on a developer's saved agent overrides (or write back to that config).
@@ -2155,7 +2159,7 @@ describe("tabbed subagent settings", () => {
       assert.deepEqual(backends, ["background"]);
       assert.deepEqual(statusChanges, [false]);
       input("\t"); input("\r");
-      for (let i = 0; i < 6; i++) input("\x1b[B"); // Reset is the final detail row.
+      for (let i = 0; i < 7; i++) input("\x1b[B"); // Reset follows the concurrency detail row.
       input("\r");
       assert.equal(configState.get().agents.scout, undefined);
       assert.match(render(), /Agents › scout\n/);
@@ -2650,6 +2654,7 @@ describe("subagent discovery", () => {
       assert.equal(testApi.getToolExtensionPath("fetch_content"), globalPkg);
       assert.equal(testApi.getToolExtensionPath("get_search_content"), globalPkg);
       assert.equal(testApi.getToolExtensionPath("source_check"), globalPkg);
+      assert.equal(testApi.getToolExtensionPath("web_enable"), globalPkg);
       // web_fetch is strictly reserved for legacy standalone extension
       assert.equal(testApi.getToolExtensionPath("web_fetch"), undefined);
     });
@@ -2667,6 +2672,7 @@ describe("subagent discovery", () => {
 
       assert.equal(testApi.getToolExtensionPath("fetch_content", projectDir), localPkg);
       assert.equal(testApi.getToolExtensionPath("web_search", projectDir), localPkg);
+      assert.equal(testApi.getToolExtensionPath("web_enable", projectDir), localPkg);
     });
   });
 
@@ -2683,6 +2689,31 @@ describe("subagent discovery", () => {
       assert.equal(testApi.getToolExtensionPath("web_search"), legacySearch);
       assert.equal(testApi.getToolExtensionPath("web_fetch"), legacyFetch);
       assert.equal(testApi.getToolExtensionPath("fetch_content"), undefined);
+      assert.equal(testApi.getToolExtensionPath("web_enable"), undefined);
+    });
+  });
+
+  it("snapshots the web loader with its permitted capabilities once and keeps it opt-in", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const entry = join(globalDir, "npm", "node_modules", "pi-web-access", "index.ts");
+      mkdirSync(dirname(entry), { recursive: true });
+      writeFileSync(entry, "export default () => {}");
+      const capabilities = ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check"];
+      const allowlist = testApi.buildSubagentToolAllowlist(["read", ...capabilities]);
+      assert.deepEqual(allowlist.split(","), ["read", ...capabilities, "ask_question"]);
+      assert.deepEqual(testApi.snapshotToolExtensionPaths(allowlist.split(","), projectDir), [entry]);
+      assert.equal(testApi.buildSubagentToolAllowlist(["read"]), "read,ask_question");
+      assert.deepEqual(testApi.snapshotToolExtensionPaths(["read"], projectDir), []);
+    });
+  });
+
+  it("offers the web loader in settings even when the parent did not register it", async () => {
+    await withIsolatedAgentEnv(async ({ projectDir, globalDir }) => {
+      const entry = join(globalDir, "npm", "node_modules", "pi-web-access", "index.ts");
+      mkdirSync(dirname(entry), { recursive: true });
+      writeFileSync(entry, "export default () => {}");
+      const catalog = testApi.getSubagentToolCatalog({ getAllTools: () => [] }, projectDir);
+      assert.equal(catalog.find((tool: any) => tool.name === "web_enable")?.available, true);
     });
   });
 
@@ -3568,6 +3599,12 @@ describe("subagent-done.ts", () => {
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
       };
+      const savedRun = process.env.PI_SUBAGENT_RUN_ID;
+      const savedToken = process.env.PI_SUBAGENT_OWNER_TOKEN;
+      const owner = claimSession(sessionFile, "question-setup", true);
+      authorizeLaunch(sessionFile, owner);
+      process.env.PI_SUBAGENT_RUN_ID = owner.runId;
+      process.env.PI_SUBAGENT_OWNER_TOKEN = owner.ownerToken;
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
@@ -3575,6 +3612,8 @@ describe("subagent-done.ts", () => {
       const mock = createMockExtensionApi();
       subagentDoneExtension(mock.api);
       const restore = () => {
+        restoreEnvVar("PI_SUBAGENT_RUN_ID", savedRun);
+        restoreEnvVar("PI_SUBAGENT_OWNER_TOKEN", savedToken);
         restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
@@ -3604,7 +3643,10 @@ describe("subagent-done.ts", () => {
     async function withQuestionRuntime(run: (fixture: any) => Promise<void>) {
       const dir = createTestDir();
       const sessionFile = join(dir, "s.jsonl");
+      const owner = claimSession(sessionFile, "question-run", true);
+      authorizeLaunch(sessionFile, owner);
       const vars = {
+        PI_SUBAGENT_OWNER_TOKEN: owner.ownerToken,
         PI_SUBAGENT_SESSION: sessionFile, PI_SUBAGENT_NAME: "scout-2",
         PI_SUBAGENT_AGENT: "scout", PI_SUBAGENT_AUTO_EXIT: "1", PI_SUBAGENT_RUN_ID: "question-run",
       };
@@ -3626,13 +3668,16 @@ describe("subagent-done.ts", () => {
         unref() { timerReferenced = false; return this; },
         hasRef() { return timerReferenced; },
       };
-      const ctx = { shutdown() { shutdowns++; }, ui: { setWidget() {} } };
-      const emit = (event: string, payload: any = {}) => (handlers.get(event) ?? []).map((handler) => handler(payload, ctx));
+      const ctx = { isIdle: () => true, shutdown() { shutdowns++; }, ui: { setWidget() {}, notify() {} }, sessionManager: { getBranch: () => [] } };
+      const emit = (event: string, payload: any = {}) => {
+        if (event === "agent_settled") {
+          for (const handler of handlers.get("agent_before_settle") ?? []) handler({ context: { canContinue: true, pendingMessages: [] } }, ctx);
+        }
+        return (handlers.get(event) ?? []).map((handler) => handler(payload, ctx));
+      };
       let sequence = 0;
       const enqueue = (message: string, runId = "question-run") => {
-        const queueDir = `${sessionFile}.steer.d`;
-        mkdirSync(queueDir, { recursive: true });
-        writeFileSync(join(queueDir, `${String(++sequence).padStart(4, "0")}.json`), JSON.stringify({ message, runId }));
+        return enqueueMessage(sessionFile, { ownerToken: owner.ownerToken, runId }, message);
       };
       try {
         Object.assign(process.env, vars);
@@ -3698,7 +3743,7 @@ describe("subagent-done.ts", () => {
         assert.equal(payload.name, "scout-2");
         assert.equal(payload.agent, "scout");
         assert.ok(!existsSync(`${sessionFile}.exit`));
-        enqueue("wrong run reply", "old-run");
+        assert.throws(() => enqueue("wrong run reply", "old-run"), /token\/run/);
         poll();
         await Promise.resolve();
         assert.equal(providerContinuations, 0, "stale run cannot answer the question");
@@ -3710,7 +3755,7 @@ describe("subagent-done.ts", () => {
         assert.match(answer.content[0].text, /https:\/\/api\.example\.test/);
         assert.equal(messages.length, 0, "answer must not also enqueue a custom steer");
         assert.ok(!existsSync(`${sessionFile}.ask`));
-        assert.ok(!existsSync(`${sessionFile}.steer.d`));
+        assert.equal(pendingMessages(sessionFile).length, 0, "question reply has a durable consumption ACK");
         poll();
         assert.equal(messages.length, 0, "polling again cannot duplicate the answer");
         emit("message_end", { message: { role: "assistant", stopReason: "stop" } });
@@ -3825,7 +3870,10 @@ describe("Pi 1.0 settled lifecycle regressions", () => {
     return withTempDir((dir) => {
       const sessionFile = join(dir, "child.jsonl");
       const activityFile = getSubagentActivityFile(dir, "lifecycle-child");
+      const owner = claimSession(sessionFile, "current-run", true);
+      authorizeLaunch(sessionFile, owner);
       const vars = {
+        PI_SUBAGENT_OWNER_TOKEN: owner.ownerToken,
         PI_SUBAGENT_SESSION: sessionFile,
         PI_SUBAGENT_ACTIVITY_FILE: activityFile,
         PI_SUBAGENT_ID: "lifecycle-child",
@@ -3843,8 +3891,11 @@ describe("Pi 1.0 settled lifecycle regressions", () => {
         handlers.get(name)!.push(handler);
       };
       let shutdowns = 0;
-      const ctx = { shutdown() { shutdowns++; }, ui: { setWidget() {} } };
+      const ctx = { isIdle: () => true, shutdown() { shutdowns++; }, ui: { setWidget() {}, notify() {} }, sessionManager: { getBranch: () => [] } };
       const emit = (event: string, payload: any = {}) => {
+        if (event === "agent_settled") {
+          for (const handler of handlers.get("agent_before_settle") ?? []) handler({ context: { canContinue: true, pendingMessages: [] } }, ctx);
+        }
         for (const handler of handlers.get(event) ?? []) handler(payload, ctx);
       };
       const snapshot = () => {
@@ -3859,6 +3910,7 @@ describe("Pi 1.0 settled lifecycle regressions", () => {
       };
       try {
         subagentDoneExtension(mock.api);
+        emit("session_start");
         emit("before_agent_start");
         emit("agent_start");
         run({ emit, assistant, snapshot, sessionFile, ctx, shutdowns: () => shutdowns });
@@ -3917,7 +3969,7 @@ describe("Pi 1.0 settled lifecycle regressions", () => {
       assert.equal(snapshot().phase, "done");
       const payload = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
       assert.deepEqual({ ...payload, createdAt: 0 }, {
-        type: "error", errorMessage: "fresh exhausted failure", stopReason: "error", runId: "current-run", createdAt: 0,
+        type: "error", errorMessage: "fresh exhausted failure", stopReason: "error", runId: "current-run", ownerToken: process.env.PI_SUBAGENT_OWNER_TOKEN, createdAt: 0,
       });
     });
   });
@@ -3991,14 +4043,14 @@ describe("run-scoped completion records", () => {
   it("ignores stale and malformed completion records until the matching run is published", async () => {
     await withTempDir(async (dir) => {
       const sessionFile = join(dir, "child.jsonl");
-      const completionFile = `${sessionFile}.complete`;
+      const owner = claimSession(sessionFile, "run-new", true);
       const startedAt = Date.now();
-      writeFileSync(completionFile, JSON.stringify({ type: "completion", runId: "old", completedAt: startedAt }));
-      setTimeout(() => writeFileSync(completionFile, JSON.stringify({
-        type: "completion", runId: "run-new", completedAt: Date.now(), exitCode: 0,
-      })), 5);
+      const completions = join(protocolDir(sessionFile), "completions");
+      mkdirSync(completions);
+      writeFileSync(join(completions, `${owner.ownerToken}.json`), JSON.stringify({ type: "completion", runId: "old", completedAt: startedAt }));
+      setTimeout(() => recordCompletion(sessionFile, owner, 0), 5);
       const result = await pollForExit("bg:not-registered", new AbortController().signal, {
-        interval: 10, sessionFile, completionFile, runId: "run-new", startedAt,
+        interval: 10, sessionFile, runId: "run-new", ownerToken: owner.ownerToken, startedAt,
       });
       assert.deepEqual(result, { reason: "done", exitCode: 0 });
     });
@@ -4008,15 +4060,14 @@ describe("run-scoped completion records", () => {
     await withTempDir(async (dir) => {
       const sessionFile = join(dir, "child.jsonl");
       const startedAt = Date.now();
-      writeFileSync(`${sessionFile}.complete`, JSON.stringify({
-        type: "completion", runId: "run-error", completedAt: startedAt, exitCode: 0,
-      }));
+      const owner = claimSession(sessionFile, "run-error", true);
       writeFileSync(`${sessionFile}.exit`, JSON.stringify({
-        type: "error", runId: "run-error", createdAt: startedAt,
+        type: "error", runId: "run-error", ownerToken: owner.ownerToken, createdAt: startedAt,
         errorMessage: "provider unavailable", stopReason: "error",
       }));
+      recordCompletion(sessionFile, owner, 0);
       const result = await pollForExit("bg:not-registered", new AbortController().signal, {
-        interval: 5, sessionFile, completionFile: `${sessionFile}.complete`, runId: "run-error", startedAt,
+        interval: 5, sessionFile, runId: "run-error", ownerToken: owner.ownerToken, startedAt,
       });
       assert.equal(result.reason, "error");
       assert.equal(result.errorMessage, "provider unavailable");
@@ -4349,8 +4400,10 @@ describe("tool registration", () => {
       ["agent", "task"],
       "agent and task must be required",
     );
-    // `name` is now optional and purely cosmetic.
-    assert.match(props.name.description, /cosmetic/i);
+    // `name` is optional, but remains the persistent follow-up routing handle.
+    assert.match(props.name.description, /persistent name.*follow-up/i);
+    assert.match(props.name.description, /already used.*rejected.*finished/i);
+    assert.match(props.agent.description, /each profile.*concurrency policy.*parent runtime/i);
     assert.match(props.thinking.description, /reasoning level override/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
@@ -4435,7 +4488,10 @@ describe("tool registration", () => {
       (subagentsModule as any).default(api);
       const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
       const ctx = {
-        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+        sessionManager: {
+          getSessionDir: () => dir, getSessionId: () => "parent-1",
+          getSessionFile: () => join(dir, "parent.jsonl"), getLeafId: () => null,
+        },
       } as any;
 
       const result = await messageTool.execute(
@@ -4461,7 +4517,10 @@ describe("tool registration", () => {
       (subagentsModule as any).default(api);
       const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
       const ctx = {
-        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+        sessionManager: {
+          getSessionDir: () => dir, getSessionId: () => "parent-1",
+          getSessionFile: () => join(dir, "parent.jsonl"), getLeafId: () => null,
+        },
       } as any;
 
       const sessionFile = join(dir, "subagent-ab12cd34.jsonl");
@@ -4489,7 +4548,10 @@ describe("tool registration", () => {
       (subagentsModule as any).default(api);
       const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
       const ctx = {
-        sessionManager: { getSessionDir: () => dir, getSessionId: () => "parent-1" },
+        sessionManager: {
+          getSessionDir: () => dir, getSessionId: () => "parent-1",
+          getSessionFile: () => join(dir, "parent.jsonl"), getLeafId: () => null,
+        },
       } as any;
 
       const sessionFile = join(dir, "subagent-ff99.jsonl");
@@ -4984,10 +5046,15 @@ describe("subagent interruption", () => {
           }
           const surface = await createSurface("actor-test", { id: `actor-${surfaces.length}`, logPath: join(dir, `actor-${surfaces.length}.log`) });
           surfaces.push(surface);
-          const running = makeRunning({ surface });
+          const parentFile = join(dir, "parent.jsonl");
+          const ctx = { sessionManager: {
+            getSessionFile: () => parentFile, getSessionDir: () => dir,
+            getSessionId: () => "parent", getLeafId: () => null,
+          } };
+          const running = makeRunning({ surface, parentIdentity: testApi.canonicalSessionPath(parentFile) });
           runningMap.clear();
           runningMap.set("a1", running);
-          const result = await withMockedNow(30_000, () => tool.execute("interrupt-call", { id: "a1", actor: { kind: "human" } }));
+          const result = await withMockedNow(30_000, () => tool.execute("interrupt-call", { id: "a1", actor: { kind: "human" } }, undefined, undefined, ctx));
           assert.equal(result.details.status, "interrupt_requested");
           assert.deepEqual((running as any).interruption, { actor, requestedAt: 30_000 });
         }
@@ -5295,16 +5362,17 @@ describe("subagent interruption", () => {
     const testApi = (subagentsModule as any).__test__;
     withTempDir((dir) => {
       const sessionFile = join(dir, "child.jsonl");
-      testApi.enqueueSteerMessage(sessionFile, "first");
-      testApi.enqueueSteerMessage(sessionFile, "second");
-      const queueDir = `${sessionFile}.steer.d`;
+      const owner = claimSession(sessionFile, "enqueue-run", true);
+      testApi.enqueueSteerMessage(sessionFile, "first", owner.runId, owner.ownerToken);
+      testApi.enqueueSteerMessage(sessionFile, "second", owner.runId, owner.ownerToken);
+      const queueDir = join(protocolDir(sessionFile), "inbox");
       const files = readdirSync(queueDir).sort();
       assert.equal(files.length, 2);
-      assert.deepEqual(files.map((file: string) => JSON.parse(readFileSync(join(queueDir, file), "utf8")).message), ["first", "second"]);
+      assert.deepEqual(files.map((file: string) => JSON.parse(readFileSync(join(queueDir, file), "utf8")).body), ["first", "second"]);
     });
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", async () => {
+  it("queues a message without flattening multiline content", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
@@ -5317,7 +5385,7 @@ describe("subagent interruption", () => {
 
     assert.deepEqual(result, { ok: true });
     assert.equal(sentSurface, "pane-1");
-    assert.equal(sentText, "do this then that");
+    assert.equal(sentText, "do this\nthen that");
   });
 
   it("returns an explicit error when steering delivery fails", async () => {
@@ -5331,7 +5399,7 @@ describe("subagent interruption", () => {
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", async () => {
+  it("queues a message without claiming the child changed activity", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -5365,10 +5433,10 @@ describe("subagent interruption", () => {
 
       assert.equal(sentSurface, "pane-1");
       assert.equal(sentText, "keep going");
-      assert.equal(result.content[0].text.includes('Message delivered to running subagent "Worker"'), true);
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "steered" });
+      assert.equal(result.content[0].text.includes('Message queued for subagent "Worker"'), true);
+      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "queued" });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
-      assert.equal(snapshot.kind, "waiting");
+      assert.equal(snapshot.kind, "active");
       assert.equal(runningMap.has("a1"), true);
     } finally {
       runningMap.clear();
@@ -5478,7 +5546,7 @@ describe("subagent interruption", () => {
       {
         exitCode: 1,
         elapsed: 14,
-        summary: "ignored when errorMessage is present",
+        summary: "partial output survives even when errorMessage is present",
         sessionFile: "/tmp/subagent.jsonl",
         sessionId: "019f-xyz",
         errorMessage: "Anthropic 529 Overloaded after 3 retries",
@@ -5491,7 +5559,7 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
-    assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+    assert.match(presentation, /partial output survives even when errorMessage is present/);
   });
 });
 
@@ -6456,12 +6524,12 @@ describe("resume command construction", () => {
 describe("Pi 1.0 sandbox and structured outputs", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  it("bundled profiles include codemode without changing their underlying tool grants", async () => {
+  it("bundled profiles grant codemode and the complete opted-in web capability set", async () => {
     await withIsolatedAgentEnv(async () => {
       const expected: Record<string, string[]> = {
         scout: ["read", "grep", "find", "ls", "codemode"],
-        researcher: ["web_search", "fetch_content", "get_search_content", "source_check", "safe_bash", "codemode"],
-        worker: ["read", "write", "edit", "bash", "web_search", "fetch_content", "get_search_content", "codemode"],
+        researcher: ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "safe_bash", "codemode"],
+        worker: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
       };
       for (const [name, tools] of Object.entries(expected)) {
         const profile = testApi.loadAgentDefaults(name);
@@ -6508,7 +6576,7 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
   });
 
   it("preserves content, details and isError while projecting action acknowledgements", () => {
-    for (const status of ["started", "steered", "interrupt_requested", "interrupt_already_requested"]) {
+    for (const status of ["started", "queued", "interrupt_requested", "interrupt_already_requested"]) {
       const content = [{ type: "text", text: "original UI acknowledgement" }];
       const details = { status, id: "id", name: "Worker", agent: "worker", sessionFile: "/s.jsonl", sessionId: "sid", task: "private", identity: "private" };
       const result = testApi.addStructuredSubagentResult({ content, details, isError: false });
@@ -6546,7 +6614,11 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
     const listed = await list.execute();
     assert.deepEqual(listed.structuredContent, testApi.listStructuredAgents(listed.details.agents));
     const interrupt = registeredTools.find((tool) => tool.name === "subagent_interrupt");
-    const result = await interrupt.execute("call", { id: "missing-id" });
+    const ctx = { sessionManager: {
+      getSessionFile: () => "/tmp/test-parent.jsonl", getSessionDir: () => "/tmp",
+      getSessionId: () => "test-parent", getLeafId: () => null,
+    } };
+    const result = await interrupt.execute("call", { id: "missing-id" }, undefined, undefined, ctx);
     assert.equal(result.structuredContent.ok, false);
     assert.equal(result.structuredContent.status, "error");
     assert.equal(result.structuredContent.error, result.details.error);
@@ -6694,17 +6766,17 @@ describe("subagent badge rendering and conciseness rules", () => {
 
     // Steered distinct
     const steeredDistinct = messageTool.renderResult({
-      content: [{ type: "text", text: "steered" }],
-      details: { name: "explore-codebase", agent: "scout", status: "steered" },
+      content: [{ type: "text", text: "queued" }],
+      details: { name: "explore-codebase", agent: "scout", status: "queued" },
     }, {}, theme).render(80).join("\n");
-    assert.match(steeredDistinct, /subagent · explore-codebase \[scout\] — message delivered/);
+    assert.match(steeredDistinct, /subagent · explore-codebase \[scout\] — message queued/);
 
     // Steered same
     const steeredSame = messageTool.renderResult({
-      content: [{ type: "text", text: "steered" }],
-      details: { name: "scout", agent: "scout", status: "steered" },
+      content: [{ type: "text", text: "queued" }],
+      details: { name: "scout", agent: "scout", status: "queued" },
     }, {}, theme).render(80).join("\n");
-    assert.match(steeredSame, /subagent · scout — message delivered/);
+    assert.match(steeredSame, /subagent · scout — message queued/);
     assert.doesNotMatch(steeredSame, /\[scout\]/);
 
     // Resumed distinct
@@ -6869,9 +6941,9 @@ describe("subagent badge rendering and conciseness rules", () => {
           state: status.replaceAll("_", " "),
         })),
         { component: message.renderCall({ name, message: "Continue" }, theme), state: "message" },
-        ...["steered", "started"].map((status) => ({
+        ...["queued", "started"].map((status) => ({
           component: message.renderResult({ content: [], details: { name, agent, status } }, {}, theme),
-          state: status === "steered" ? "message delivered" : "resumed",
+          state: status === "queued" ? "message queued" : "resumed",
         })),
       ];
       for (const expanded of [false, true]) {
@@ -6927,7 +6999,7 @@ describe("subagent badge rendering and conciseness rules", () => {
     setSurfaceBackendPreference("background");
     const ctx = {
       hasUI: false,
-      sessionManager: { getSessionDir: () => dir, getSessionId: () => "p-1", getSessionFile: () => join(dir, "parent.jsonl") },
+      sessionManager: { getSessionDir: () => dir, getSessionId: () => "p-1", getSessionFile: () => join(dir, "parent.jsonl"), getLeafId: () => null },
     } as any;
     (subagentsModule as any).default(mock.api);
     await mock.emit("session_start", {}, ctx);
@@ -6943,6 +7015,7 @@ describe("subagent badge rendering and conciseness rules", () => {
     };
 
     const sessionFile = join(dir, "subagent-res.jsonl");
+    const priorOwner = claimSession(sessionFile, "previous-resume", true);
     writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-res" }) + "\n");
     writeSubagentLoadout(sessionFile, {
       agent: "scout",
@@ -6957,9 +7030,10 @@ describe("subagent badge rendering and conciseness rules", () => {
       agentDir: null,
     });
 
+    recordCompletion(sessionFile, priorOwner, 0);
     const result = await messageTool.execute("c-1", { sessionPath: sessionFile, message: "continue" }, undefined, undefined, ctx);
     assert.equal(result.details?.agent, "scout");
-    const runningEntry = Array.from(runningMap.values()).find((entry) => entry.sessionFile === sessionFile);
+    const runningEntry = Array.from(runningMap.values()).find((entry) => entry.sessionFile === testApi.canonicalSessionPath(sessionFile));
     assert.ok(runningEntry, "expected running entry to be registered");
     assert.equal(runningEntry.agent, "scout");
     assert.equal((globalThis as any)[Symbol.for("pi-subagents/widget-interval")] ?? null, null,

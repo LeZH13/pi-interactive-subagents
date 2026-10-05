@@ -18,7 +18,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux o
 ╰─────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Agent profiles appear as dim `[worker]` badges only when the display name differs from the profile name (ignoring case). Transcript headers use `subagent · name [profile] — state`; completion model information appears on the metadata line instead of the header. Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
+Agent profiles appear as dim `[worker]` badges only when the display name differs from the profile name (ignoring case). Transcript headers use `subagent · name [profile] — state`; completion model information appears on the metadata line instead of the header. Run independent profiles in parallel within their configured concurrency limits; their results steer back independently. The bundled worker declares `max-concurrent: 1`, rather than receiving special treatment in code. Limits are per profile and parent runtime, including startup, resume, and model fallback.
 
 Panes are kept evenly sized after every spawn and exit (debounced). The extension reads the tmux window dimensions and applies `even-horizontal` (equal columns) when columns are at least twice the row count (accounting for character cell aspect ratio), or `even-vertical` (equal rows) for portrait/square dimensions. Resizing alone does not trigger a rebalance; the new aspect ratio takes effect on the next spawn or exit.
 
@@ -53,9 +53,9 @@ Restricted launches explicitly load `-e builtin:codemode` despite `--no-extensio
 These tools declare output schemas, so `tools.<name>(args)` in codemode resolves to structured data instead of parsing acknowledgement text:
 
 - `subagents_list`: `{ agents: [{ name, source, description?, model?, modelFallback? }] }`. `source` is `package`, `global`, or `project`; an empty list is `{ agents: [] }`. This lists available definitions, **not running status**, and excludes profile bodies/private loadout data.
-- `subagent`, `subagent_message`, `subagent_interrupt`: `{ ok, status, id?, name?, agent?, sessionFile?, sessionId?, error? }`. Optional handles come from existing result details. Status is `started` (spawn or resume), `steered`, `interrupt_requested`, or `interrupt_already_requested`. Returned validation/operation errors have `ok: false`, `status: "error"`, and `error`; thrown failures still reject. Existing text, details, and error flags are unchanged.
+- `subagent`, `subagent_message`, `subagent_interrupt`: `{ ok, status, id?, name?, agent?, sessionFile?, sessionId?, messageId?, error? }`. Optional handles come from existing result details. Status is `started` (spawn or resume), `queued` (running Pi child), `interrupt_requested`, or `interrupt_already_requested`. Returned validation/operation errors have `ok: false`, `status: "error"`, and `error`; thrown failures still reject.
 
-`ok: true` means only that the operation was acknowledged — **not that the child's task completed**. Spawn/resume completions arrive later as steer messages; a live message acknowledgement itself does not emit another result. Interruption acknowledgements precede the watcher's removal notice. Do not poll or infer completion from any acknowledgement.
+`ok: true` means only that the operation was acknowledged — **not that the child's task completed**. `queued` confirms durable inbox acceptance, not child receipt; ingestion is acknowledged in the session's control artifacts after persistence or question-answer consumption. Spawn/resume completions arrive later as steer messages; a queued-message acknowledgement itself does not emit another result. Interruption acknowledgements precede the watcher's removal notice. Do not poll or infer completion from an acknowledgement.
 
 ```js
 const { agents } = await tools.subagents_list({});
@@ -89,8 +89,9 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
-- **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
-- **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+- **Running Pi child** — the full message is written to a durable inbox and the call returns `queued` with a message ID. The child consumes it at a turn boundary or as its pending question's answer. Delivery and closure share a mutex; messages submitted after closure are explicitly refused, not falsely reported delivered. Wait for completion before retrying as a resume.
+- **Finished Pi child** — the session is resumed autonomously with the follow-up task; its result arrives later. Concurrent requests for the same session in one runtime join its startup instead of launching multiple writers. The resumed run reclaims its name and recovers retained unacknowledged messages.
+- **Claude CLI child** — messaging and message-based resume are refused because this backend cannot provide ingestion acknowledgements or durable inbox consumption. Claude spawning and result reporting remain supported; spawn a fresh child for further work.
 
 Pass `sessionPath` instead of `name` to resume a recorded session (`.jsonl`) file directly, bypassing the name registry:
 
@@ -100,7 +101,15 @@ subagent_message({ sessionPath: "/path/to/artifacts/<id>/subagents/subagent-ab12
 
 Provide exactly one of `name` or `sessionPath`. Path resume reaches sessions missing from the current session's registry — e.g. after starting a fresh pi session, or children of a nested sub-agent (registered under their spawner's session id, not yours). The registry name is reclaimed when the file is known to the current session; otherwise a display name is derived from the filename. The `.loadout.json` sandbox snapshot must sit beside the session file or resume is refused, exactly as with name resume — a path never relaxes the sandbox.
 
-Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
+Every spawn persists name → session file in `artifacts/<sessionId>/subagent-registry.json` before submitting the child command. Explicit names already used in this parent session are rejected, including finished handles; omitted names are uniquified. A newly named path resume also saves its handle. A nested spawner has its own registry keyed by its session ID.
+
+### Session ownership and delivery safety
+
+Each managed session has a canonical-path `<session>.control` directory containing its owner, immutable inbox records, receipts, and completion evidence. Symlink aliases share ownership; multiply hard-linked sessions are refused. Separate spawners cannot launch writers against the same session. A delivery-closed marker is not proof of process exit: replacement ownership requires the matching outer wrapper's post-exit completion record. Watchers read immutable completion archives keyed by owner/run, including rich error outcomes, so a successor cannot hide the original result by consuming the live completion file.
+
+Unacknowledged messages remain in the inbox and are identified in completion/interruption reports; an explicit resume recovers them. Abandoned mutexes, unknown owners, and ambiguous termination fail closed with diagnostics. Ownership is never guessed from age or PID, and OS-crash exactly-once delivery is not promised. Orphan cleanup removes only validated, terminated control groups under their mutex. Busy, active, ambiguous, or foreign/symlink-containing groups retain their related files and discovery markers.
+
+**Reload the parent extension before new launches after updating.** Recorded sessions without the new ownership metadata cannot be resumed, even if they have a loadout snapshot; spawn a fresh child rather than bypassing the guard. Resume also refuses missing names, missing session files, or missing loadout snapshots. Concurrency limits are process-local and profile-scoped, not workspace-wide locks across independent orchestrators.
 
 ### Interrupting
 
@@ -130,6 +139,13 @@ Different sub-agents can wait in parallel; each child permits only one pending q
 
 All three are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if GLM-5.3 fails.
 
+### Keeping orchestration lean
+
+- Use one worker for implementation and parallel read-only agents for independent investigations. Assign file ownership and one integration/test owner; separate conversations do not isolate a shared workspace. Use separate worktrees when overlapping edits are unavoidable.
+- Resume for focused follow-ups on the same task. For a substantially new phase, spawn a fresh agent with a short handoff and a new name.
+- Request concise findings, decisions, blockers, changed paths, and verification counts. Main should inspect critical changes and run final integration checks instead of repeating broad exploration or ingesting full passing logs.
+- Result transport remains lossless: the normal Pi child's full final text is embedded in a completion wrapper. Collapsing its TUI preview does not reduce parent context. Keep reports concise through task/profile instructions; store lengthy evidence in files when appropriate.
+
 ## Custom agents
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global). Discovery priority: **project > global > package-bundled** — a project-local file overrides a bundled agent with the same name.
@@ -158,7 +174,8 @@ You are a specialized agent that does X...
 | `model` | string | Primary/default model |
 | `model-fallback` | string | Optional one-shot fallback model. Use `inherit` to copy the immediate spawning session's live model, or provide a concrete model id |
 | `thinking` | string | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget) |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `max-concurrent` | positive integer | Maximum admitted runs of this profile per parent runtime; omission means Unlimited. Applies to starts and resumes, including startup and fallback; settings can override it |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_enable`, `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. A nonempty effective list grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts targets to that list within the parent's allowed agents. Settings can override the list; an empty list disables spawning |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -169,6 +186,20 @@ You are a specialized agent that does X...
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
 
+### Web tool activation
+
+Web-capable bundled profiles grant `web_enable` alongside `web_search`, `source_check`, `fetch_content`, and `get_search_content`. The loader and capabilities share one pi-web-access extension snapshot. Keep the underlying capabilities in the allowlist: the loader cannot grant excluded tools, and pi-web-access currently rejects activation if a globally configured capability is unavailable in the child. It is omitted from Scout.
+
+pi-web-access's `toolActivation: "auto"` chooses lazy or eager activation according to model compatibility; `"eager"` does not use the loader. New profile grants apply to fresh children; existing/resumed sessions retain their recorded sandbox.
+
+### Concurrency policy
+
+Set `max-concurrent: 1` in any profile to serialize it, or a larger positive safe integer to allow bounded parallelism. Omit the field for Unlimited. Empty, zero, negative, fractional, and unsafe values are invalid; an invalid higher-priority profile still shadows lower-priority definitions and its admissions fail explicitly.
+
+The settings override `agents.<name>.maxConcurrent` takes precedence: a positive safe integer is a limit, `null` is explicit Unlimited, and absence uses the profile default. The **current** policy is checked before each new spawn or resume; reducing it never cancels existing runs. Unlimited runs are counted too, so a later stricter limit sees them. Same-session messages/startup joins do not consume another slot, and a fallback retains its original admission.
+
+This is parent admission policy, not a frozen child permission. Resumes keep their original tools/model sandbox while using the current concurrency policy. Limits also govern Claude CLI spawning; Claude message-based resume remains unsupported.
+
 ### Model fallback
 
 `model-fallback` is attempted once when the primary run reports a provider/agent error, exits non-zero, or exits without any non-whitespace assistant text. The failed child is retained in the parent's artifacts and a fresh child starts from the original task under the same display name. User cancellation never triggers fallback, and a fallback that resolves to the same model and thinking level is skipped.
@@ -177,7 +208,7 @@ With `model-fallback: inherit`, nested agents inherit from their **immediate spa
 
 ## Configuration (agent-dir `config.json` + `/subagent-settings`)
 
-The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.json` (`status`, `multiplexing.backend`, per-agent `agents` overrides), honoring `PI_CODING_AGENT_DIR`. This keeps settings outside the installed package, so reinstalling or replacing the package does not erase them. Package-local `config.json` is obsolete and is no longer read; `config.json.example` remains the committed template. Every successful selection or list toggle is saved immediately with an atomic write; no separate Apply step is required. Agent overrides apply to **new spawns only**; running agents and resumed sessions keep their original loadouts. General settings still apply live.
+The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.json` (`status`, `multiplexing.backend`, per-agent `agents` overrides), honoring `PI_CODING_AGENT_DIR`. This keeps settings outside the installed package, so reinstalling or replacing the package does not erase them. Package-local `config.json` is obsolete and is no longer read; `config.json.example` remains the committed template. Every successful selection or list toggle is saved immediately with an atomic write; no separate Apply step is required. Loadout overrides apply to **new spawns only**; running agents and resumed sessions keep their original loadouts. **Max concurrent** is the exception: current policy governs subsequent spawn/resume admissions, without stopping existing runs. General settings still apply live.
 
 ```json
 {
@@ -187,6 +218,7 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
     "worker": {
       "model": "openai/gpt-5",
       "thinking": "high",
+      "maxConcurrent": 2,
       "tools": ["read", "bash", "edit", "write"],
       "subagentAgents": ["scout", "researcher"],
       "skills": [],
@@ -200,12 +232,12 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
 
 `/subagent-settings` opens a settings page (same style as pi's `/settings`) with two tabs:
 
-- **Agents** (default) — search `scout`, `researcher`, `worker`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above tools/spawnable agents/skills, with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, or **Pi default**) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. The new controls support Pi-backed agents only and are marked unsupported for `cli: claude`.
+- **Agents** (default) — search `scout`, `researcher`, `worker`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above the second group (Tools, Skills, Spawnable agents, Max concurrent), with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, **Pi default**, or **Extension default** for an omitted concurrency limit) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Max concurrent** accepts a positive safe integer or explicit **Unlimited**; invalid/cancelled input leaves the previous value intact. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. Tools/spawnable agents/skills/fallback controls support Pi-backed agents only and are marked unsupported for `cli: claude`; Max concurrent is backend-neutral.
 - **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved.
 
 Use **← / →** for the previous / next panel when the search is empty, **Tab / Shift+Tab** to cycle forward / backward, or click a tab. When a search query exists, horizontal arrows move its cursor—even at the query's beginning or end—while Tab / Shift+Tab still switch panels. Each panel retains its selection, and Agents retains its search. Panel switching is disabled in nested screens, which replace tabs with breadcrumbs; **Esc** returns one level, then closes the page from a panel's list. Search errors and empty results explain how to recover. In list pickers, **Space / Enter** or a checkbox click toggles and saves immediately; **Esc** returns without undoing saved changes. The concise footer shows move, toggle, and back shortcuts. Keyboard hints wrap at narrow widths.
 
-Absent override fields use the agent Markdown defaults. Explicit `tools: []` grants no optional tools, `skills: []` invokes no startup skills, `subagentAgents: []` disables spawning, and `modelFallback: null` disables fallback. If neither the definition nor settings specify tools, new agents inherit the spawner's active optional tools. `ask_question` remains a managed control tool; spawning tools are managed automatically from the effective spawnable-agent list, which cannot widen an inherited agent restriction. The Tools picker includes supported Pi built-ins even when excluded or inactive in the parent, built-in extensions `codemode` and `tool_search`, bundled `safe_bash`, and registered workspace extension tools, deduplicated by name. Other pickers use current-session discoveries. Unavailable existing entries are preserved rather than silently deleted. Adding tools to the catalog does not change the inherited active-tool defaults. Child tools remain independently configurable; parent CLI tool exclusions are not a delegation ceiling. `safe_bash` and native `bash` are independent grants: allowing native `bash` bypasses `safe_bash` command filters.
+Absent override fields use the agent Markdown defaults. Explicit `tools: []` grants no optional tools, `skills: []` invokes no startup skills, `subagentAgents: []` disables spawning, `modelFallback: null` disables fallback, and `maxConcurrent: null` explicitly removes a profile's concurrency limit. If neither the definition nor settings specify tools, new agents inherit the spawner's active optional tools. `ask_question` remains a managed control tool; spawning tools are managed automatically from the effective spawnable-agent list, which cannot widen an inherited agent restriction. The Tools picker includes supported Pi built-ins even when excluded or inactive in the parent, built-in extensions `codemode` and `tool_search`, bundled `safe_bash`, and registered workspace extension tools, deduplicated by name. Other pickers use current-session discoveries. Unavailable existing entries are preserved rather than silently deleted. Adding tools to the catalog does not change the inherited active-tool defaults. Child tools remain independently configurable; parent CLI tool exclusions are not a delegation ceiling. `safe_bash` and native `bash` are independent grants: allowing native `bash` bypasses `safe_bash` command filters.
 
 Model/thinking precedence is **explicit spawn args > settings-page override > agent markdown default**. The old `/subagent-mux` and `/subagent-sessions` commands are removed; explicit `/subagent agent@model:thinking` args still win for a single spawn.
 
@@ -226,7 +258,7 @@ With `auto-exit: true`, the session shuts down at Pi 1.0's final `agent_settled`
 Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally. Normally aborted turns park instead of closing. **Pi 1.0 late-abort limitation:** an abort after the agent loop has completed, during final settlement callbacks, is not exposed by Pi's public API and may still auto-close the session; no private-API workaround is used.
-- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
+- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` when an `ask_question` is unanswered, its own children are running, or accepted inbox messages lack receipts. `agent_before_settle` drains the inbox and serializes closure against enqueue; delayed receipts and transient mutex contention retry closure while idle without an extra provider request. Valid same-writer SDK continuations reopen delivery.
 
 ### interactive
 
@@ -239,6 +271,33 @@ Pi sub-agent access is **whitelist-only**. Each new process uses `--no-extension
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn agents in its effective `subagent_agents` list, intersected with the spawner's inherited restriction (enforced via `PI_SUBAGENT_ALLOWED`). A nonempty effective list grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`). There is no agentless spawn route.
 
 Extensions can register additional tools for sub-agents at runtime via `registerToolExtension(name, path)` on the `__pi_interactive_subagents` process global.
+
+## On-demand orchestration audit
+
+```text
+/subagents-audit
+/subagents-audit <session-id-or-jsonl-path>
+/subagents-audit <session-id-1>, <session-id-2> "/path with spaces/session.jsonl"
+/subagents-audit compare <baseline-session> <other-session>
+/subagents-audit profiles [directory]
+```
+
+The thin command injects the canonical `audit/INSTRUCTIONS.md`, absolute analyzer/reference paths, and JSON scope only while Pi is idle. With no arguments it targets the current recorded session, capturing its byte cutoff, active leaf, and actual session directory **before** injection; an ephemeral session instead asks for references. The captured directory honors effective CLI storage selection rather than overriding it with a conflicting environment variable. Nothing is installed as an always-advertised skill or tool. Loading the package extension also enables this command; no extra tool permissions are granted.
+
+The agent invokes the bundled, dependency-free Node offline analyzer; the command itself does not run analysis. You can also run it directly:
+
+```sh
+node audit/analyze.mjs <session-id> --sessions-dir /configured/session/storage
+node audit/analyze.mjs compare '/path with spaces/baseline.jsonl' /path/other.jsonl
+node audit/analyze.mjs /path/session.jsonl --leaf <entry-id> --cutoff-bytes <byte-count>
+node audit/analyze.mjs --help
+```
+
+IDs resolve from saved headers, not filenames or pane names. Bounded JSON reports include registry-corroborated nested children, canonical overlap memberships, physical usage (including abandoned branches and non-message requests), text sizes, outer tool counts, and entry/line evidence refs—never raw prompts or tool payloads. Fork-seeded records require scoped parent provenance before new-usage attribution; missing telemetry remains unknown. Leaf ancestry is separate from physical accounting and is not reconstructed model context or peak context. The captured current-session cutoff excludes this invocation. Historical audit-marker prefixes label bounded request/event metadata without hiding subsequent work; earlier audit activity remains in physical accounting as a potential comparison confounder. Whole-turn exclusion and historical audit provider-cost attribution are unknown.
+
+Processing and output have hard limits; incomplete, missing, ambiguous, malformed, cyclic, or out-of-scope evidence is disclosed. Explicit file scope includes its local artifact tree; a configured `--sessions-dir` permits broader saved-storage resolution. Registry paths and symlinks escaping that scope are refused. A valid extension-owned artifact marker plus child placement/header can also corroborate children when registries are absent; transcript-only linkage requires bounded manual corroboration. A `parentSession` link alone may be a fork, not delegation. Profiles mode remains a semantic read-only review of effective prompts and configuration.
+
+This is local analysis and recommendations, **not automatic fixes** or a live provider/collector. It never resumes audited sessions or modifies durable state. Larger reports need an authorized output path; keep raw transcripts private. The on-demand wrapper design follows prompt-snippets; extraction is specific to orchestration, not prompt mining.
 
 ## Role folders
 

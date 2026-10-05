@@ -68,9 +68,22 @@ export function backgroundExitCode(surface: string): number | null | undefined {
 }
 export function hasBackgroundSurface(surface: string): boolean { return surfaces.has(surface); }
 export function backgroundLogPath(surface: string): string | undefined { return surfaces.get(surface)?.logPath; }
-export function closeBackground(surface: string): void {
+export async function closeBackground(surface: string): Promise<void> {
   const record = surfaces.get(surface);
-  if (record?.child && record.exitCode === null && record.child.exitCode === null) record.child.kill("SIGTERM");
+  const child = record?.child;
+  if (child && record.exitCode === null && child.exitCode === null) {
+    // The wrapper traps TERM, stops its Pi child, waits for exit, then writes completion.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        child.off("exit", onExit);
+        reject(new Error(`Background wrapper did not exit after SIGTERM: ${surface}. Ownership must remain held.`));
+      }, 5000);
+      const onExit = () => { clearTimeout(timer); resolve(); };
+      child.once("exit", onExit);
+      try { child.kill("SIGTERM"); }
+      catch (error) { clearTimeout(timer); child.off("exit", onExit); reject(error); }
+    });
+  }
   surfaces.delete(surface);
 }
 export function allBackgroundSurfaces(): string[] { return [...surfaces.keys()]; }

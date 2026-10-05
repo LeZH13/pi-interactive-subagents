@@ -10,6 +10,7 @@ import {
   readSync,
   readdirSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -17,6 +18,7 @@ import {
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import { cleanCompletedSession } from "./protocol.ts";
 
 export interface SessionEntry {
   type: string;
@@ -171,6 +173,8 @@ export function seedSubagentSessionFile(params: {
  * deleted.
  */
 export interface SubagentLoadout {
+  /** Transport identity. Claude snapshots must never be replayed through Pi. */
+  cli?: "pi" | "claude";
   /** Agent profile name (for PI_SUBAGENT_AGENT); null for agentless spawns. */
   agent: string | null;
   /** The `--tools` allowlist string, or null when the spawn was unrestricted. */
@@ -225,6 +229,7 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object") return null;
+    if (parsed.cli !== undefined && parsed.cli !== "pi" && parsed.cli !== "claude") return null;
     if (parsed.toolExtensionPaths !== undefined &&
       (!Array.isArray(parsed.toolExtensionPaths) ||
         parsed.toolExtensionPaths.some((path: unknown) => typeof path !== "string" || !path.trim()))) {
@@ -272,28 +277,37 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
   }
 }
 
-/**
- * Register (or overwrite) a name → session mapping for a spawner session.
- * Writes atomically (temp file + rename) so a concurrent reader never sees a
- * partial registry.
- */
-export function registerName(
-  artifactDir: string,
-  name: string,
-  entry: NameRegistryEntry,
-): void {
+function writeNameRegistry(artifactDir: string, registry: NameRegistry): void {
+  mkdirSync(artifactDir, { recursive: true });
+  const p = nameRegistryPath(artifactDir);
+  const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
   try {
-    mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
-    const p = nameRegistryPath(artifactDir);
-    const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);
-  } catch {
-    // Best-effort: a failed registration only means resume-by-name won't find
-    // this subagent later; it never breaks the spawn itself.
+  } finally {
+    rmSync(tmp, { force: true });
   }
+}
+
+/** Atomically persist a handle. Failure must not masquerade as a saved identity. */
+export function registerName(artifactDir: string, name: string, entry: NameRegistryEntry): void {
+  const registry = readNameRegistry(artifactDir);
+  registry[name] = entry;
+  writeNameRegistry(artifactDir, registry);
+}
+
+/** Roll back only this failed launch's mapping; never delete another launch's handle. */
+export function restoreNameRegistration(
+  artifactDir: string,
+  name: string,
+  sessionFile: string,
+  previous: NameRegistryEntry | null,
+): void {
+  const registry = readNameRegistry(artifactDir);
+  if (registry[name]?.sessionFile !== sessionFile) return;
+  if (previous) registry[name] = previous;
+  else delete registry[name];
+  writeNameRegistry(artifactDir, registry);
 }
 
 /** Resolve a name to its registry entry within a spawner session, or null. */
@@ -785,7 +799,7 @@ export function hasExtensionArtifacts(artifactDirPath: string): boolean {
   if (existsSync(subagentsDir)) {
     try {
       const files = readdirSync(subagentsDir);
-      if (files.some((f) => f.endsWith(".jsonl") || f.endsWith(".loadout.json"))) {
+      if (files.some((f) => f.endsWith(".jsonl") || f.endsWith(".loadout.json") || f.endsWith(".jsonl.control"))) {
         return true;
       }
     } catch {}
@@ -824,10 +838,21 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
 
   // 1. Clean subagents/
   const subagentsDir = join(artifactDirPath, "subagents");
+  let retainedManagedArtifacts = false;
   if (isRealDirectory(subagentsDir)) {
     try {
       const entries = readdirSync(subagentsDir, { withFileTypes: true });
+      const controlledNames = entries.filter((entry) => entry.name.endsWith(".jsonl.control"))
+        .map((entry) => entry.name.slice(0, -".control".length));
+      for (const name of controlledNames) {
+        const cleaned = cleanCompletedSession(join(subagentsDir, name));
+        result.cleanedFilesCount += cleaned.cleanedFilesCount;
+        result.cleanedBytes += cleaned.cleanedBytes;
+        if (!cleaned.removed) retainedManagedArtifacts = true;
+      }
       for (const entry of entries) {
+        // The protocol helper owns the entire group, including unsafe groups' sidecars.
+        if (controlledNames.some((name) => entry.name === name || entry.name.startsWith(`${name}.`))) continue;
         const full = join(subagentsDir, entry.name);
         if (entry.isFile()) {
           if (
@@ -859,7 +884,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
                 result.cleanedFilesCount++;
               } catch {}
             }
-            if (readdirSync(full).length === 0) rmSync(full, { recursive: true, force: true });
+            if (readdirSync(full).length === 0) rmdirSync(full);
           } catch {}
         } else if (entry.isDirectory() && entry.name === "artifacts") {
           // Nested artifacts
@@ -870,18 +895,25 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
                 const subRes = cleanExtensionArtifactDir(join(full, nDir.name));
                 result.cleanedFilesCount += subRes.cleanedFilesCount;
                 result.cleanedBytes += subRes.cleanedBytes;
+                if (hasArtifactOwnershipMarker(join(full, nDir.name))) retainedManagedArtifacts = true;
               }
             }
             if (readdirSync(full).length === 0) {
-              rmSync(full, { recursive: true, force: true });
+              rmdirSync(full);
             }
           } catch {}
         }
       }
-      if (readdirSync(subagentsDir).length === 0) {
-        rmSync(subagentsDir, { recursive: true, force: true });
-      }
-    } catch {}
+      const remaining = readdirSync(subagentsDir);
+      if (remaining.some((name) => name.endsWith(".jsonl.control"))) retainedManagedArtifacts = true;
+      if (remaining.length === 0) rmdirSync(subagentsDir);
+    } catch { retainedManagedArtifacts = true; }
+  }
+
+  // Retained writers need their ownership marker, registry and launch artifacts for discovery/recovery.
+  if (retainedManagedArtifacts || (existsSync(subagentsDir) && !isRealDirectory(subagentsDir))) {
+    result.preservedForeignEntries = readdirSync(artifactDirPath);
+    return result;
   }
 
   // 2. Clean subagent-activity/
@@ -900,7 +932,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
         }
       }
       if (readdirSync(activityDir).length === 0) {
-        rmSync(activityDir, { recursive: true, force: true });
+        rmdirSync(activityDir);
       }
     } catch {}
   }
@@ -921,7 +953,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
         }
       }
       if (readdirSync(scriptsDir).length === 0) {
-        rmSync(scriptsDir, { recursive: true, force: true });
+        rmdirSync(scriptsDir);
       }
     } catch {}
   }
@@ -942,7 +974,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
         }
       }
       if (readdirSync(resumeDir).length === 0) {
-        rmSync(resumeDir, { recursive: true, force: true });
+        rmdirSync(resumeDir);
       }
     } catch {}
   }
@@ -963,14 +995,14 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
         }
       }
       if (readdirSync(contextDir).length === 0) {
-        rmSync(contextDir, { recursive: true, force: true });
+        rmdirSync(contextDir);
       }
     } catch {}
   }
 
   // 6. Clean subagent-registry.json and .subagents-managed.json
   const registryFile = nameRegistryPath(artifactDirPath);
-  if (existsSync(registryFile)) {
+  if (existsSync(registryFile) && lstatSync(registryFile).isFile()) {
     try {
       result.cleanedBytes += statSync(registryFile).size;
       unlinkSync(registryFile);
@@ -979,7 +1011,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
   }
 
   const markerFile = join(artifactDirPath, SUBAGENT_MANAGED_MARKER_FILE);
-  if (existsSync(markerFile)) {
+  if (existsSync(markerFile) && lstatSync(markerFile).isFile()) {
     try {
       result.cleanedBytes += statSync(markerFile).size;
       unlinkSync(markerFile);
@@ -991,7 +1023,7 @@ export function cleanExtensionArtifactDir(artifactDirPath: string): CleanDirResu
   try {
     const remaining = readdirSync(artifactDirPath);
     if (remaining.length === 0) {
-      rmSync(artifactDirPath, { recursive: true, force: true });
+      rmdirSync(artifactDirPath);
       result.dirRemoved = true;
     } else {
       result.preservedForeignEntries = remaining;

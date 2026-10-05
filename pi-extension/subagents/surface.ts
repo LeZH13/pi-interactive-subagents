@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import * as tmux from "./tmux.ts";
+import { readSessionCompletion } from "./protocol.ts";
 import { allBackgroundSurfaces, backgroundExitCode, backgroundLogPath, closeBackground, createBackgroundSurface, hasBackgroundSurface, interruptBackground, launchBackground, readBackground } from "./background.ts";
 import { EXAMPLE_CONFIG_PATH, subagentsUserConfigPath } from "./config.ts";
 import { HERDR_CLI_TIMEOUT_MS, HerdrCliError, closeHerdrPane, createHerdrPane, getHerdrPaneDimensions, getRecentOwnedHerdrPane, getRecommendedHerdrDirection, interruptHerdrPane, isHerdrCliInstalled, isHerdrEnvironment, probeHerdrPane, readHerdrPane, runHerdrCommand, sendHerdrMessage } from "./herdr.ts";
@@ -163,43 +164,43 @@ function interpretExit(data: any): PollResult {
 }
 export const __pollForExitTest__ = { interpretExitSidecar: interpretExit };
 export const __surfaceTest__ = { cliTimeoutMs: HERDR_CLI_TIMEOUT_MS, resetCommandAvailability() {} };
-export async function pollForExit(surface: string, signal: AbortSignal, options: { interval: number; sessionFile?: string; sentinelFile?: string; runId?: string; startedAt?: number; completionFile?: string; onTick?: (elapsed: number) => void }): Promise<PollResult> {
+export async function pollForExit(surface: string, signal: AbortSignal, options: { interval: number; sessionFile?: string; sentinelFile?: string; runId?: string; ownerToken?: string; startedAt?: number; onTick?: (elapsed: number) => void }): Promise<PollResult> {
+  if (options.runId && (!options.ownerToken || !options.sessionFile)) throw new Error("Managed polling requires a session path and owner token from an updated parent launch.");
   const startedAt = options.startedAt ?? Date.now(); let failures = 0;
+  const completedOutcome = (): PollResult | undefined => {
+    if (!options.runId) return undefined;
+    try {
+      const done = readSessionCompletion(options.sessionFile!, { runId: options.runId, ownerToken: options.ownerToken! });
+      // Watchers only read their immutable outcome; they never consume successor state.
+      if (done) return done.error ? interpretExit(done.error) : { reason: "done", exitCode: done.exitCode };
+    } catch {}
+    return undefined;
+  };
   for (;;) {
     if (signal.aborted) throw new Error("Aborted while waiting for subagent to finish");
-    if (options.runId && options.completionFile) {
-      try {
-        const done = JSON.parse(readFileSync(options.completionFile, "utf8"));
-        if (done?.type === "completion" && done.runId === options.runId && done.completedAt >= startedAt && Number.isInteger(done.exitCode)) {
-          let result: PollResult = { reason: "done", exitCode: done.exitCode };
-          if (options.sessionFile) try {
-            const failure = JSON.parse(readFileSync(`${options.sessionFile}.exit`, "utf8"));
-            if (failure?.runId === options.runId && failure.createdAt >= startedAt) result = interpretExit(failure);
-          } catch {}
-          rmSync(options.completionFile, { force: true });
-          if (options.sessionFile) rmSync(`${options.sessionFile}.exit`, { force: true });
-          return result;
-        }
-      } catch {}
-    } else if (options.sessionFile && existsSync(`${options.sessionFile}.exit`)) {
+    const completed = completedOutcome();
+    if (completed) return completed;
+    if (!options.runId && options.sessionFile && existsSync(`${options.sessionFile}.exit`)) {
       try { const data = JSON.parse(readFileSync(`${options.sessionFile}.exit`, "utf8")); rmSync(`${options.sessionFile}.exit`, { force: true }); return interpretExit(data); } catch {}
     }
-    if (options.sentinelFile && existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
+    if (!options.runId && options.sentinelFile && existsSync(options.sentinelFile)) return { reason: "sentinel", exitCode: 0 };
     try {
       const output = await readScreenAsync(surface, 5, signal); failures = 0;
-      const match = output.match(/__SUBAGENT_DONE_(\d+)__/); if (match) return { reason: "sentinel", exitCode: Number(match[1]) };
+      const match = output.match(/__SUBAGENT_DONE_(\d+)__/); if (!options.runId && match) return { reason: "sentinel", exitCode: Number(match[1]) };
     } catch (error: any) {
       failures++;
       if (kind(surface) === "herdr") {
         try { const state = await probeHerdrPane(pane(surface), signal); if (state === "exists") failures = 0; }
         catch {}
       } else if (kind(surface) === "tmux" && await tmux.probeTmux(surface, signal)) failures = 0;
-      if (failures >= 3) return { reason: "error", exitCode: 1, errorMessage: `${kind(surface)} pane/backend unavailable for 3 consecutive probes: ${error?.message ?? error}` };
+      if (failures >= 3) return completedOutcome() ?? { reason: "error", exitCode: 1, errorMessage: `${kind(surface)} pane/backend unavailable for 3 consecutive probes: ${error?.message ?? error}` };
     }
     if (kind(surface) === "background") {
       const code = backgroundExitCode(surface);
-      if (code !== null && code !== undefined) return { reason: "sentinel", exitCode: code };
-      if (!hasBackgroundSurface(surface) && ++failures >= 3) return { reason: "error", exitCode: 1, errorMessage: "Background subagent surface disappeared before completion." };
+      if (code !== null && code !== undefined) return options.runId
+        ? completedOutcome() ?? { reason: "error", exitCode: 1, errorMessage: "Child surface exited without matching wrapper completion; writer ownership retained." }
+        : { reason: "sentinel", exitCode: code };
+      if (!hasBackgroundSurface(surface) && ++failures >= 3) return completedOutcome() ?? { reason: "error", exitCode: 1, errorMessage: "Background subagent surface disappeared before completion." };
     }
     options.onTick?.(Math.floor((Date.now() - startedAt) / 1000));
     await new Promise<void>((resolve, reject) => {

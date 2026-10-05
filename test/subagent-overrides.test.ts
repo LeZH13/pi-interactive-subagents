@@ -53,6 +53,42 @@ describe("persisted subagent launch overrides", () => {
     assert.equal(Object.hasOwn(parsed.agents.parent, "tools"), false);
   });
 
+  it("round-trips positive safe concurrency limits and explicit unlimited without inventing absent values", () => withTempDir((dir) => {
+    const parsed = parseSubagentsConfig({ agents: {
+      finite: { maxConcurrent: 3 }, unlimited: { maxConcurrent: null }, omitted: { tools: [] },
+      largest: { maxConcurrent: Number.MAX_SAFE_INTEGER },
+    } });
+    assert.equal(Object.hasOwn(parsed.agents.omitted, "maxConcurrent"), false);
+    assert.deepEqual(parseSubagentsConfig(JSON.parse(serializeSubagentsConfig(parsed))), parsed);
+    const path = join(dir, "config.json");
+    const state = createSubagentsConfigState(parsed, path);
+    state.update((draft) => { draft.agents.finite.maxConcurrent = null; });
+    assert.equal(loadSubagentsConfig(path).agents.finite.maxConcurrent, null);
+    state.update((draft) => { delete draft.agents.finite.maxConcurrent; });
+    assert.equal(Object.hasOwn(loadSubagentsConfig(path).agents, "finite"), false);
+  }));
+
+  it("rejects invalid concurrency settings instead of silently granting unlimited", () => {
+    for (const maxConcurrent of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "2", "garbage", true, [], {}]) {
+      assert.throws(() => parseSubagentsConfig({ agents: { reviewer: { maxConcurrent } } }), /agents.reviewer.maxConcurrent must be a positive safe integer or null/);
+    }
+  });
+
+  it("parses omitted and positive safe frontmatter limits and records explicit invalid definitions", () => {
+    const definition = (field = "") => runtime.parseAgentDefinition(`---\nname: reviewer\n${field}tools: read\n---\nProfile\n`, "reviewer")!;
+    assert.equal(definition().maxConcurrent, undefined);
+    assert.equal(definition().maxConcurrentError, undefined);
+    for (const limit of [1, 2, 3, Number.MAX_SAFE_INTEGER]) {
+      assert.equal(definition(`max-concurrent: ${limit}\n`).maxConcurrent, limit);
+      assert.equal(definition(`max-concurrent: ${limit}\n`).maxConcurrentError, undefined);
+    }
+    for (const raw of ["", "  ", "0", "-1", "1.5", "NaN", "Infinity", "garbage", "null", '"2"', "9007199254740992"]) {
+      const parsed = definition(`max-concurrent: ${raw}\n`);
+      assert.match(parsed.maxConcurrentError!, /Invalid max-concurrent.*reviewer.*positive safe integer/);
+      assert.equal(parsed.maxConcurrent, undefined);
+    }
+  });
+
   it("rejects malformed new fields and unsupported paths", () => {
     for (const key of ["tools", "skills", "subagentAgents"]) {
       for (const value of [null, "read", ["read", 2], {}]) {
@@ -76,6 +112,26 @@ describe("persisted subagent launch overrides", () => {
     assert.deepEqual(state.get().agents.worker, { skills: [], subagentAgents: [], modelFallback: null });
     state.update((draft) => { draft.agents.worker = {}; });
     assert.deepEqual(loadSubagentsConfig(path).agents, {});
+  }));
+
+  it("preserves unrelated durable settings when changing concurrency and rejects invalid updates atomically", () => withTempDir((dir) => {
+    const path = join(dir, "config.json");
+    const other = { model: "provider/primary", tools: [], skills: ["review"], subagentAgents: [], modelFallback: null };
+    const hidden = { maxConcurrent: null, thinking: "high" };
+    const state = createSubagentsConfigState({ status: { enabled: false }, multiplexing: { backend: "background" },
+      agents: { worker: other, hidden } }, path);
+    state.update((draft) => { draft.agents.worker.maxConcurrent = 37; });
+    const saved = loadSubagentsConfig(path);
+    assert.deepEqual(saved.agents.worker, { ...other, maxConcurrent: 37 });
+    for (const value of [0, -1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => state.update((draft) => { draft.agents.worker.maxConcurrent = value; }), /positive safe integer/);
+      assert.deepEqual(state.get(), saved);
+      assert.deepEqual(loadSubagentsConfig(path), saved);
+    }
+    state.update((draft) => { draft.agents.worker.maxConcurrent = null; });
+    assert.deepEqual(loadSubagentsConfig(path).agents.worker, { ...other, maxConcurrent: null });
+    state.update((draft) => { delete draft.agents.worker.maxConcurrent; });
+    assert.deepEqual(loadSubagentsConfig(path), { status: { enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
   }));
 
   it("keeps live state unchanged if an update cannot be validated or persisted", () => withTempDir((dir) => {
@@ -207,7 +263,7 @@ describe("runtime catalogs and extension replay", () => {
     const catalog = runtime.getSubagentToolCatalog(pi, dir);
     const byName = new Map(catalog.map((tool) => [tool.name, tool]));
     assert.equal(catalog.length, byName.size);
-    assert.deepEqual([...byName.keys()], ["read", "write", "edit", "bash", "powershell", "grep", "find", "ls", "codemode", "tool_search", "safe_bash"]);
+    assert.deepEqual([...byName.keys()], ["read", "write", "edit", "bash", "powershell", "grep", "find", "ls", "codemode", "tool_search", "web_enable", "safe_bash"]);
     assert.equal(byName.get("read")!.description, "Registered read metadata");
     assert.equal(byName.get("bash")!.available, true);
     assert.equal(byName.get("codemode")!.available, true);

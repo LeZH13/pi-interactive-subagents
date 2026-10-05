@@ -15,7 +15,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { existsSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
+import { drainInbox, openSession, validateChildOwner, reopenSessionDelivery, retrySessionOperation, SessionBusyError, type InboxMessage } from "./protocol.ts";
 import {
   createSubagentActivityRecorder,
   type SubagentTelemetry,
@@ -210,7 +211,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -276,6 +277,22 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
+  const sessionFile = process.env.PI_SUBAGENT_SESSION;
+  const identity = { runId: process.env.PI_SUBAGENT_RUN_ID ?? "", ownerToken: process.env.PI_SUBAGENT_OWNER_TOKEN ?? "" };
+  if (sessionFile) {
+    try { validateChildOwner(sessionFile, identity); }
+    catch (error) {
+      if (!(error instanceof SessionBusyError)) throw error;
+      await retrySessionOperation(() => validateChildOwner(sessionFile, identity));
+    }
+  }
+  let deliveryClosed = false;
+  let latestContext: import("@earendil-works/pi-coding-agent").ExtensionContext | undefined;
+  let deliveryFailure: string | undefined;
+  let boundaryExitRequested = false;
+  let idleExit: { messages: any[]; telemetry: SubagentTelemetry | undefined;
+    ctx: import("@earendil-works/pi-coding-agent").ExtensionContext } | undefined;
+
   let userTookOver = false;
   let agentStarted = false;
   let runOpen = false;
@@ -295,43 +312,65 @@ export default function (pi: ExtensionAPI) {
     return true;
   }
 
-  function deliverSteer(message: string): void {
-    if (!message || answerPendingQuestion(message)) return;
+  function deliverSteer(item: InboxMessage): "question" | "queued" {
+    if (answerPendingQuestion(item.body)) return "question";
     pi.sendMessage(
-      { customType: "subagent_steer", content: message, display: true },
+      { customType: "subagent_steer", content: item.body, display: true,
+        details: { messageId: item.messageId, runId: item.runId, deliveryRunId: identity.runId } },
       { triggerTurn: true, deliverAs: "steer" },
     );
+    // sendMessage returns void. Only the persisted branch can confirm ingestion.
+    return "queued";
   }
 
-  function checkPendingSteerMessage(): void {
-    const sessionFile = process.env.PI_SUBAGENT_SESSION;
-    if (!sessionFile) return;
-
-    // New writers publish one atomic file per message so rapid steers cannot
-    // overwrite each other. Sorted names preserve enqueue order.
-    const queueDir = `${sessionFile}.steer.d`;
-    let files: string[] = [];
-    try { files = readdirSync(queueDir).filter((name) => name.endsWith(".json")).sort(); } catch {}
-    for (const file of files) {
-      const path = `${queueDir}/${file}`;
-      try {
-        const data = JSON.parse(readFileSync(path, "utf8"));
-        unlinkSync(path);
-        const runId = process.env.PI_SUBAGENT_RUN_ID;
-        if (
-          typeof data?.message === "string" &&
-          (typeof data.runId !== "string" || !runId || data.runId === runId)
-        ) deliverSteer(data.message.trim());
-      } catch {
-        try { unlinkSync(path); } catch {}
-      }
+  function checkPendingSteerMessage(close = false) {
+    if (!sessionFile || !latestContext || deliveryClosed || shuttingDown) return;
+    try {
+      const result = drainInbox(sessionFile, identity, {
+        branch: latestContext.sessionManager.getBranch(), deliver: deliverSteer, close,
+      });
+      deliveryClosed = result.closed;
+      deliveryFailure = undefined;
+      return result;
+    } catch (error) {
+      // Retain every item and keep delivery open. A transient mutex collision can retry next poll.
+      deliveryFailure = String(error);
+      if (!(error instanceof SessionBusyError)) latestContext.ui.notify(`Subagent delivery stalled: ${String(error)}`, "error");
     }
-    try { if (existsSync(queueDir) && readdirSync(queueDir).length === 0) rmSync(queueDir, { recursive: true }); } catch {}
   }
 
-  // Show widget + status bar on session start
-  pi.on("session_start", (_event, ctx) => {
+  function clearExitIntent() {
+    idleExit = undefined;
+    boundaryExitRequested = false;
+    if (!pendingQuestion) steerInterval?.unref();
+  }
+
+  function finishAutoExit(messages: any[], telemetry: SubagentTelemetry | undefined,
+    ctx: import("@earendil-works/pi-coding-agent").ExtensionContext) {
+    clearExitIntent();
+    const errorInfo = findLatestAssistantError(messages);
+    if (errorInfo && sessionFile) {
+      try {
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage: errorInfo.errorMessage,
+          stopReason: errorInfo.stopReason, ...identity, createdAt: Date.now() }));
+      } catch { /* The finalized transcript still contains the full provider error. */ }
+    }
+    recorder.agentSettledDone(telemetry);
+    ctx.shutdown();
+  }
+
+  function pollDelivery() {
+    const intent = idleExit;
+    const mayFinish = !!intent && !!latestContext?.isIdle() && !pendingQuestion && !runCancelled && runningChildrenCount() === 0;
+    const result = checkPendingSteerMessage(mayFinish);
+    // Resume only the exit intent authorized by the actionable boundary. No new prompt/provider request is needed for a late ACK or released mutex.
+    if (intent && idleExit === intent && mayFinish && result?.closed) finishAutoExit(intent.messages, intent.telemetry, intent.ctx);
+  }
+
+  // Show widget + status bar only after child ownership has been validated and opened.
+  function startSession(ctx: import("@earendil-works/pi-coding-agent").ExtensionContext) {
     shuttingDown = false;
+    latestContext = ctx;
     recorder.sessionStart(telemetryFromContext(ctx));
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -340,11 +379,22 @@ export default function (pi: ExtensionAPI) {
     renderWidget(ctx, null);
 
     if (!steerInterval) {
-      steerInterval = setInterval(checkPendingSteerMessage, 500);
+      steerInterval = setInterval(pollDelivery, 500);
       if (typeof steerInterval?.unref === "function") {
         steerInterval.unref();
       }
     }
+  }
+  pi.on("session_start", (_event, ctx) => {
+    if (sessionFile) {
+      try { openSession(sessionFile, identity); }
+      catch (error) {
+        if (!(error instanceof SessionBusyError)) { ctx.shutdown(); throw error; }
+        return retrySessionOperation(() => openSession(sessionFile, identity)).then(() => startSession(ctx))
+          .catch((failure) => { ctx.shutdown(); throw failure; });
+      }
+    }
+    startSession(ctx);
   });
 
   pi.on("input", (event) => {
@@ -357,12 +407,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
+    clearExitIntent();
     runCancelled = false;
     runAssistantMessage = undefined;
     recorder.beforeAgentStart(telemetryFromContext(ctx));
   });
 
-  pi.on("agent_start", (_event, ctx) => {
+  function startRun(ctx: import("@earendil-works/pi-coding-agent").ExtensionContext) {
+    clearExitIntent();
+    deliveryClosed = false;
     agentStarted = true;
     // Retry/compaction/queued continuations start more loops in the same run.
     // Only a fresh run resets message freshness. A question is cleared only
@@ -374,6 +427,17 @@ export default function (pi: ExtensionAPI) {
       runOpen = true;
     }
     recorder.agentStart(telemetryFromContext(ctx));
+  }
+  pi.on("agent_start", (_event, ctx) => {
+    if (deliveryClosed && sessionFile) {
+      try { reopenSessionDelivery(sessionFile, identity); }
+      catch (error) {
+        if (!(error instanceof SessionBusyError)) { ctx.shutdown(); throw error; }
+        return retrySessionOperation(() => reopenSessionDelivery(sessionFile, identity)).then(() => startRun(ctx))
+          .catch((failure) => { ctx.shutdown(); throw failure; });
+      }
+    }
+    startRun(ctx);
   });
 
   pi.on("message_end", (event) => {
@@ -384,6 +448,20 @@ export default function (pi: ExtensionAPI) {
     // A loop ending is not final: Pi may retry, compact, drain queues, or
     // continue from agent_before_settle. Keep recording until settlement.
     recorder.agentEnd(lifecycleTelemetry(latestAssistantMessage(event.messages), ctx));
+  });
+
+  pi.on("agent_before_settle", (event, ctx) => {
+    latestContext = ctx;
+    const messages = runAssistantMessage ? [runAssistantMessage] : [];
+    const mayClose = autoExit && event.outcome !== "aborted" && !pendingQuestion && !runCancelled && runningChildrenCount() === 0 &&
+      shouldAutoExitOnAgentSettled(userTookOver, messages);
+    boundaryExitRequested = mayClose;
+    const result = checkPendingSteerMessage(mayClose && !event.continue && event.context.pendingMessages.length === 0);
+    if (result?.pending.length && event.context.canContinue &&
+        (result.dispatched > 0 || event.context.pendingMessages.length > 0)) {
+      return { continue: true };
+    }
+    // Pending ACKs or delivery errors park the child rather than pretending it drained its inbox.
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -406,37 +484,18 @@ export default function (pi: ExtensionAPI) {
       !runCancelled &&
       !hasPendingChildren &&
       autoExit &&
+      (!sessionFile || boundaryExitRequested) &&
+      (!sessionFile || deliveryClosed) &&
+      !deliveryFailure &&
       shouldAutoExitOnAgentSettled(userTookOver, messages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo && sessionFile) {
-        try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-              runId: process.env.PI_SUBAGENT_RUN_ID,
-              createdAt: Date.now(),
-            }),
-          );
-        } catch {
-          // Best effort — even without the sidecar, watcher's session-file
-          // fallback can still recover the errorMessage.
-        }
-      }
-
-      recorder.agentSettledDone(telemetry);
-      ctx.shutdown();
+      finishAutoExit(messages, telemetry, ctx);
       return;
+    }
+    if (boundaryExitRequested && autoExit && !pendingQuestion && !runCancelled && !hasPendingChildren) {
+      idleExit = { messages, telemetry, ctx };
+      steerInterval?.ref(); // Keep headless children alive while reconciling a delayed receipt/lock.
     }
 
     recorder.agentSettledWaiting(telemetry);
@@ -502,6 +561,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (event) => {
     shuttingDown = true;
+    clearExitIntent();
     pendingQuestion?.cancel("ask_question cancelled: session shutdown.");
     if (steerInterval) {
       clearInterval(steerInterval);

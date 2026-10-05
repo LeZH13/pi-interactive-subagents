@@ -31,7 +31,7 @@ export interface SubagentSettingsDeps {
   discoverAgents: () => Array<{ name: string; description?: string }>;
   /** Profile defaults, before persistent overrides; cli identifies unsupported controls. */
   markdownDefaults: (agentName: string) => {
-    model?: string; thinking?: string; cli?: string;
+    model?: string; thinking?: string; cli?: string; maxConcurrent?: number; maxConcurrentError?: string;
     tools?: string[]; skills?: string[]; subagentAgents?: string[]; modelFallback?: string | null;
   };
   /** Discovered choices only. Managed orchestration tools are excluded by the UI. */
@@ -82,6 +82,7 @@ interface SettingsView extends Component, Focusable {
   action: string;
   readonly hasSearchQuery: boolean;
   confirmLabel?: string;
+  movementHint?: string;
   hints?: string[];
 }
 
@@ -208,10 +209,10 @@ function selectionView(
 
 const MANAGED_TOOLS = new Set(["ask_question", "subagent", "subagent_interrupt", "subagent_message", "subagents_list"]);
 type ListField = "tools" | "skills" | "subagentAgents";
-type AgentField = "model" | "thinking" | "modelFallback" | ListField;
+type AgentField = "model" | "thinking" | "modelFallback" | "maxConcurrent" | ListField;
 const FIELD_LABELS: Record<AgentField, string> = {
   model: "Model", thinking: "Thinking", tools: "Tools", skills: "Skills",
-  subagentAgents: "Spawnable agents", modelFallback: "Model fallback",
+  subagentAgents: "Spawnable agents", modelFallback: "Model fallback", maxConcurrent: "Max concurrent",
 };
 const FIELD_HELP: Record<ListField, string> = {
   tools: "Optional tools only. ask_question is always included; spawning tools are managed by Spawnable agents. Empty means no optional tools.",
@@ -233,6 +234,7 @@ function agentValues(deps: SubagentSettingsDeps, name: string) {
   const tools = override.tools ?? defaults.tools;
   const skills = override.skills ?? defaults.skills;
   const spawnable = override.subagentAgents ?? defaults.subagentAgents;
+  const maxConcurrent = override.maxConcurrent !== undefined ? override.maxConcurrent : defaults.maxConcurrent;
   const source = (field: AgentField) => override[field] !== undefined ? "Custom override" : "Agent default";
   return {
     model: model ?? "Pi default",
@@ -248,6 +250,8 @@ function agentValues(deps: SubagentSettingsDeps, name: string) {
     subagentAgentsSource: `${source("subagentAgents")} · ${spawnable?.length ? "Managed spawning tools enabled" : "No spawning tools"}`,
     modelFallback: fallback === undefined || fallback === null ? "Disabled" : fallback === "inherit" ? "Inherit parent model" : fallback,
     modelFallbackSource: source("modelFallback"),
+    maxConcurrent: defaults.maxConcurrentError ? "Invalid profile limit" : maxConcurrent == null ? "Unlimited" : String(maxConcurrent),
+    maxConcurrentSource: override.maxConcurrent !== undefined ? "Custom override" : defaults.maxConcurrent !== undefined || defaults.maxConcurrentError ? "Agent default" : "Extension default",
     supportsThinking, piAgent, override, defaults,
   };
 }
@@ -422,6 +426,57 @@ function checkboxView(
   return view;
 }
 
+const CONCURRENCY_HELP = "Per-parent limit for the next spawn or resume. Running agents are not stopped.";
+
+function concurrencyInputView(
+  ctx: ExtensionContext,
+  name: string,
+  current: number | null | undefined,
+  profileError: string | undefined,
+  save: (value: number) => void,
+  back: () => void,
+): SettingsView {
+  const input = new Input({ prompt: "", placeholder: "Positive safe integer" });
+  // Seed through Input so its caret starts after the value, not before it.
+  input.handleInput(String(current ?? 1));
+  let error: string | undefined;
+  input.onSubmit = (value) => {
+    const raw = value.trim();
+    const limit = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(limit) || limit <= 0) {
+      error = `Enter a positive safe integer (1–${Number.MAX_SAFE_INTEGER}).`;
+      return;
+    }
+    try { save(limit); }
+    catch (failure) {
+      error = `Could not save Max concurrent: ${failure instanceof Error ? failure.message : String(failure)}`;
+      ctx.ui.notify(error, "error");
+    }
+  };
+  input.onEscape = back;
+  return {
+    path: [name, FIELD_LABELS.maxConcurrent, "Custom limit"], action: "Save", hasSearchQuery: false,
+    confirmLabel: keyLabel("tui.input.submit"), movementHint: "←→ Cursor",
+    get focused() { return input.focused; },
+    set focused(value) { input.focused = value; },
+    invalidate() { input.invalidate(); },
+    render(width) {
+      return [ctx.ui.theme.fg("muted", "Positive safe integer"), ...input.render(width), "",
+        ...wrapTextWithAnsi(ctx.ui.theme.fg(error ? "error" : "muted", error ?? CONCURRENCY_HELP), width),
+        ...(profileError ? ["", ...wrapTextWithAnsi(ctx.ui.theme.fg("error", `${profileError} Fix the agent file before spawning or resuming.`), width)] : []),
+      ].map((line) => truncateToWidth(line, width));
+    },
+    handleInput(data) {
+      const previous = input.getValue();
+      input.handleInput(data);
+      if (input.getValue() !== previous) error = undefined;
+    },
+    handleMouse(event) {
+      if (event.y === 1) return input.handleMouse({ ...event, y: 0 });
+    },
+  };
+}
+
 function agentView(
   ctx: ExtensionContext,
   deps: SubagentSettingsDeps,
@@ -434,8 +489,9 @@ function agentView(
     { value: "thinking", label: "Thinking" },
     { value: "modelFallback", label: FIELD_LABELS.modelFallback },
     { value: "tools", label: FIELD_LABELS.tools },
-    { value: "subagentAgents", label: FIELD_LABELS.subagentAgents },
     { value: "skills", label: FIELD_LABELS.skills },
+    { value: "subagentAgents", label: FIELD_LABELS.subagentAgents },
+    { value: "maxConcurrent", label: FIELD_LABELS.maxConcurrent },
     { value: "reset", label: "Reset to agent defaults" },
   ];
   const list = new SelectList(items, items.length, getSelectListTheme());
@@ -457,7 +513,35 @@ function agentView(
     const values = agentValues(deps, name);
     if (item.value === "reset") {
       if (!Object.keys(values.override).length) return;
-      deps.configState.update((draft) => { delete draft.agents[name]; });
+      try { deps.configState.update((draft) => { delete draft.agents[name]; }); }
+      catch (error) { ctx.ui.notify(`Could not reset agent defaults: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+    } else if (item.value === "maxConcurrent") {
+      const current = values.override.maxConcurrent !== undefined ? values.override.maxConcurrent : values.defaults.maxConcurrent;
+      const unlimitedId = "\u0000unlimited";
+      const customId = "\u0000custom";
+      const limits = [...new Set([1, ...(current == null ? [] : [current])])];
+      push(selectionView(ctx, {
+        path: [name, FIELD_LABELS.maxConcurrent], initial: current == null ? unlimitedId : String(current),
+        items: [
+          ...limits.map((limit) => ({ value: String(limit), label: `${limit} run${limit === 1 ? "" : "s"}` })),
+          { value: unlimitedId, label: "Unlimited" },
+          { value: customId, label: "Custom limit…" },
+          { value: resetId, label: "Reset field to agent defaults" },
+        ],
+        empty: "No concurrency choices available.",
+        detail: (selected) => values.defaults.maxConcurrentError ?
+          `${values.defaults.maxConcurrentError} Fix the agent file before spawning or resuming.` :
+          selected.value === resetId ? "Remove this override and restore the profile limit, or Unlimited if omitted." : CONCURRENCY_HELP,
+        onSelect: (selected) => {
+          if (selected.value === customId) {
+            push(concurrencyInputView(ctx, name, current, values.defaults.maxConcurrentError,
+              (limit) => { update("maxConcurrent", limit); back(); back(); }, back));
+            return;
+          }
+          try { save("maxConcurrent", selected.value === unlimitedId ? null : selected.value === resetId ? undefined : Number(selected.value)); }
+          catch (error) { ctx.ui.notify(`Could not save Max concurrent: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+        }, onBack: back,
+      }));
     } else if (item.value === "model") {
       const current = values.override.model ?? values.defaults.model;
       push(selectionView(ctx, {
@@ -530,18 +614,19 @@ function agentView(
         thinking: values.supportsThinking ? "Reasoning effort for new launches." : values.thinkingSource,
         modelFallback: "Used when the primary model cannot be used. Inherit uses the parent model; Disabled means no fallback.",
         ...FIELD_HELP,
+        maxConcurrent: values.defaults.maxConcurrentError ? `${values.defaults.maxConcurrentError} Fix the agent file before spawning or resuming.` : CONCURRENCY_HELP,
       };
       const lines: string[] = [];
       rowLines = [];
       for (const [index, item] of items.entries()) {
-        if (index === 3 || index === 6) lines.push("");
+        if (index === 3 || index === 7) lines.push("");
         rowLines.push(lines.length);
         const active = item.value === selected;
         const prefix = active ? "→ " : "  ";
         let value = "";
         if (item.value !== "reset") {
           const field = item.value as AgentField;
-          value = !values.piAgent && field !== "model" && field !== "thinking" ? "Unsupported for cli:claude" : values[field];
+          value = !values.piAgent && field !== "model" && field !== "thinking" && field !== "maxConcurrent" ? "Unsupported for cli:claude" : values[field];
           if (values.piAgent && field in memberships) {
             const entries = memberships[field as ListField];
             if (entries.length && visibleWidth(value) > valueWidth) {
@@ -570,11 +655,11 @@ function agentView(
         const hasOverrides = Object.keys(values.override).length > 0;
         lines.push(...helpLines(hasOverrides ? "Remove all custom overrides" : "Already using agent defaults", 1),
           ...helpLines("Restore every field to its profile default.", 2),
-          ...helpLines("Applies only to new launches; running and resumed sessions are unchanged.", 2));
+          ...helpLines("Sandbox changes: new launches only. Limits: next spawn/resume; running agents are not stopped.", 2));
       } else if (selected) {
         const field = selected as AgentField;
-        const unsupported = !values.piAgent && field !== "model";
-        const source = values.override[field] !== undefined ? "Custom override" :
+        const unsupported = !values.piAgent && field !== "model" && field !== "maxConcurrent";
+        const source = field === "maxConcurrent" ? values.maxConcurrentSource : values.override[field] !== undefined ? "Custom override" :
           field === "tools" && values.defaults.tools === undefined ? "Parent default" :
           (field === "model" && values.defaults.model === undefined || field === "thinking" && values.defaults.thinking === undefined) ? "Pi default" : "Agent default";
         const count = field in memberships ? memberships[field as ListField].length : 0;
@@ -591,7 +676,10 @@ function agentView(
       if (matchesKey(data, Key.delete)) {
         const field = list.getSelectedItem()?.value as AgentField | "reset" | undefined;
         const values = agentValues(deps, name);
-        if (field && field !== "reset" && (values.piAgent || field === "model")) update(field, undefined);
+        if (field && field !== "reset" && (values.piAgent || field === "model" || field === "maxConcurrent")) {
+          try { update(field, undefined); }
+          catch (error) { ctx.ui.notify(`Could not reset ${FIELD_LABELS[field]}: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+        }
       } else if (data === " ") list.onSelect?.(list.getSelectedItem()!);
       else list.handleInput(data);
     },
@@ -628,7 +716,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
         path: [], action: "Open", search: "agents", legend: "* Saved overrides",
         items: agents.map((agent) => ({ value: agent.name, label: agent.name })),
         formatItems: (items, width) => formatAgentItems(deps, agentNames, items, width),
-        detail: (item) => agents.find((agent) => agent.name === item.value)?.description ?? `Model, thinking, tools, spawnable agents, startup skills, and fallback defaults for ${item.value}.`,
+        detail: (item) => agents.find((agent) => agent.name === item.value)?.description ?? `Model, thinking, tools, spawnable agents, startup skills, fallback, and concurrency defaults for ${item.value}.`,
         empty: agents.length ? "No matching agents. Clear or change the search." : "No agents found. Add an agent definition to your agents directory.",
         onSelect: (item) => push(agentView(ctx, deps, item.value, push, back)), onBack: () => done(),
       }),
@@ -732,7 +820,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
             ? theme.fg("accent", theme.bold(label)) : theme.fg("muted", label)).join("  ");
         const navigationKeys = `${keyLabel("tui.select.up")}${keyLabel("tui.select.down")}`;
         const hints = [
-          `${navigationKeys} Move`, `${view.confirmLabel ?? keyLabel("tui.select.confirm")} ${view.action}`,
+          view.movementHint ?? `${navigationKeys} Move`, `${view.confirmLabel ?? keyLabel("tui.select.confirm")} ${view.action}`,
           ...(!stack.length ? [
             view.hasSearchQuery ? "←→ Cursor" : "←→ Panel",
             `${keyLabel("tui.input.tab")}/Shift+Tab Panel`,
@@ -742,7 +830,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
         ];
         return [
           theme.fg("accent", theme.bold("Subagent settings")),
-          theme.fg("dim", "Changes save immediately · New launches only"), navigation, border,
+          theme.fg("dim", "Changes save immediately · Limits: next spawn/resume"), navigation, border,
           ...view.render(innerWidth), border,
           ...shortcutLines(hints, innerWidth).map((line) => theme.fg("dim", line)),
         ].map((line) => truncateToWidth(" ".repeat(inset) + truncateToWidth(line, innerWidth), width));
@@ -784,7 +872,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
 
 export function registerSubagentSettingsCommand(pi: ExtensionAPI, deps: SubagentSettingsDeps): void {
   pi.registerCommand("subagent-settings", {
-    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, surface/status, cleanup",
+    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, concurrency, surface/status, cleanup",
     handler: async (_args, ctx) => { await showSubagentSettings(ctx, deps); },
   });
 }
