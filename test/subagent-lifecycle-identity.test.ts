@@ -147,6 +147,27 @@ describe("lifecycle identity and launch reservations", { concurrency: false }, (
     assert.equal(next.details.name, "scout-3");
   });
 
+  for (const exitCode of [0, 1]) {
+    it(`forwards completion telemetry for resumed Pi agents (exit ${exitCode})`, async (t) => {
+      const h = setup(t);
+      const file = h.session("bash-guard-worker", "worker");
+      const stats = {
+        model: "test/model", thinking: "high", toolCount: 13,
+        inputTokens: 3200, outputTokens: 500, cacheReadTokens: 1000,
+        cacheWriteTokens: 200, contextTokens: 4900, cost: 0.012,
+      };
+      const resumed = await h.call("subagent_message", { sessionPath: file, message: "continue" });
+      assert.equal(resumed.details.status, "started");
+      h.watches[0].done.resolve({ exitCode, elapsed: 446, stats });
+      await flush();
+      const completed = h.messages.find((message) => message.customType === "subagent_result");
+      assert.ok(completed);
+      assert.equal(completed.details.agent, "worker");
+      assert.equal(completed.details.exitCode, exitCode);
+      assert.deepEqual(completed.details.stats, stats);
+    });
+  }
+
   it("joins simultaneous name/path/symlink resumes and persists a new path handle for followup", async (t) => {
     const h = setup(t);
     const file = h.session("outside");

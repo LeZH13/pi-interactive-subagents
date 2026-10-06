@@ -658,6 +658,8 @@ export function mergeNewEntries(
 
 export interface SessionStats {
   model: string | null;
+  /** Last observed thinking level, absent when the session records none. */
+  thinking?: string;
   toolCount: number;
   /** Cumulative token usage across all assistant turns. */
   inputTokens: number;
@@ -672,7 +674,7 @@ export interface SessionStats {
 
 /**
  * Parse a completed subagent session JSONL into aggregate stats for display:
- * model, tool-call count, cumulative token usage + cost, and current context
+ * model/thinking, tool-call count, cumulative token usage + cost, and current context
  * size. Cumulative usage fields are summed across every assistant turn; the
  * context size is taken from the last assistant turn's `totalTokens` (the live
  * context window occupancy). Returns null if the file can't be read.
@@ -702,12 +704,19 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
       if (typeof modelId === "string" && modelId) stats.model = modelId;
       continue;
     }
+    if (entry.type === "thinking_level_change") {
+      const thinking = entry.thinkingLevel;
+      if (typeof thinking === "string" && thinking.trim()) stats.thinking = thinking.trim();
+      continue;
+    }
     if (entry.type !== "message") continue;
     const msg = (entry as MessageEntry).message;
     if (msg.role !== "assistant") continue;
 
     const model = (msg as { model?: unknown }).model;
     if (typeof model === "string" && model) stats.model = model;
+    const thinking = (msg as { thinkingLevel?: unknown }).thinkingLevel;
+    if (typeof thinking === "string" && thinking.trim()) stats.thinking = thinking.trim();
 
     for (const block of msg.content) {
       if (block.type === "toolCall") stats.toolCount++;

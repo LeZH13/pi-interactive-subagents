@@ -1,11 +1,11 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, symlinkSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, mkdirSync, rmSync, existsSync, symlinkSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { initTheme, Theme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { formatSubagentIdentity } from "../pi-extension/subagents/identity.ts";
 import { claimSession, enqueueMessage, recordCompletion, protocolDir, pendingMessages, authorizeLaunch } from "../pi-extension/subagents/protocol.ts";
@@ -1050,6 +1050,7 @@ describe("session.ts", () => {
   describe("summarizeSessionStats", () => {
     const asstWithUsage = (id: string, opts: {
       model?: string;
+      thinkingLevel?: string;
       tools?: string[];
       usage?: Record<string, unknown>;
     }) => ({
@@ -1059,6 +1060,7 @@ describe("session.ts", () => {
       message: {
         role: "assistant",
         ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.thinkingLevel ? { thinkingLevel: opts.thinkingLevel } : {}),
         content: [
           { type: "text", text: "ok" },
           ...(opts.tools ?? []).map((name, i) => ({ type: "toolCall", name, id: `${id}-tc${i}` })),
@@ -1100,6 +1102,24 @@ describe("session.ts", () => {
         asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
       ]);
       assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+    });
+
+    it("tracks thinking changes and per-message thinking without inventing missing telemetry", () => {
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "thinking_level_change", id: "t1", thinkingLevel: "low" },
+        asstWithUsage("a1", { thinkingLevel: "high" }),
+        asstWithUsage("a2", {}),
+        { type: "thinking_level_change", id: "invalid", thinkingLevel: 42 },
+        { type: "thinking_level_change", id: "empty", thinkingLevel: " " },
+      ]);
+      assert.equal(summarizeSessionStats(file)!.thinking, "high");
+      for (const thinkingLevel of ["off", "xhigh", "max", "32768"]) {
+        appendFileSync(file, JSON.stringify({ type: "thinking_level_change", thinkingLevel }) + "\n");
+        assert.equal(summarizeSessionStats(file)!.thinking, thinkingLevel);
+      }
+      const noThinking = createSessionFile(dir, [SESSION_HEADER, asstWithUsage("a1", {})]);
+      assert.equal(summarizeSessionStats(noThinking)!.thinking, undefined);
     });
 
     it("handles missing usage gracefully", () => {
@@ -5713,7 +5733,7 @@ const levels = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const thinkingTheme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
-  getThinkingBorderColor: (level: string) => (text: string) => `\x1b[38;5;${levels.indexOf(level) + 1}m${text}\x1b[0m`,
+  getThinkingBorderColor: (level: string) => (text: string) => `\x1b[38;5;${levels.indexOf(level) + 1}m${text}\x1b[39m`,
 };
 
 describe("subagents widget rendering", () => {
@@ -6053,7 +6073,13 @@ describe("subagent display helpers", () => {
         assert.ok(testApi.formatModelWithThinking("claude-3-7", level, thinkingTheme)
           .includes(`\x1b[38;5;${index + 1}m:${level}`));
       }
-      assert.match(testApi.formatModelWithThinking("claude-3-7", "16k", thinkingTheme), /\x1b\[38;2;214;181;94m:16k/);
+      const calls: [string, string][] = [];
+      const theme = { ...thinkingTheme, fg: (color: string, text: string) => {
+        calls.push([color, text]);
+        return text;
+      } };
+      assert.equal(testApi.formatModelWithThinking("claude-3-7", "16k", theme), "claude-3-7:16k");
+      assert.deepEqual(calls, [["dim", "claude-3-7"], ["warning", ":16k"]]);
     });
 
     it("parses inline model thinking suffix and honors explicit overrides", () => {
@@ -6899,7 +6925,7 @@ describe("subagent badge rendering and conciseness rules", () => {
     assert.doesNotMatch(sameRendered, /scout \[scout\]/);
   });
 
-  it("keeps completion model information on the metadata line, including model-only stats", () => {
+  it("keeps completion metadata in a separated footer, including model-only stats", () => {
     initTheme("dark", false);
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -6918,10 +6944,14 @@ describe("subagent badge rendering and conciseness rules", () => {
       }, { expanded: false }, theme).render(160);
       const headerIndex = lines.findIndex((line: string) => line.includes("subagent ·"));
       const header = lines[headerIndex];
-      assert.match(header, /subagent · settings-controls \[worker\] —/);
-      assert.match(header, exitCode === 0 ? /12 tools · 38s/ : /failed \(exit 1\) · 38s/);
-      assert.doesNotMatch(header, /model-name/);
-      assert.match(lines[headerIndex + 1], /provider\/a-very-long-model-name · ↑3\.2k ↓500/);
+      assert.match(header, /subagent · settings-controls \[worker\]/);
+      if (exitCode !== 0) assert.match(header, /failed \(exit 1\)/);
+      assert.doesNotMatch(header, /model-name|12 tools|38s/);
+      const summaryIndex = lines.findIndex((line: string) => line.trim() === "done");
+      const footerIndex = lines.findIndex((line: string) => line.includes(stats.model));
+      assert.ok(headerIndex < summaryIndex && summaryIndex < footerIndex);
+      assert.match(lines[footerIndex - 1].trim(), /^─+$/);
+      assert.match(lines[footerIndex].replace(/\x1b\[[0-9;]*m/g, ""), /provider\/a-very-long-model-name · 12 tools · 38s · ↑3\.2k ↓500/);
     }
 
     const modelOnly = renderer({
@@ -6930,7 +6960,120 @@ describe("subagent badge rendering and conciseness rules", () => {
     }, { expanded: false }, theme).render(160);
     const modelLine = modelOnly.find((line: string) => line.includes(stats.model));
     assert.ok(modelLine);
-    assert.doesNotMatch(modelLine, / · /, "model-only metadata has no dangling separator");
+    assert.match(modelLine.trim(), /^provider\/a-very-long-model-name · 12 tools · 1s$/);
+
+    const withoutStats = renderer({
+      content: "", details: { name: "worker", elapsed: 1 },
+    }, { expanded: false }, theme).render(80);
+    const dividerIndex = withoutStats.findIndex((line: string) => /^─+$/.test(line.trim()));
+    assert.ok(dividerIndex >= 0);
+    assert.equal(withoutStats[dividerIndex + 1].trim(), "1s");
+    assert.ok(!withoutStats.some((line: string) => /tools|↑|↓| · $/.test(line.trim())), "missing stats do not invent usage or dangling separators");
+  });
+
+  it("keeps the summary above the footer, previews five lines, and wraps without truncating content", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const summary = ["A long result with important details that must remain readable on narrow terminals.", "two", "three", "four", "five", "six"];
+    for (const expanded of [false, true]) {
+      for (const width of [32, 80]) {
+        const lines = renderer({
+          content: `Sub-agent "demo" completed (8s).\n\n${summary.join("\n")}\n\nFollow up with subagent_message({ name: "demo", message: "…" })`,
+          details: { name: "demo", agent: "scout", elapsed: 8, sessionFile: "/tmp/demo.jsonl" },
+        }, { expanded }, createTheme()).render(width);
+        for (const line of lines) assert.ok(visibleWidth(line) <= width);
+        const dividerIndex = lines.findIndex((line: string) => /^─+$/.test(line.trim()));
+        const body = lines.slice(0, dividerIndex).join("\n").replace(/\s/g, "");
+        assert.ok(body.includes(summary[0].replace(/\s/g, "")), "wrapped summary is not truncated");
+        assert.ok(body.includes("twothreefourfive"));
+        if (expanded) {
+          assert.ok(body.includes("six"));
+          assert.ok(lines.slice(dividerIndex).join("\n").includes("Session file:"));
+        } else {
+          assert.ok(body.includes("…1morelines"));
+          assert.ok(!body.includes("six"));
+          assert.ok(!lines.join("\n").includes("Session file:"));
+        }
+        assert.ok(!body.includes("Sub-agent"));
+        assert.ok(!body.includes("Followup"));
+        assert.equal(lines[dividerIndex + 1].trim(), "8s");
+      }
+    }
+  });
+
+  it("shows a single-line footer and reveals cache/cost/context only when expanded", () => {
+    initTheme("dark", false);
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const theme = { ...createTheme(), ...thinkingTheme };
+    for (const expanded of [false, true]) {
+      for (const thinking of [undefined, "off", "high", "xhigh", "max", "32768"]) {
+        for (const exitCode of [0, 1]) {
+          const lines = renderer({
+            content: "done",
+            details: { name: "bash-guard-worker", agent: "worker", elapsed: 446, exitCode, stats: {
+              model: "model-id", thinking, toolCount: 13,
+              inputTokens: 3200, outputTokens: 500, cacheReadTokens: 1000,
+              cacheWriteTokens: 200, contextTokens: 4900, cost: 0.012,
+            } },
+          }, { expanded }, theme).render(160).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+          const headerIndex = lines.findIndex((line: string) => line.includes("subagent ·"));
+          assert.match(lines[headerIndex], /bash-guard-worker \[worker\]/);
+          assert.doesNotMatch(lines[headerIndex], /model-id/);
+          assert.doesNotMatch(lines[headerIndex], /13 tools|7m 26s/);
+          const suffix = thinking && thinking !== "off" ? `:${thinking}` : "";
+          const footerIndex = lines.findIndex((line: string) => line.includes(`model-id${suffix}`));
+          assert.equal(lines[footerIndex].trim(), `model-id${suffix} · 13 tools · 7m 26s · ↑3.2k ↓500`);
+          assert.match(lines[footerIndex - 1].trim(), /^─+$/);
+          const text = lines.join("\n");
+          if (expanded) assert.match(lines[footerIndex + 1], /cache R1\.0k W200 · \$0\.012 · 4\.9k ctx/);
+          else assert.doesNotMatch(text, /R1\.0k|W200|\$0\.012|4\.9k ctx/);
+        }
+      }
+    }
+  });
+
+  it("preserves completion backgrounds through model/thinking metadata using real theme styling", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const theme = new Theme({
+      dim: 8, muted: 8, text: 7, toolTitle: 7, success: 2, error: 1, warning: 3,
+      thinkingMinimal: 6, thinkingLow: 6, thinkingMedium: 5, thinkingHigh: 5, thinkingXhigh: 5,
+    } as any, { selectedBg: 0, toolSuccessBg: 22, toolErrorBg: 52 } as any, "256color", { dim: ["dim"] });
+    for (const expanded of [false, true]) {
+      for (const exitCode of [0, 1]) {
+        for (const thinking of [undefined, "off", ...levels, "32768", "custom"]) {
+          const lines = renderer({
+            content: "done", details: { name: "completion-demo", agent: "scout", elapsed: 11, exitCode, stats: {
+              model: "gpt-6-luna", thinking, toolCount: 1, inputTokens: 4200,
+              outputTokens: 73, cacheReadTokens: 2600, cacheWriteTokens: 0, contextTokens: 3800, cost: 0.001,
+            } },
+          }, { expanded }, theme).render(160);
+          const metadata = lines.find((line: string) => line.includes("gpt-6-luna"))!;
+          assert.ok(metadata);
+          assert.ok(metadata.startsWith(theme.getBgAnsi(exitCode === 0 ? "toolSuccessBg" : "toolErrorBg")));
+          assert.doesNotMatch(metadata, /\x1b\[(?:0|)m/, "full ANSI resets clear the box background");
+          assert.doesNotMatch(metadata, /\x1b\[38;5;(?:3|5)m/, "footer thinking stays dim, including numeric budgets");
+          assert.equal(metadata.match(/\x1b\[49m/g)?.length, 1, "only the outer box closes its background");
+          assert.match(metadata.replace(/\x1b\[[0-9;]*m/g, ""), /1 tool · 11s · ↑4\.2k ↓73/);
+          const extra = lines.find((line: string) => line.includes("cache"));
+          if (expanded) {
+            assert.ok(extra);
+            assert.match(extra.replace(/\x1b\[[0-9;]*m/g, ""), /cache R2\.6k · \$0\.001 · 3\.8k ctx/);
+            assert.doesNotMatch(extra, /\x1b\[(?:0|)m/);
+            assert.equal(extra.match(/\x1b\[49m/g)?.length, 1);
+          } else assert.equal(extra, undefined);
+          if (exitCode === 0) {
+            const text = lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+            assert.ok(text.includes("1 tool · 11s"));
+            assert.ok(!text.includes("1 tools"));
+          }
+        }
+      }
+    }
   });
 
   it("question headers use the same identity and duplicate-profile omission", () => {
@@ -6958,6 +7101,7 @@ describe("subagent badge rendering and conciseness rules", () => {
       ...createTheme(),
       fg: (_color: string, text: string) => `\x1b[2m${text}\x1b[0m`,
       bold: (text: string) => `\x1b[1m${text}\x1b[0m`,
+      getThinkingBorderColor: thinkingTheme.getThinkingBorderColor,
     };
     const name = "settings-controls-界面-refactoring-with-a-long-name";
     const agent = "worker";
@@ -6988,7 +7132,7 @@ describe("subagent badge rendering and conciseness rules", () => {
         cases.push(
           { component: result({
             content: "Done", details: { name, agent, elapsed: 38, stats: {
-              model, toolCount: 12, inputTokens: 3200, outputTokens: 500,
+              model, thinking: "high", toolCount: 12, inputTokens: 3200, outputTokens: 500,
               cacheReadTokens: 0, cacheWriteTokens: 0, contextTokens: 0, cost: 0,
             } },
           }, { expanded }, theme), state: "12 tools · 38s" },
@@ -7054,7 +7198,15 @@ describe("subagent badge rendering and conciseness rules", () => {
 
     const sessionFile = join(dir, "subagent-res.jsonl");
     const priorOwner = claimSession(sessionFile, "previous-resume", true);
-    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "child-res" }) + "\n");
+    writeFileSync(sessionFile, [
+      { type: "session", id: "child-res" },
+      { type: "thinking_level_change", id: "thinking", thinkingLevel: "high" },
+      { type: "message", id: "prior-output", message: {
+        role: "assistant", model: "test/model",
+        content: [{ type: "toolCall", id: "read-1", name: "read", arguments: {} }],
+        usage: { input: 100, output: 20, totalTokens: 120 },
+      } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
     writeSubagentLoadout(sessionFile, {
       agent: "scout",
       toolAllowlist: "read",
@@ -7080,6 +7232,11 @@ describe("subagent badge rendering and conciseness rules", () => {
     const completed = await completion;
     assert.equal(completed.details?.agent, "scout");
     assert.equal(completed.details?.exitCode, 0);
+    assert.deepEqual(completed.details?.stats, {
+      model: "test/model", thinking: "high", toolCount: 1,
+      inputTokens: 100, outputTokens: 20, cacheReadTokens: 0,
+      cacheWriteTokens: 0, contextTokens: 120, cost: 0,
+    });
     assert.equal(runningMap.size, 0, "watcher removes the completed run");
   });
 });

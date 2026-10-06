@@ -1042,6 +1042,7 @@ const ICON_RED = "\x1b[38;2;224;108;117m";
 const ICON_DIM = "\x1b[38;2;128;128;128m";
 
 type ThinkingTheme = {
+  fg: Theme["fg"];
   getThinkingBorderColor(level: string): (text: string) => string;
 };
 
@@ -1049,17 +1050,19 @@ function formatModelWithThinking(rawModel: string, thinkingOverride: string | un
   const { model: baseModel, thinking: inlineThinking } = splitModelThinking(rawModel);
   const effectiveModel = (baseModel ?? rawModel).trim();
   const effectiveThinking = (thinkingOverride ?? inlineThinking)?.trim();
+  // Foreground-only theme helpers preserve backgrounds supplied by transcript boxes.
+  const model = theme.fg("dim", effectiveModel);
   if (!effectiveThinking || effectiveThinking.toLowerCase() === "off" || effectiveThinking.toLowerCase() === "none") {
-    return `${ICON_DIM}${effectiveModel}${RST}`;
+    return model;
   }
   const normalized = effectiveThinking.toLowerCase();
   const label = `:${effectiveThinking}`;
   const colored = /^\d/.test(normalized)
-    ? `${ICON_YELLOW}${label}`
+    ? theme.fg("warning", label)
     : ["minimal", "low", "medium", "high", "xhigh", "max"].includes(normalized)
       ? theme.getThinkingBorderColor(normalized)(label)
-      : `${ICON_DIM}${label}`;
-  return `${ICON_DIM}${effectiveModel}${RST}${colored}${RST}`;
+      : theme.fg("dim", label);
+  return model + colored;
 }
 
 /** Map a live status kind to a colored single-char icon for the widget. */
@@ -3847,6 +3850,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
                   sessionId: resumedSessionId,
+                  ...(result.stats ? { stats: result.stats } : {}),
                   ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
                   ...(result.undeliveredMessages ? { undeliveredMessages: result.undeliveredMessages } : {}),
                   ...(result.ownershipError ? { ownershipError: result.ownershipError } : {}),
@@ -4047,34 +4051,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
         const identity = formatSubagentIdentity(name, details.agent, theme);
-        const titleSegment = `${icon} ${theme.fg("dim", "subagent · ")}${identity} ${theme.fg("dim", "—")} `;
-
-        // Success: icon already conveys "completed", so show "N tools · duration"
-        // like the in-process extension. Failure: surface the failure reason.
-        let header: string;
+        let header = `${icon} ${theme.fg("dim", "subagent · ")}${identity}`;
         if (failed) {
           const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
-          header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
-        } else {
-          const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
-          header = `${titleSegment}${theme.fg("dim", toolPart)}`;
+          header += ` ${theme.fg("dim", "—")} ${theme.fg("error", reason)}`;
         }
 
-        // Metadata line: model · ↑in ↓out R… W… $cost context-gauge (color-coded by %).
-        let usageLine: string | null = null;
+        // Quiet footer: model:thinking · tools · duration · ↑in ↓out.
+        const footerSegments: string[] = [];
+        if (stats?.model) footerSegments.push(theme.fg("dim", [stats.model, stats.thinking && !["off", "none"].includes(stats.thinking.toLowerCase()) ? stats.thinking : null].filter(Boolean).join(":")));
+        if (stats) footerSegments.push(theme.fg("dim", `${stats.toolCount} ${stats.toolCount === 1 ? "tool" : "tools"}`));
+        footerSegments.push(theme.fg("dim", elapsed));
         if (stats) {
-          const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
+          const io = formatUsageSegments({ ...stats, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0 });
+          if (io.length) footerSegments.push(theme.fg("dim", io.join(" ")));
+        }
+        const footerLine = footerSegments.join(theme.fg("dim", " · "));
+
+        // Cache/cost/context are secondary details, shown only on expansion.
+        const extraSegments: string[] = [];
+        if (options.expanded && stats) {
+          const cache = formatUsageSegments({ ...stats, inputTokens: 0, outputTokens: 0, cost: 0 });
+          if (cache.length) extraSegments.push(theme.fg("dim", `cache ${cache.join(" ")}`));
+          if (stats.cost) extraSegments.push(theme.fg("dim", `$${stats.cost.toFixed(3)}`));
           if (stats.contextTokens > 0) {
             const window = contextWindowFor(stats.model);
             const ctxStr = formatContextUsage(stats.contextTokens, window);
             const pct = window ? (stats.contextTokens / window) * 100 : 0;
-            const coloredCtx =
-              pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
-            segs.push(coloredCtx);
+            extraSegments.push(theme.fg(pct > 90 ? "error" : pct > 70 ? "warning" : "dim", ctxStr));
           }
-          const model = stats.model ? theme.fg("dim", stats.model) : "";
-          const usage = segs.join(theme.fg("dim", " "));
-          usageLine = [model, usage].filter(Boolean).join(theme.fg("dim", " · ")) || null;
         }
 
         const rawContent = typeof message.content === "string" ? message.content : "";
@@ -4091,17 +4096,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             "",
           );
 
-        // Build content for the box
         const contentLines = [header];
-        if (usageLine) contentLines.push(usageLine);
+        if (summary) {
+          contentLines.push("");
+          const summaryLines = summary.split("\n");
+          contentLines.push(...(options.expanded ? summaryLines : summaryLines.slice(0, 5)));
+          if (!options.expanded && summaryLines.length > 5) {
+            contentLines.push(theme.fg("muted", `… ${summaryLines.length - 5} more lines`));
+          }
+        }
+
+        const dividerWidth = Math.max(0, Math.min(width - 2, visibleWidth(footerLine)));
+        contentLines.push("", theme.fg("dim", "─".repeat(dividerWidth)), footerLine);
+        if (extraSegments.length) contentLines.push(extraSegments.join(theme.fg("dim", " · ")));
 
         if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) {
-            for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
-            }
-          }
           if (details.name || details.sessionFile) {
             contentLines.push("");
             if (details.name) {
@@ -4117,18 +4126,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
           }
         } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
-            }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
-            }
-          }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          contentLines.push("", theme.fg("muted", keyHint("app.tools.expand", "to expand")));
         }
 
         // Render via Box for background + padding, with blank line above for separation
