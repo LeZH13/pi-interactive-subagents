@@ -181,6 +181,8 @@ export interface SubagentLoadout {
   toolAllowlist: string | null;
   /** Resolved backing extension entries, frozen at launch rather than rediscovered on resume. */
   toolExtensionPaths?: string[];
+  /** Required bash safety extension, resolved once and replayed without rediscovery. */
+  bashGuardExtensionPath?: string;
   /** Model id (without thinking suffix), or null to use the session default. */
   model: string | null;
   /** Thinking level appended to the model as `model:level`, or null. */
@@ -214,12 +216,7 @@ export function getSubagentSessionDir(artifactDir: string): string {
 
 /** Persist a subagent's resolved sandbox loadout beside its session file. */
 export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoadout): void {
-  try {
-    writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
-  } catch {
-    // Best-effort: a missing snapshot only means resume will refuse, never that
-    // it launches unrestricted.
-  }
+  writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify(loadout), "utf8");
 }
 
 /** Read a subagent's loadout snapshot, or null if absent/unparseable. */
@@ -233,6 +230,10 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (parsed.toolExtensionPaths !== undefined &&
       (!Array.isArray(parsed.toolExtensionPaths) ||
         parsed.toolExtensionPaths.some((path: unknown) => typeof path !== "string" || !path.trim()))) {
+      return null;
+    }
+    if (parsed.bashGuardExtensionPath !== undefined &&
+      (typeof parsed.bashGuardExtensionPath !== "string" || !parsed.bashGuardExtensionPath.trim())) {
       return null;
     }
     return parsed as SubagentLoadout;

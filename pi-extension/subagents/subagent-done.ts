@@ -17,6 +17,7 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { drainInbox, openSession, validateChildOwner, reopenSessionDelivery, retrySessionOperation, SessionBusyError, type InboxMessage } from "./protocol.ts";
+import { bashGuardReady } from "./bash-guard.ts";
 import {
   createSubagentActivityRecorder,
   type SubagentTelemetry,
@@ -367,8 +368,22 @@ export default async function (pi: ExtensionAPI) {
     if (intent && idleExit === intent && mayFinish && result?.closed) finishAutoExit(intent.messages, intent.telemetry, intent.ctx);
   }
 
+  function requireBashGuard(ctx: import("@earendil-works/pi-coding-agent").ExtensionContext): boolean {
+    if (!pi.getAllTools().some((tool) => tool.name === "bash") || bashGuardReady()) return true;
+    const errorMessage = "Cannot start bash-enabled subagent: bash-guard did not initialize in enforced deny mode. Check its installation and extension errors.";
+    if (sessionFile) {
+      try {
+        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "error", errorMessage,
+          stopReason: "error", ...identity, createdAt: Date.now() }));
+      } catch { /* Diagnostic persistence must never prevent shutdown or tool blocking. */ }
+    }
+    ctx.shutdown();
+    return false;
+  }
+
   // Show widget + status bar only after child ownership has been validated and opened.
   function startSession(ctx: import("@earendil-works/pi-coding-agent").ExtensionContext) {
+    if (!requireBashGuard(ctx)) return;
     shuttingDown = false;
     latestContext = ctx;
     recorder.sessionStart(telemetryFromContext(ctx));
@@ -407,6 +422,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
+    if (!requireBashGuard(ctx)) return;
     clearExitIntent();
     runCancelled = false;
     runAssistantMessage = undefined;
@@ -414,6 +430,7 @@ export default async function (pi: ExtensionAPI) {
   });
 
   function startRun(ctx: import("@earendil-works/pi-coding-agent").ExtensionContext) {
+    if (!requireBashGuard(ctx)) return;
     clearExitIntent();
     deliveryClosed = false;
     agentStarted = true;
@@ -543,7 +560,8 @@ export default async function (pi: ExtensionAPI) {
     recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", (event, ctx) => {
+    if (!requireBashGuard(ctx)) return { block: true, reason: "Required bash-guard is not ready in enforced deny mode." };
     recorder.toolCall((event as any).toolCallId, (event as any).toolName);
   });
 

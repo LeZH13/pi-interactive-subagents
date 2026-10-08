@@ -40,6 +40,20 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
+### Shell safety
+
+Pi subagents granted `bash` require a configured, installed **`@zle13/pi-bash-guard` >= 0.3.0**:
+
+```bash
+pi install npm:@zle13/pi-bash-guard@^0.3.0
+```
+
+The extension explicitly loads the guard despite `--no-extensions` and sets `PI_BASH_GUARD_APPROVAL_MODE=deny`. Commands passing the guard's existing rules/Jev assessment run normally; commands requiring approval are denied, including assessment failures/timeouts. No approval dialogs open in child panes. This launch policy keeps the guard enabled despite config, flags, or session toggles. The footer shows `⛨ BG deny`, retaining existing watchdog activity and decision counts.
+
+Missing, incompatible, or failed guard initialization stops the child; there is no unguarded or `safe_bash` fallback. Guard sources are resolved from Pi's configured installed packages (project before user), never downloaded during launch, and pinned in the loadout for resume. Guarded children start with Pi's `--offline` flag to prevent startup package installs/updates from changing that pinned source. This also skips startup catalog/helper downloads; missing or version-mismatched package resources are unavailable until installed separately. Normal model inference and web tools remain network-capable. Resumes validate and replay that source rather than substituting a currently configured package. Bash snapshots without a pinned guard must be replaced by a new launch.
+
+Alternatively, explicitly select `safe_bash` for its existing static dangerous-command filtering. Choose **one** shell policy per profile; granting both is rejected. Neither policy enforces read-only execution, so read-only profiles should remain shell-free. Codemode's `tools.bash()` runs through the same guard hooks. Other shell-executing tools and Claude CLI agents are outside this integration.
+
 ### Codemode (Pi 1.0)
 
 Codemode is included in the bundled **scout**, **researcher**, and **worker** profiles for batching independent calls and filtering large results. Custom profiles remain **opt-in**: include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
@@ -134,7 +148,7 @@ Different sub-agents can wait in parallel; each child permits only one pending q
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
 | **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls`, `codemode` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `codemode` | Web research, synthesized into a sourced brief |
+| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `bash`, `codemode` | Web research, synthesized into a sourced brief |
 | **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `get_search_content`, `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
 
 All three are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if GLM-5.3 fails.
@@ -175,7 +189,7 @@ You are a specialized agent that does X...
 | `model-fallback` | string | Optional one-shot fallback model. Use `inherit` to copy the immediate spawning session's live model, or provide a concrete model id |
 | `thinking` | string | Default reasoning level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a token budget) |
 | `max-concurrent` | positive integer | Maximum admitted runs of this profile per parent runtime; omission means Unlimited. Applies to starts and resumes, including startup and fallback; settings can override it |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_enable`, `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Opt-in built-in extension: `codemode`. Extension-backed: `web_enable`, `web_search`, `fetch_content`, `get_search_content`, `source_check`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools, plus required bash-guard when `bash` is granted, are loaded into the child |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. A nonempty effective list grants the spawning toolset (`subagent`, `subagent_interrupt`, `subagent_message`, `subagents_list`) and restricts targets to that list within the parent's allowed agents. Settings can override the list; an empty list disables spawning |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -239,7 +253,7 @@ Use **← / →** for the previous / next panel when the search is empty, **Tab 
 
 **Visible to model** is a per-agent On/Off toggle supported by both Pi and Claude CLI profiles. Enter or Space toggles it and saves immediately. Off hides the agent from `subagents_list`, but does not prevent explicit spawning by name or remove it from settings or spawnable-agent choices. The saved `agents.<name>.disableModelInvocation` boolean overrides the Markdown `disable-model-invocation` field (`false` means visible); without either, agents are visible. Delete restores the profile default, and **Reset to agent defaults** also clears the visibility override. Visibility changes take effect on the next listing without a reload and do not stop running agents.
 
-Absent override fields use the agent Markdown defaults. Explicit `tools: []` grants no optional tools, `skills: []` invokes no startup skills, `subagentAgents: []` disables spawning, `modelFallback: null` disables fallback, and `maxConcurrent: null` explicitly removes a profile's concurrency limit. If neither the definition nor settings specify tools, new agents inherit the spawner's active optional tools. `ask_question` remains a managed control tool; spawning tools are managed automatically from the effective spawnable-agent list, which cannot widen an inherited agent restriction. The Tools picker includes supported Pi built-ins even when excluded or inactive in the parent, built-in extensions `codemode` and `tool_search`, bundled `safe_bash`, and registered workspace extension tools, deduplicated by name. Other pickers use current-session discoveries. Unavailable existing entries are preserved rather than silently deleted. Adding tools to the catalog does not change the inherited active-tool defaults. Child tools remain independently configurable; parent CLI tool exclusions are not a delegation ceiling. `safe_bash` and native `bash` are independent grants: allowing native `bash` bypasses `safe_bash` command filters.
+Absent override fields use the agent Markdown defaults. Explicit `tools: []` grants no optional tools, `skills: []` invokes no startup skills, `subagentAgents: []` disables spawning, `modelFallback: null` disables fallback, and `maxConcurrent: null` explicitly removes a profile's concurrency limit. If neither the definition nor settings specify tools, new agents inherit the spawner's active optional tools. `ask_question` remains a managed control tool; spawning tools are managed automatically from the effective spawnable-agent list, which cannot widen an inherited agent restriction. The Tools picker includes supported Pi built-ins even when excluded or inactive in the parent, built-in extensions `codemode` and `tool_search`, bundled `safe_bash`, and registered workspace extension tools, deduplicated by name. Other pickers use current-session discoveries. Unavailable existing entries are preserved rather than silently deleted. Adding tools to the catalog does not change the inherited active-tool defaults. Child tools remain independently configurable; parent CLI tool exclusions are not a delegation ceiling. Shell tools are mutually exclusive: `bash` requires bash-guard in enforced deny mode, while `safe_bash` retains its static filtering. See [Shell safety](#shell-safety).
 
 Model/thinking precedence is **explicit spawn args > settings-page override > agent markdown default**. The old `/subagent-mux` and `/subagent-sessions` commands are removed; explicit `/subagent agent@model:thinking` args still win for a single spawn.
 

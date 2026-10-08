@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -41,6 +41,22 @@ describe("loadout backing extension snapshots", () => {
       };
       writeSubagentLoadout(sessionFile, snapshot);
       assert.deepEqual(readSubagentLoadout(sessionFile), snapshot);
+    });
+  });
+
+  it("fails loudly when the required loadout cannot be persisted", () => {
+    withSession((sessionFile) => {
+      mkdirSync(loadoutSidecarPath(sessionFile));
+      assert.throws(() => writeSubagentLoadout(sessionFile, loadout), /EISDIR/);
+    });
+  });
+
+  it("refuses malformed pinned guard entries", () => {
+    withSession((sessionFile) => {
+      for (const bashGuardExtensionPath of [null, 7, [], "", "  "]) {
+        writeFileSync(loadoutSidecarPath(sessionFile), JSON.stringify({ ...loadout, bashGuardExtensionPath }));
+        assert.equal(readSubagentLoadout(sessionFile), null);
+      }
     });
   });
 

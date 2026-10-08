@@ -13,6 +13,7 @@ import childExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __test__ as runtime } from "../pi-extension/subagents/index.ts";
 import { createStatusState } from "../pi-extension/subagents/status.ts";
 import { shellEscape } from "../pi-extension/subagents/surface.ts";
+import { writeSubagentLoadout } from "../pi-extension/subagents/session.ts";
 
 function openSession(file: string, owner: Parameters<typeof openOwner>[1]) {
   authorizeLaunch(file, owner);
@@ -31,8 +32,11 @@ function fixture(t: TestContext) {
   const persisted = (item: any) => ({ type: "custom_message", customType: "subagent_steer", details: { messageId: item.messageId, runId: item.runId } });
   return { dir, file, owner, branch, sent, deliver, persisted };
 }
-function child(t: TestContext) {
+function child(t: TestContext, guarded = false, persistLoadout = true, exitDirectory = false) {
   const h = fixture(t);
+  if (exitDirectory) mkdirSync(`${h.file}.exit`);
+  if (guarded && persistLoadout) writeSubagentLoadout(h.file, { agent: "worker", toolAllowlist: "bash,ask_question", model: null,
+    thinking: null, systemPromptMode: null, identity: null, spawnable: [], autoExit: true, cwd: h.dir, agentDir: null });
   const vars = { PI_SUBAGENT_SESSION: h.file, PI_SUBAGENT_RUN_ID: h.owner.runId,
     PI_SUBAGENT_OWNER_TOKEN: h.owner.ownerToken, PI_SUBAGENT_AUTO_EXIT: "1" };
   const saved = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
@@ -49,7 +53,7 @@ function child(t: TestContext) {
   const notifications: string[] = [];
   const api = {
     on: (event: string, handler: any) => handlers.set(event, handler),
-    registerTool: (tool: any) => tools.set(tool.name, tool), registerShortcut() {}, getAllTools: () => [],
+    registerTool: (tool: any) => tools.set(tool.name, tool), registerShortcut() {}, getAllTools: () => guarded ? [{ name: "bash" }] : [],
     sendMessage: (message: any, options: any) => { if (sendFails) throw new Error("send failed"); h.sent.push({ message, options }); },
   } as any;
   const ctx = { isIdle: () => true, sessionManager: { getBranch: () => h.branch }, shutdown: () => { shutdowns++; },
@@ -81,6 +85,45 @@ function child(t: TestContext) {
 const moduleUrl = pathToFileURL(resolve("pi-extension/subagents/protocol.ts")).href;
 
 describe("shared session ownership and delivery protocol", { concurrency: false }, () => {
+  it("shuts down and blocks calls when a required guard failed to initialize", (t) => {
+    const key = Symbol.for("@zle13/pi-bash-guard/runtime");
+    const globals = globalThis as any;
+    const previous = globals[key];
+    delete globals[key];
+    t.after(() => { if (previous === undefined) delete globals[key]; else globals[key] = previous; });
+    const h = child(t, true);
+    assert.ok(h.shutdowns() > 0);
+    assert.match(JSON.parse(readFileSync(`${h.file}.exit`, "utf8")).errorMessage, /did not initialize in enforced deny mode/);
+    assert.equal(h.emit("tool_call", { toolName: "bash", toolCallId: "nested-bash" }).block, true);
+  });
+
+  it("enforces the guard without a loadout and still shuts down when diagnostics cannot be written", (t) => {
+    const key = Symbol.for("@zle13/pi-bash-guard/runtime");
+    const globals = globalThis as any;
+    const previous = globals[key];
+    delete globals[key];
+    t.after(() => { if (previous === undefined) delete globals[key]; else globals[key] = previous; });
+    const h = child(t, true, false, true);
+    assert.ok(h.shutdowns() > 0);
+    assert.equal(h.emit("tool_call", { toolName: "bash", toolCallId: "without-loadout" }).block, true);
+  });
+
+  it("starts only with a ready enabled deny-mode guard, not a prompt-mode marker", (t) => {
+    const key = Symbol.for("@zle13/pi-bash-guard/runtime");
+    const globals = globalThis as any;
+    const previous = globals[key];
+    globals[key] = { ready: true, approvalMode: "deny", guardEnabled: true };
+    t.after(() => { if (previous === undefined) delete globals[key]; else globals[key] = previous; });
+    const h = child(t, true);
+    assert.equal(h.shutdowns(), 0);
+    assert.equal(h.emit("tool_call", { toolName: "bash", toolCallId: "bash" }), undefined);
+    for (const marker of [{ ready: false, approvalMode: "deny", guardEnabled: true },
+      { ready: true, approvalMode: "prompt", guardEnabled: true }, { ready: true, approvalMode: "deny", guardEnabled: false }]) {
+      globals[key] = marker;
+      assert.equal(h.emit("tool_call", { toolName: "bash", toolCallId: "blocked" }).block, true);
+    }
+  });
+
   it("serializes closure-before-enqueue and rejects late input without false acceptance", (t) => {
     const h = fixture(t); openSession(h.file, h.owner);
     const closed = drainInbox(h.file, h.owner, { branch: [], deliver: h.deliver, close: true });

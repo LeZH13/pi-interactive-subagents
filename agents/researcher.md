@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
-tools: web_enable, web_search, fetch_content, get_search_content, source_check, safe_bash, codemode
+tools: web_enable, web_search, fetch_content, get_search_content, source_check, bash, codemode
 model: openrouter/z-ai/glm-5.3
 model-fallback: inherit
 thinking: medium

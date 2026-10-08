@@ -6592,7 +6592,7 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
     await withIsolatedAgentEnv(async () => {
       const expected: Record<string, string[]> = {
         scout: ["read", "grep", "find", "ls", "codemode"],
-        researcher: ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "safe_bash", "codemode"],
+        researcher: ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "bash", "codemode"],
         worker: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
       };
       for (const [name, tools] of Object.entries(expected)) {

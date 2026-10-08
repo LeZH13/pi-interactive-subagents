@@ -60,6 +60,7 @@ import {
 } from "./config.ts";
 import { registerSubagentSettingsCommand } from "./settings.ts";
 import { registerSubagentsAuditCommand } from "./audit-command.ts";
+import { hasBash, resolveBashGuardExtension, validateBashGuardExtension, validateShellSelection } from "./bash-guard.ts";
 import { formatSubagentIdentity } from "./identity.ts";
 import { canonicalSessionPath, claimSession, abandonStartingSession, enqueueMessage, pendingMessages, finalizeSession, type SessionOwner, type InboxMessage } from "./protocol.ts";
 import {
@@ -356,10 +357,10 @@ function getSubagentToolCatalog(pi: ExtensionAPI, cwd: string): Array<{ name: st
       name, description, available: !!getToolExtensionPath(name, cwd),
     });
   }
-  for (const name of ["bash", "safe_bash"]) {
-    const tool = catalog.get(name)!;
-    tool.description = `${tool.description ?? builtinDescriptions[name] ?? ""} Granting native bash bypasses safe_bash's command filters.`.trim();
-  }
+  const bash = catalog.get("bash")!;
+  bash.description = `${bash.description ?? builtinDescriptions.bash} Requires bash-guard in enforced deny mode. Choose bash or safe_bash, not both.`;
+  const safeBash = catalog.get("safe_bash")!;
+  safeBash.description = `${safeBash.description ?? bundledDescriptions.safe_bash} Uses its own filtering, not bash-guard. Choose bash or safe_bash, not both.`;
   return [...catalog.values()];
 }
 
@@ -376,6 +377,7 @@ function snapshotToolExtensionPaths(tools: string[], cwd: string): string[] {
 }
 
 function validateSubagentTools(tools: string[], cwd: string): void {
+  validateShellSelection(tools);
   for (const tool of tools) {
     if (BUILTIN_TOOLS.has(tool) || (SUBAGENT_CONTROL_TOOLS as readonly string[]).includes(tool)) continue;
     if (!getToolExtensionPath(tool, cwd)) {
@@ -1584,6 +1586,17 @@ function applySandboxToParts(
   loadout: SubagentLoadout,
   opts: { artifactDir: string; name: string },
 ): void {
+  if (loadout.toolAllowlist) validateShellSelection(loadout.toolAllowlist.split(","));
+  if (hasBash(loadout.toolAllowlist)) {
+    if (!loadout.bashGuardExtensionPath) {
+      throw new Error("Cannot launch bash-enabled subagent: its loadout has no pinned bash-guard source. Start a new subagent with bash-guard installed, or select safe_bash.");
+    }
+    const guardPath = validateBashGuardExtension(loadout.bashGuardExtensionPath);
+    // Load the guard before subagent-done: its startup readiness check must run after guard initialization.
+    parts.splice(1, 0, "-e", shellEscape(guardPath));
+    // Pi otherwise resolves/installs configured packages even with --no-extensions.
+    parts.push("--offline");
+  }
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
     parts.push("--model", shellEscape(model));
@@ -2367,11 +2380,18 @@ async function launchSubagent(
 
   const { effectiveCwd, localAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? parent.cwd;
+  const resolvedAgentDir =
+    localAgentDir && existsSync(localAgentDir)
+      ? localAgentDir
+      : process.env.PI_CODING_AGENT_DIR ?? null;
   const grantSpawning = !!piLoadout?.subagentAgents.length;
   const toolAllowlist = piLoadout ? buildSubagentToolAllowlist(effectiveTools, { grantSpawning }) : null;
   const toolExtensionPaths = toolAllowlist
     ? snapshotToolExtensionPaths(toolAllowlist.split(","), targetCwdForSession)
     : [];
+  const bashGuardExtensionPath = hasBash(toolAllowlist)
+    ? await resolveBashGuardExtension(targetCwdForSession, resolvedAgentDir ?? getAgentConfigDir())
+    : undefined;
 
   // Generate a deterministic session file path for this subagent scoped inside
   // the parent session's artifact directory (artifacts/<parentSessionId>/subagents/).
@@ -2550,14 +2570,6 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
-  // else the propagated global dir. Captured once so the launch env and the
-  // resume snapshot agree.
-  const resolvedAgentDir =
-    localAgentDir && existsSync(localAgentDir)
-      ? localAgentDir
-      : process.env.PI_CODING_AGENT_DIR ?? null;
-
   // New Pi launches always pin optional tools plus the managed controls.
   // An absent profile selection inherits the parent's active optional tools.
 
@@ -2569,6 +2581,7 @@ async function launchSubagent(
     agent: params.agent ?? null,
     toolAllowlist,
     toolExtensionPaths,
+    ...(bashGuardExtensionPath ? { bashGuardExtensionPath } : {}),
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
@@ -2586,6 +2599,7 @@ async function launchSubagent(
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
+  if (hasBash(toolAllowlist)) envParts.push("PI_BASH_GUARD_APPROVAL_MODE=deny");
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -3735,6 +3749,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // so the resumed process resolves the same agents/extensions and keeps
         // the same nested-spawn restriction it originally ran with.
         const resumeEnvParts: string[] = [];
+        if (hasBash(loadout.toolAllowlist)) resumeEnvParts.push("PI_BASH_GUARD_APPROVAL_MODE=deny");
         const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);

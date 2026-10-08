@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import extension, { __test__ as runtime } from "../pi-extension/subagents/index.ts";
 import { claimSession, recordCompletion, protocolDir, pendingMessages } from "../pi-extension/subagents/protocol.ts";
 import { DEFAULT_SUBAGENTS_CONFIG } from "../pi-extension/subagents/config.ts";
-import { readNameRegistry, registerName, writeSubagentLoadout, readSubagentLoadout } from "../pi-extension/subagents/session.ts";
+import { configureGuard, createGuardPackage } from "./helpers/bash-guard.ts";
+import { loadoutSidecarPath, readNameRegistry, registerName, writeSubagentLoadout, readSubagentLoadout } from "../pi-extension/subagents/session.ts";
 
 function gate<T>() {
   let resolve!: (value: T) => void;
@@ -122,6 +123,66 @@ function assertError(result: any, pattern: RegExp) {
 }
 
 describe("lifecycle identity and launch reservations", { concurrency: false }, () => {
+  it("loads guarded bash in deny mode on launch and resumes its pinned source", async (t) => {
+    const h = setup(t);
+    const guard = createGuardPackage(h.dir);
+    configureGuard(join(h.dir, "config"), guard.root);
+    runtime.getSubagentsConfigState().replace({ ...DEFAULT_SUBAGENTS_CONFIG, agents: {
+      worker: { tools: ["read", "bash", "codemode"], subagentAgents: [] },
+    } });
+    const started = await h.call("subagent", { agent: "worker", name: "Guarded", task: "inspect" });
+    assert.equal(started.details.status, "started");
+    const file = h.surfaces[0]!.sessionFile;
+    const pinned = readSubagentLoadout(file)!;
+    assert.equal(pinned.bashGuardExtensionPath, guard.extension);
+    assert.match(h.commands[0]!, /PI_BASH_GUARD_APPROVAL_MODE=deny/);
+    assert.ok(h.commands[0]!.includes("--offline"));
+    assert.ok(h.commands[0]!.includes(`pi -e \'${guard.extension}\' --session`));
+    assert.ok(h.commands[0]!.includes("-e \'builtin:codemode\'"));
+    h.watches[0]!.done.resolve({});
+    await flush();
+
+    const replacement = createGuardPackage(join(h.dir, "replacement"));
+    configureGuard(join(h.dir, "config"), replacement.root);
+    const resumed = await h.call("subagent_message", { name: "Guarded", message: "continue" });
+    assert.equal(resumed.details.status, "started");
+    assert.match(h.commands[1]!, /PI_BASH_GUARD_APPROVAL_MODE=deny/);
+    assert.ok(h.commands[1]!.includes("--offline"));
+    assert.ok(h.commands[1]!.includes(`pi -e \'${guard.extension}\' --session`));
+    assert.ok(!h.commands[1]!.includes(replacement.extension));
+    assert.deepEqual(readSubagentLoadout(file), pinned);
+    h.watches[1]!.done.resolve({});
+    await flush();
+    rmSync(guard.extension);
+    assertError(await h.call("subagent_message", { name: "Guarded", message: "again" }), /pinned guard extension is unavailable/);
+    assert.equal(h.commands.length, 2);
+  });
+
+  it("closes a launch before sending commands when its loadout cannot be persisted", async (t) => {
+    const h = setup(t);
+    const create = runtime.lifecycle.createSurface;
+    runtime.lifecycle.createSurface = async (name, options) => {
+      const surface = await create(name, options);
+      mkdirSync(loadoutSidecarPath(options!.sessionFile!));
+      return surface;
+    };
+    assertError(await h.call("subagent", { agent: "worker", task: "inspect" }), /EISDIR/);
+    assert.equal(h.commands.length, 0);
+    assert.equal(h.closed.length, 1);
+    assert.equal(runtime.reservedNames.size, 0);
+    assert.equal(admissionCount("worker"), 0);
+  });
+
+  it("fails missing-guard launches before allocating a surface or sending a command", async (t) => {
+    const h = setup(t);
+    runtime.getSubagentsConfigState().replace({ ...DEFAULT_SUBAGENTS_CONFIG, agents: { worker: { tools: ["bash"] } } });
+    assertError(await h.call("subagent", { agent: "worker", task: "inspect" }), /not configured and installed/);
+    assert.equal(h.surfaces.length, 0);
+    assert.equal(h.commands.length, 0);
+    assert.equal(runtime.reservedNames.size, 0);
+    assert.equal(admissionCount("worker"), 0);
+  });
+
   it("reserves generated and explicit names before simultaneous launches; finished handles never overwrite", async (t) => {
     const h = setup(t);
     const start = gate<string>();

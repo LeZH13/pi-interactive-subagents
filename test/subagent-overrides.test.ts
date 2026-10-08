@@ -290,8 +290,8 @@ describe("runtime catalogs and extension replay", () => {
     assert.equal(byName.get("codemode")!.available, true);
     assert.equal(byName.get("tool_search")!.available, true);
     assert.equal(byName.get("safe_bash")!.available, true);
-    assert.match(byName.get("bash")!.description!, /bypasses safe_bash's command filters/);
-    assert.match(byName.get("safe_bash")!.description!, /bypasses safe_bash's command filters/);
+    assert.match(byName.get("bash")!.description!, /Requires bash-guard in enforced deny mode/);
+    assert.match(byName.get("safe_bash")!.description!, /own filtering, not bash-guard/);
     let powerShellAvailable = false;
     try { getPowerShellConfig(); powerShellAvailable = true; } catch {}
     assert.equal(byName.get("powershell")!.available, powerShellAvailable);
@@ -445,14 +445,19 @@ describe("new launches versus persisted resumes", () => {
       runtime.getSubagentsConfigState().replace({ ...DEFAULT_SUBAGENTS_CONFIG, agents: {
         [name]: { tools: ["bash", "safe_bash"], subagentAgents: [] },
       } });
-      const fourth = await runtime.launchSubagent({ agent: name, name: "Explicit shell toggles", task: "work" }, ctx, { piTools: ["read"] });
+      await assert.rejects(runtime.launchSubagent({ agent: name, name: "Both shell policies", task: "work" }, ctx, { piTools: ["read"] }), /not both/);
+      runtime.getSubagentsConfigState().replace({ ...DEFAULT_SUBAGENTS_CONFIG, agents: {
+        [name]: { tools: ["safe_bash"], subagentAgents: [] },
+      } });
+      const fourth = await runtime.launchSubagent({ agent: name, name: "Static shell policy", task: "work" }, ctx, { piTools: ["read"] });
       runs.push(fourth);
       const shellLoadout = readSubagentLoadout(fourth.sessionFile)!;
       const safeBashPath = runtime.getToolExtensionPath("safe_bash", dir)!;
-      assert.equal(shellLoadout.toolAllowlist, "bash,safe_bash,ask_question");
+      assert.equal(shellLoadout.toolAllowlist, "safe_bash,ask_question");
       assert.deepEqual(shellLoadout.toolExtensionPaths, [safeBashPath]);
+      assert.equal(shellLoadout.bashGuardExtensionPath, undefined);
       const shellLaunch = readFileSync(fourth.launchScriptFile!, "utf8");
-      assert.ok(shellLaunch.includes("--tools 'bash,safe_bash,ask_question'"));
+      assert.ok(shellLaunch.includes("--tools 'safe_bash,ask_question'"));
       assert.ok(shellLaunch.includes(`-e '${safeBashPath}'`));
     } finally {
       for (const run of runs) {
