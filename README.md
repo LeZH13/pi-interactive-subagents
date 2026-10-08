@@ -35,7 +35,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagent` | Spawn a sub-agent in a dedicated tmux pane (async) |
 | `subagent_interrupt` | Cancel a running Pi-backed sub-agent by exact `id` or `name` — terminates its process and closes its pane |
 | `subagent_message` | Message a sub-agent by name (or `sessionPath`) — steers it if running, resumes its session if finished |
-| `subagents_list` | List available agent definitions |
+| `subagents_list` | List available agents with effective defaults for new spawns |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
 There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
@@ -66,7 +66,7 @@ Restricted launches explicitly load `-e builtin:codemode` despite `--no-extensio
 
 These tools declare output schemas, so `tools.<name>(args)` in codemode resolves to structured data instead of parsing acknowledgement text:
 
-- `subagents_list`: `{ agents: [{ name, source, description?, model?, modelFallback? }] }`. `source` is `package`, `global`, or `project`; an empty list is `{ agents: [] }`. This lists available definitions, **not running status**, and excludes profile bodies/private loadout data.
+- `subagents_list`: `{ agents: [{ name, source, description?, model?, thinking?, modelFallback? }] }`. `source` is `package`, `global`, or `project`; an empty list is `{ agents: [] }`. This lists effective defaults for **new spawns**, including current settings overrides, **not running status** or resumed loadouts. Model thinking suffixes are separated into `thinking`; unset model/thinking fields are omitted (Pi chooses its defaults). Disabled fallback is omitted; `inherit` remains literal. Profile bodies/private loadout data are excluded.
 - `subagent`, `subagent_message`, `subagent_interrupt`: `{ ok, status, id?, name?, agent?, sessionFile?, sessionId?, messageId?, error? }`. Optional handles come from existing result details. Status is `started` (spawn or resume), `queued` (running Pi child), `interrupt_requested`, or `interrupt_already_requested`. Returned validation/operation errors have `ok: false`, `status: "error"`, and `error`; thrown failures still reject.
 
 `ok: true` means only that the operation was acknowledged — **not that the child's task completed**. `queued` confirms durable inbox acceptance, not child receipt; ingestion is acknowledged in the session's control artifacts after persistence or question-answer consumption. Spawn/resume completions arrive later as steer messages; a queued-message acknowledgement itself does not emit another result. Interruption acknowledgements precede the watcher's removal notice. Do not poll or infer completion from an acknowledgement.

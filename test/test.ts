@@ -3197,6 +3197,75 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("lists effective spawn defaults and applies settings changes live", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      const state = testApi.getSubagentsConfigState();
+      const original = state.get();
+      const name = "effective-list-test-agent";
+      writeAgentFile(projectAgentsDir, name,
+        `name: ${name}\nmodel: provider/default:medium\nthinking: low\nmodel-fallback: inherit`);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list")!;
+      const check = async (model: string, thinking: string, modelFallback?: string) => {
+        const result = await tool.execute();
+        const expected = { name, source: "project", model, thinking,
+          ...(modelFallback ? { modelFallback } : {}) };
+        assert.deepEqual(result.structuredContent.agents.find((a: any) => a.name === name), expected);
+        const details = result.details.agents.find((a: any) => a.name === name);
+        assert.equal(details.model, model);
+        assert.equal(details.thinking, thinking);
+        assert.equal(details.modelFallback, modelFallback);
+        const selection = `[${model}; thinking: ${thinking}${modelFallback ? ` → ${modelFallback}` : ""}]`;
+        assert.ok(result.content[0].text.includes(selection));
+        const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+        assert.ok(tool.renderResult(result, {}, theme).render(200).join("\n").includes(selection));
+        // Listing must not mutate the underlying profile defaults.
+        assert.equal(testApi.loadAgentDefaults(name).model, "provider/default:medium");
+        assert.equal(testApi.loadAgentDefaults(name).modelFallback, "inherit");
+      };
+      try {
+        state.replace({ ...original, agents: {} });
+        await check("provider/default", "medium", "inherit");
+        state.replace({ ...original, agents: { [name]: {
+          model: "provider/override", thinking: "high", modelFallback: "provider/fallback",
+        } } });
+        await check("provider/override", "high", "provider/fallback");
+        state.replace({ ...original, agents: { [name]: {
+          model: "provider/override:none", modelFallback: null,
+        } } });
+        await check("provider/override", "off");
+        state.replace({ ...original, agents: {} });
+        await check("provider/default", "medium", "inherit");
+      } finally { state.replace(original); }
+    });
+  });
+
+  it("lists thinking-only defaults and ignores Pi-only fallback overrides for Claude", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      const state = testApi.getSubagentsConfigState();
+      const original = state.get();
+      const name = "thinking-only-list-test-agent";
+      const claude = "claude-list-test-agent";
+      writeAgentFile(projectAgentsDir, name, `name: ${name}\nthinking: none`);
+      writeAgentFile(projectAgentsDir, claude, `name: ${claude}\ncli: claude\nmodel: sonnet`);
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const tool = registeredTools.find((tool) => tool.name === "subagents_list")!;
+      try {
+        state.replace({ ...original, agents: { [claude]: { modelFallback: "provider/ignored" } } });
+        const result = await tool.execute();
+        assert.deepEqual(result.structuredContent.agents.find((a: any) => a.name === name), {
+          name, source: "project", thinking: "off",
+        });
+        assert.ok(result.content[0].text.includes(`${name} (project) [thinking: off]`));
+        assert.deepEqual(result.structuredContent.agents.find((a: any) => a.name === claude), {
+          name: claude, source: "project", model: "sonnet",
+        });
+      } finally { state.replace(original); }
+    });
+  });
+
   it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -6662,7 +6731,7 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
 
   it("projects structured agent listings without profile body or private configuration", () => {
     const list = [{ name: "example", source: "project", description: "public", model: "provider/model", modelFallback: "inherit", body: "secret prompt", tools: "bash", thinking: "high", autoExit: true }];
-    assert.deepEqual(testApi.listStructuredAgents(list), { agents: [{ name: "example", source: "project", description: "public", model: "provider/model", modelFallback: "inherit" }] });
+    assert.deepEqual(testApi.listStructuredAgents(list), { agents: [{ name: "example", source: "project", description: "public", model: "provider/model", thinking: "high", modelFallback: "inherit" }] });
     assert.deepEqual(testApi.listStructuredAgents([{ name: "minimal", source: "package" }]), { agents: [{ name: "minimal", source: "package" }] });
   });
 

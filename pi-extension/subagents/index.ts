@@ -186,6 +186,7 @@ const SubagentListOutputSchema = Type.Object({
     source: Type.Union([Type.Literal("package"), Type.Literal("global"), Type.Literal("project")]),
     description: Type.Optional(Type.String()),
     model: Type.Optional(Type.String()),
+    thinking: Type.Optional(Type.String()),
     modelFallback: Type.Optional(Type.String()),
   })),
 });
@@ -210,11 +211,12 @@ function withSubagentStructuredOutput<P extends TSchema>(execute: ToolDefinition
 
 function listStructuredAgents(list: ListedAgentDefinition[]): Static<typeof SubagentListOutputSchema> {
   return {
-    agents: list.map(({ name, source, description, model, modelFallback }) => ({
+    agents: list.map(({ name, source, description, model, thinking, modelFallback }) => ({
       name,
       source,
       ...(description !== undefined ? { description } : {}),
       ...(model !== undefined ? { model } : {}),
+      ...(thinking !== undefined ? { thinking } : {}),
       ...(modelFallback !== undefined ? { modelFallback } : {}),
     })),
   };
@@ -846,16 +848,21 @@ function resolveParentModelDefaults(ctx: ExtensionContext, pi: ExtensionAPI): Pa
   return { model, thinking };
 }
 
-/** Resolve one explicit frontmatter fallback. Undefined means no retry is configured. */
+/** Read the current fallback policy, preserving an explicitly disabled override. */
+function resolveEffectiveModelFallback(agent: string, agentDefs: AgentDefaults | null): string | undefined {
+  const override = agentDefs?.cli !== "claude" ? configState.get().agents[agent] : undefined;
+  return (override?.modelFallback !== undefined
+    ? override.modelFallback
+    : agentDefs?.modelFallback)?.trim() || undefined;
+}
+
+/** Resolve one effective fallback. Undefined means no retry is configured. */
 function resolveFallbackModelAndThinking(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
   parent: ParentModelDefaults,
 ): { model: string | undefined; thinking: string | undefined } | undefined {
-  const override = agentDefs?.cli !== "claude" ? configState.get().agents[params.agent] : undefined;
-  const rawFallback = (override?.modelFallback !== undefined
-    ? override.modelFallback
-    : agentDefs?.modelFallback)?.trim();
+  const rawFallback = resolveEffectiveModelFallback(params.agent, agentDefs);
   if (!rawFallback) return undefined;
   const fallbackModel = rawFallback.toLowerCase() === "inherit"
     ? { model: parent.model, thinking: undefined }
@@ -3444,11 +3451,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
+        "List available subagents with effective model, thinking, and fallback defaults for new spawns (including settings overrides). " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
         "Project-local agents override global ones with the same name.",
       promptSnippet:
-        "List all available subagent definitions. " +
+        "List available subagents with effective model, thinking, and fallback defaults for new spawns (including settings overrides). " +
         "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
         "Project-local agents override global ones with the same name.",
       parameters: Type.Object({}),
@@ -3457,7 +3464,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       async execute() {
         const overrides = configState.get().agents;
         const list = discoverAgentDefinitions().filter((agent) =>
-          !(overrides[agent.name]?.disableModelInvocation ?? agent.disableModelInvocation));
+          !(overrides[agent.name]?.disableModelInvocation ?? agent.disableModelInvocation))
+          .map((agent) => ({
+            ...agent,
+            ...resolveEffectiveModelAndThinking({ agent: agent.name, task: "" }, agent),
+            modelFallback: resolveEffectiveModelFallback(agent.name, agent),
+          }));
 
         if (list.length === 0) {
           return {
@@ -3471,7 +3483,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";
           const fallback = a.modelFallback ? ` → ${a.modelFallback}` : "";
-          const model = a.model ? ` [${a.model}${fallback}]` : "";
+          const selection = [a.model, a.thinking ? `thinking: ${a.thinking}` : undefined].filter(Boolean).join("; ");
+          const model = selection || fallback ? ` [${selection}${fallback}]` : "";
           return `• ${a.name}${badge}${model}${desc}`;
         });
 
@@ -3492,7 +3505,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
           const fallback = a.modelFallback ? ` → ${a.modelFallback}` : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}${fallback}]`) : "";
+          const selection = [a.model, a.thinking ? `thinking: ${a.thinking}` : undefined].filter(Boolean).join("; ");
+          const model = selection || fallback ? theme.fg("dim", ` [${selection}${fallback}]`) : "";
           return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
         });
         return new Text(lines.join("\n"), 0, 0);
