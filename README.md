@@ -81,6 +81,8 @@ text(ack); // acknowledgement only; the harness delivers the eventual result
 
 ### Spawning
 
+The orchestrator should omit `model` and `thinking` to use the agent's effective defaults, including `/subagent-settings` overrides. Only set a field when the user explicitly requests that override; do not copy the orchestrator's model/thinking or choose replacements based on task complexity. This is model-facing guidance, not a runtime restriction: explicit spawn arguments still take precedence.
+
 ```typescript
 subagent({ agent: "scout", task: "Analyze the auth module" });
 subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });

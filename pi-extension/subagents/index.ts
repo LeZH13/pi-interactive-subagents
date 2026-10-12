@@ -113,6 +113,11 @@ function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
+const SUBAGENT_DEFAULT_SELECTION_GUIDANCE =
+  "Omit `model` and `thinking` to use the agent's effective defaults, including settings overrides. " +
+  "Only set either field when the user explicitly requests that override. " +
+  "Do not copy the orchestrator's model or thinking level or choose replacements based on task complexity. ";
+
 const SubagentParams = Type.Object({
   agent: Type.String({
     description:
@@ -129,11 +134,17 @@ const SubagentParams = Type.Object({
         "Use `agent`, not `name`, to select the profile.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(Type.String({
+    description:
+      "Model override. Omit to use the agent's effective model default, including settings overrides. " +
+      "Only set when the user explicitly requests a model override; do not copy the orchestrator's model.",
+  })),
   thinking: Type.Optional(
     Type.String({
       description:
-        "Thinking / reasoning level override (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', or token budget)",
+        "Thinking / reasoning level override (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', or token budget). " +
+        "Omit to use the agent's effective thinking default, including settings overrides. " +
+        "Only set when the user explicitly requests a thinking override; do not copy the orchestrator's thinking level.",
     }),
   ),
   cwd: Type.Optional(
@@ -3026,6 +3037,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       label: "Subagent",
       description:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        SUBAGENT_DEFAULT_SELECTION_GUIDANCE +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
@@ -3033,6 +3045,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+        SUBAGENT_DEFAULT_SELECTION_GUIDANCE +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +

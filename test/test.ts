@@ -4539,6 +4539,26 @@ describe("tool registration", () => {
     }
   });
 
+  it("instructs the orchestrator to preserve effective model/thinking defaults unless the user requests an override", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    assert.ok(subagentTool, "expected subagent tool to be registered");
+
+    for (const guidance of [subagentTool.description, subagentTool.promptSnippet]) {
+      assert.match(guidance, /omit `model` and `thinking`.*effective defaults.*settings overrides/i);
+      assert.match(guidance, /only set either field when the user explicitly requests that override/i);
+      assert.match(guidance, /do not copy the orchestrator's model or thinking level/i);
+      assert.match(guidance, /or choose replacements based on task complexity/i);
+    }
+    const props = subagentTool.parameters.properties;
+    for (const field of ["model", "thinking"]) {
+      assert.match(props[field].description, /omit.*effective.*default.*settings overrides/i);
+      assert.match(props[field].description, new RegExp(`only set when the user explicitly requests a ${field} override`, "i"));
+      assert.match(props[field].description, new RegExp(`do not copy the orchestrator's ${field}`, "i"));
+    }
+  });
+
   it("renders partial subagent tool-call args without throwing", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
