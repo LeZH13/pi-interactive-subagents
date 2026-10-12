@@ -2009,6 +2009,7 @@ describe("tabbed subagent settings", () => {
         sessionDirs: () => null,
         runningSessionFiles: () => [],
         artifactDirFor: (_sessionDir, _sessionId) => dir,
+        async audit() {},
       };
       const showing = showSubagentSettings(ctx, deps);
       try {

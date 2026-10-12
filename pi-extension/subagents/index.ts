@@ -59,7 +59,7 @@ import {
   type SubagentsConfigState,
 } from "./config.ts";
 import { registerSubagentSettingsCommand } from "./settings.ts";
-import { registerSubagentsAuditCommand } from "./audit-command.ts";
+import { showSubagentAudit } from "./audit.ts";
 import { hasBash, resolveBashGuardExtension, validateBashGuardExtension, validateShellSelection } from "./bash-guard.ts";
 import { formatSubagentIdentity } from "./identity.ts";
 import { canonicalSessionPath, claimSession, abandonStartingSession, enqueueMessage, pendingMessages, finalizeSession, type SessionOwner, type InboxMessage } from "./protocol.ts";
@@ -3938,8 +3938,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }),
     });
 
-  registerSubagentsAuditCommand(pi, resolve(SUBAGENTS_DIR, "../.."));
-
   // /subagent command — request a model-owned tool call with optional overrides.
   // Explicit wording improves clarity; argument fidelity still depends on the model.
   pi.registerCommand("subagent", {
@@ -3988,6 +3986,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // model picker: per-agent overrides persist to the user agent config and outrank
   // markdown defaults, while explicit spawn args still win per-spawn.
   registerSubagentSettingsCommand(pi, {
+    audit: (ctx, scope) => showSubagentAudit(pi, ctx, resolve(SUBAGENTS_DIR, "../.."), scope),
     discoverAgents: () => discoverAgentDefinitions().map((a) => ({
       name: a.name,
       description: a.description,

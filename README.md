@@ -247,7 +247,7 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
 `/subagent-settings` opens a settings page (same style as pi's `/settings`) with two tabs:
 
 - **Agents** (default) — search `scout`, `researcher`, `worker`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above the second group (Tools, Skills, Spawnable agents, Max concurrent), with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, **Pi default**, or **Extension default** for an omitted concurrency limit) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Max concurrent** accepts a positive safe integer or explicit **Unlimited**; invalid/cancelled input leaves the previous value intact. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. Tools/spawnable agents/skills/fallback controls support Pi-backed agents only and are marked unsupported for `cli: claude`; Max concurrent is backend-neutral.
-- **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved.
+- **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved. **Audit subagents…** opens a scope picker for the current session, explicit session references, comparisons, or agent profiles; settings closes before any input dialog or audit request.
 
 Use **← / →** for the previous / next panel when the search is empty, **Tab / Shift+Tab** to cycle forward / backward, or click a tab. When a search query exists, horizontal arrows move its cursor—even at the query's beginning or end—while Tab / Shift+Tab still switch panels. Each panel retains its selection, and Agents retains its search. Panel switching is disabled in nested screens, which replace tabs with breadcrumbs; **Esc** returns one level, then closes the page from a panel's list. Search errors and empty results explain how to recover. In list pickers, **Space / Enter** or a checkbox click toggles and saves immediately; **Esc** returns without undoing saved changes. The concise footer shows move, toggle, and back shortcuts. Keyboard hints wrap at narrow widths.
 
@@ -290,17 +290,17 @@ Extensions can register additional tools for sub-agents at runtime via `register
 
 ## On-demand orchestration audit
 
-```text
-/subagents-audit
-/subagents-audit <session-id-or-jsonl-path>
-/subagents-audit <session-id-1>, <session-id-2> "/path with spaces/session.jsonl"
-/subagents-audit compare <baseline-session> <other-session>
-/subagents-audit profiles [directory]
-```
+Open **/subagent-settings → General → Audit subagents…**, then select:
+- **Current session** — audit the recorded session and corroborated descendants.
+- **Session references…** — enter session IDs or JSONL paths, separated by commas or whitespace; quote paths containing spaces.
+- **Compare sessions…** — enter the baseline reference first, followed by other session references (at least two).
+- **Agent profiles…** — optionally enter a quoted directory, or leave empty for the default agents directory.
 
-The thin command injects the canonical `audit/INSTRUCTIONS.md`, absolute analyzer/reference paths, and JSON scope only while Pi is idle. With no arguments it targets the current recorded session, capturing its byte cutoff, active leaf, and actual session directory **before** injection; an ephemeral session instead asks for references. The captured directory honors effective CLI storage selection rather than overriding it with a conflicting environment variable. Nothing is installed as an always-advertised skill or tool. Loading the package extension also enables this command; no extra tool permissions are granted.
+Settings closes before prompting or submitting the request; cancelling an input dialog submits nothing. The standalone `/subagents-audit` command has been removed.
 
-The agent invokes the bundled, dependency-free Node offline analyzer; the command itself does not run analysis. You can also run it directly:
+The action injects the canonical `audit/INSTRUCTIONS.md`, absolute analyzer/reference paths, and JSON scope only while Pi is idle. The Current session action targets the current recorded session, capturing its byte cutoff, active leaf, and actual session directory **before** injection; an ephemeral session instead asks for references. The captured directory honors effective CLI storage selection rather than overriding it with a conflicting environment variable. Nothing is installed as an always-advertised skill or tool. Loading the package extension enables the settings action; no extra tool permissions are granted.
+
+The agent invokes the bundled, dependency-free Node offline analyzer; the settings action itself does not run analysis. You can also run it directly:
 
 ```sh
 node audit/analyze.mjs <session-id> --sessions-dir /configured/session/storage

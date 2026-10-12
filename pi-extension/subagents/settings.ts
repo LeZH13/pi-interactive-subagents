@@ -22,6 +22,7 @@ import {
   type SelectItem,
 } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
+import type { AuditScope } from "./audit.ts";
 import { cleanOrphanArtifactDirs, findOrphanArtifactDirs } from "./session.ts";
 import type { AgentOverride, SubagentsConfigState } from "./config.ts";
 import { isHerdrAvailable, isTmuxAvailable, resolveSurfaceBackend } from "./surface.ts";
@@ -54,6 +55,7 @@ export interface SubagentSettingsDeps {
   sessionDirs: (ctx: ExtensionContext) => { sessionDir: string; sessionId: string } | null;
   runningSessionFiles: () => string[];
   artifactDirFor: (sessionDir: string, sessionId: string) => string;
+  audit: (ctx: ExtensionCommandContext, scope: AuditScope) => Promise<void>;
 }
 
 const STANDARD_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -703,7 +705,7 @@ function agentView(
 
 export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: SubagentSettingsDeps): Promise<void> {
   if (!ctx.hasUI) { ctx.ui.notify("Subagent settings require interactive mode.", "warning"); return; }
-  await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+  const auditScope = await ctx.ui.custom<AuditScope | undefined>((tui, theme, _keybindings, done) => {
     const tabs = ["Agents", "General"] as const;
     let activeTab: typeof tabs[number] = "Agents";
     let focused = false;
@@ -728,7 +730,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
         formatItems: (items, width) => formatAgentItems(deps, agentNames, items, width),
         detail: (item) => agents.find((agent) => agent.name === item.value)?.description ?? `Model, thinking, tools, spawnable agents, startup skills, fallback, and concurrency defaults for ${item.value}.`,
         empty: agents.length ? "No matching agents. Clear or change the search." : "No agents found. Add an agent definition to your agents directory.",
-        onSelect: (item) => push(agentView(ctx, deps, item.value, push, back)), onBack: () => done(),
+        onSelect: (item) => push(agentView(ctx, deps, item.value, push, back)), onBack: () => done(undefined),
       }),
       General: selectionView(ctx, {
         path: [], action: "Change",
@@ -736,6 +738,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
           { value: "backend", label: "Launch surface" },
           { value: "status-widget", label: "Status widget" },
           { value: "orphan-cleanup", label: "Orphan cleanup" },
+          { value: "audit", label: "Audit subagents…" },
         ],
         empty: "No general settings available.",
         formatItems: (items, width) => {
@@ -743,24 +746,41 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
           const compact = width < 48;
           const labels: Record<string, string> = {
             backend: "Launch surface",
-            "status-widget": "Status widget", "orphan-cleanup": "Orphan cleanup",
+            "status-widget": "Status widget", "orphan-cleanup": "Orphan cleanup", audit: "Audit subagents…",
           };
           const labelWidth = Math.max(...Object.values(labels).map(visibleWidth));
           for (const item of items) {
             const value = item.value === "backend" ? backendSummary :
-              item.value === "status-widget" ? config.status.enabled ? "On" : "Off" : cleanupSummary;
+              item.value === "status-widget" ? config.status.enabled ? "On" : "Off" :
+              item.value === "audit" ? "Choose scope" : cleanupSummary;
             const displayedValue = compact && item.value === "backend" ? value.replace(/^Automatic/, "Auto") : value;
             item.label = `${padColumn(labels[item.value], labelWidth)}${FIELD_GAP}${displayedValue}`;
           }
         },
         detail: (item) => item.value === "backend" ? `${backendSummary}. Where new subagents run. Automatic chooses an available surface.` :
           item.value === "status-widget" ? "Show live subagent progress above the editor. Enter toggles On / Off." :
+          item.value === "audit" ? "Read-only orchestration review of sessions or profiles. Closes settings and starts an audit while idle." :
           "Review artifacts from deleted parent sessions. Deletion requires confirmation.",
         onSelect: (item) => {
           if (item.value === "status-widget") {
             const enabled = !deps.configState.get().status.enabled;
             deps.configState.update((draft) => { draft.status.enabled = enabled; });
             deps.setStatusEnabled(enabled);
+          } else if (item.value === "audit") {
+            push(selectionView(ctx, {
+              path: ["Audit subagents"], action: "Audit",
+              items: [
+                { value: "current", label: "Current session" },
+                { value: "sessions", label: "Session references…" },
+                { value: "compare", label: "Compare sessions…" },
+                { value: "profiles", label: "Agent profiles…" },
+              ],
+              empty: "No audit scopes available.",
+              detail: (choice) => choice.value === "current" ? "Audit the current recorded session and its nested subagents." :
+                choice.value === "profiles" ? "Review effective agent prompts and configuration; optionally specify a directory." :
+                "Enter session IDs or JSONL paths after settings closes. Quote paths with spaces.",
+              onSelect: (choice) => done(choice.value as AuditScope), onBack: back,
+            }));
           } else if (item.value === "orphan-cleanup") {
             push(orphanView(ctx, deps, () => { refreshGeneral(); back(); }));
           } else {
@@ -793,7 +813,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
               }, onBack: back,
             }));
           }
-        }, onBack: () => done(),
+        }, onBack: () => done(undefined),
       }),
     };
     const current = () => stack.at(-1) ?? panels[activeTab];
@@ -878,11 +898,12 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
       },
     };
   });
+  if (auditScope) await deps.audit(ctx, auditScope);
 }
 
 export function registerSubagentSettingsCommand(pi: ExtensionAPI, deps: SubagentSettingsDeps): void {
   pi.registerCommand("subagent-settings", {
-    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, concurrency, surface/status, cleanup",
+    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, concurrency, surface/status, cleanup, audit",
     handler: async (_args, ctx) => { await showSubagentSettings(ctx, deps); },
   });
 }

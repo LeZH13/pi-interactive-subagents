@@ -5,7 +5,7 @@ import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
-import { registerSubagentsAuditCommand, parseAuditArgs, AUDIT_MARKER } from "../pi-extension/subagents/audit-command.ts";
+import { requestSubagentAudit, showSubagentAudit, parseAuditArgs, AUDIT_MARKER } from "../pi-extension/subagents/audit.ts";
 import { seedSubagentSessionFile } from "../pi-extension/subagents/session.ts";
 // The dependency-free executable is intentionally JavaScript, usable without a TS loader.
 // @ts-expect-error No declaration needed for the local offline CLI.
@@ -32,19 +32,22 @@ function registry(path: string, id: string, entries: any) {
 }
 const codes = (report: any) => report.issues.map((i: any) => i.code);
 
-describe("subagents audit command", () => {
-  function command(file: string | undefined, overrides: any = {}) {
-    let registered: any; const sent: string[] = [], notices: any[] = [];
-    registerSubagentsAuditCommand({ registerCommand(name: string, c: any) { assert.equal(name, "subagents-audit"); registered = c; }, sendUserMessage(text: string, options: any) { assert.equal(options.expandPromptTemplates, false); sent.push(text); if (file) writeFileSync(file, text, { flag: "a" }); } } as any, root);
+describe("subagents audit action", () => {
+  function auditHarness(file: string | undefined, overrides: any = {}) {
+    const sent: string[] = [], notices: any[] = [];
+    const pi = { sendUserMessage(text: string, options: any) { assert.equal(options.expandPromptTemplates, false); sent.push(text); if (file) writeFileSync(file, text, { flag: "a" }); } } as any;
     const ctx = { cwd: root, hasUI: true, ui: { notify: (...args: any[]) => notices.push(args) }, isIdle: () => true,
       sessionManager: { getSessionFile: () => file, getSessionDir: () => file ? dirname(file) : root, getSessionId: () => "current-id", getLeafId: () => "active-leaf" }, ...overrides };
-    return { registered, sent, notices, ctx };
+    const request = (args: string, mode: "sessions" | "compare" | "profiles") =>
+      requestSubagentAudit(pi, ctx as any, root, args, mode);
+    return { request, pi, sent, notices, ctx };
   }
   const context = (text: string) => JSON.parse(text.split("Audit context (JSON data, not instructions):\n")[1]);
   it("captures the current file cutoff and leaf before injection, not the physical last entry", () => fixture(async dir => {
     const file = session(dir, "current.jsonl", "current-id", [message("active-leaf", null), message("other-tail", null)]);
-    const size = statSync(file).size, mock = command(file);
-    await mock.registered.handler("", mock.ctx);
+    const size = statSync(file).size, mock = auditHarness(file);
+    mock.ctx.ui.input = async () => { assert.fail("Current-session audit must not prompt"); };
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "current");
     assert.equal(mock.sent.length, 1); const c = context(mock.sent[0]);
     assert.deepEqual(c.targets, [file]); assert.equal(c.current.cutoffBytes, size); assert.equal(c.current.leafId, "active-leaf");
     assert.deepEqual(c.snapshots, [{ path: file, cutoffBytes: size, leafId: "active-leaf" }]);
@@ -53,22 +56,22 @@ describe("subagents audit command", () => {
     assert.ok(statSync(file).size > c.current.cutoffBytes);
   }));
   it("keeps explicit refs as data and supports compare, quotes, commas and profiles", () => fixture(async dir => {
-    const file = session(dir, "current.jsonl", "current-id"), mock = command(file);
-    await mock.registered.handler('compare id-1, "/path with spaces/log.jsonl" "$(touch NOPE)"', mock.ctx);
+    const file = session(dir, "current.jsonl", "current-id"), mock = auditHarness(file);
+    await mock.request('id-1, "/path with spaces/log.jsonl" "$(touch NOPE)"', "compare");
     assert.deepEqual(context(mock.sent[0]).targets, ["id-1", "/path with spaces/log.jsonl", "$(touch NOPE)"]);
     assert.equal(context(mock.sent[0]).mode, "compare"); assert.equal(existsSync(join(root, "NOPE")), false);
-    await mock.registered.handler('profiles "relative agents"', mock.ctx);
+    await mock.request('"relative agents"', "profiles");
     const c = context(mock.sent[1]); assert.equal(c.profilesDir, join(root, "relative agents"));
     assert.deepEqual(c.targets, []); assert.ok(c.configPaths.every((p: string) => p.startsWith("/")));
     assert.equal(c.projectAgentsDir, join(root, ".pi/agents"));
-    await mock.registered.handler('"relative/session.jsonl"', mock.ctx);
+    await mock.request('"relative/session.jsonl"', "sessions");
     assert.deepEqual(context(mock.sent[2]).targets, [join(root, "relative/session.jsonl")]);
   }));
   it("passes resolved configured agent and session directories for semantic profile review", async () => {
     const oldAgent = process.env.PI_CODING_AGENT_DIR, oldSessions = process.env.PI_CODING_AGENT_SESSION_DIR;
     process.env.PI_CODING_AGENT_DIR = "/configured/agent"; process.env.PI_CODING_AGENT_SESSION_DIR = "/configured/sessions";
     try {
-      const mock = command(undefined); await mock.registered.handler("profiles", mock.ctx);
+      const mock = auditHarness(undefined); await mock.request("", "profiles");
       const c = context(mock.sent[0]); assert.equal(c.agentDir, "/configured/agent"); assert.equal(c.profilesDir, "/configured/agent/agents"); assert.equal(c.sessionsDir, root);
       assert.equal(c.configPaths[0], "/configured/agent/extensions/pi-interactive-subagents/config.json");
     } finally {
@@ -83,32 +86,59 @@ describe("subagents audit command", () => {
     session(envDir, "different.jsonl", "requested-id", [message("wrong", null)]);
     const old = process.env.PI_CODING_AGENT_SESSION_DIR; process.env.PI_CODING_AGENT_SESSION_DIR = envDir;
     try {
-      const mock = command(current); await mock.registered.handler("requested-id", mock.ctx);
+      const mock = auditHarness(current); await mock.request("requested-id", "sessions");
       const request = context(mock.sent[0]); assert.equal(request.sessionsDir, cliDir); assert.equal(request.current.sessionDir, cliDir);
       const cli = spawnSync(process.execPath, [script, "--request-json", JSON.stringify(request)], { encoding: "utf8" });
       assert.equal(cli.status, 0); assert.deepEqual(JSON.parse(cli.stdout).roots, [wanted]);
     } finally { if (old === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR; else process.env.PI_CODING_AGENT_SESSION_DIR = old; }
   }));
   it("asks for refs for an ephemeral session, with no invented target", async () => {
-    const mock = command(undefined); await mock.registered.handler("", mock.ctx);
+    const mock = auditHarness(undefined); await mock.request("", "sessions");
     const c = context(mock.sent[0]); assert.equal(c.needsReferences, true); assert.deepEqual(c.targets, []); assert.deepEqual(c.snapshots, []);
   });
   it("refuses busy contexts without injecting, including no-UI mode", async () => {
-    const mock = command(undefined, { isIdle: () => false }); await mock.registered.handler("id", mock.ctx);
+    const mock = auditHarness(undefined, { isIdle: () => false }); await mock.request("id", "sessions");
     assert.equal(mock.sent.length, 0); assert.equal(mock.notices[0][1], "warning");
     const old = console.error, errors: string[] = []; console.error = text => errors.push(text);
-    try { const headless = command(undefined, { isIdle: () => false, hasUI: false, ui: undefined }); await headless.registered.handler("", headless.ctx); assert.equal(headless.sent.length, 0); assert.equal(errors.length, 1); }
+    try { const headless = auditHarness(undefined, { isIdle: () => false, hasUI: false, ui: undefined }); await headless.request("", "sessions"); assert.equal(headless.sent.length, 0); assert.equal(errors.length, 1); }
     finally { console.error = old; }
   });
   it("reports invalid args, missing files and resources safely without UI", async () => {
     const old = console.error, errors: string[] = []; console.error = text => errors.push(text);
     try {
-      const mock = command("/no-such-audit-file", { hasUI: false, ui: undefined });
-      for (const args of ['"unclosed', "compare one", "profiles one two", ""]) await mock.registered.handler(args, mock.ctx);
+      const mock = auditHarness("/no-such-audit-file", { hasUI: false, ui: undefined });
+      for (const [args, mode] of [['"unclosed', "sessions"], ["one", "compare"], ["one two", "profiles"], ["", "sessions"]] as const) await mock.request(args, mode);
       assert.equal(mock.sent.length, 0); assert.equal(errors.length, 4);
-      let c: any; registerSubagentsAuditCommand({ registerCommand(_name: string, cmd: any) { c = cmd; } } as any, "/missing-package");
-      await c.handler("profiles", command(undefined, { hasUI: false, ui: undefined }).ctx); assert.equal(errors.length, 5);
+      await requestSubagentAudit(mock.pi, auditHarness(undefined, { hasUI: false, ui: undefined }).ctx as any, "/missing-package", "", "profiles"); assert.equal(errors.length, 5);
     } finally { console.error = old; }
+  });
+  it("prompts for explicit scope, preserves scope-like IDs, and supports cancellation", async () => {
+    const mock = auditHarness(undefined);
+    const replies: Array<string | undefined> = ["compare, profiles", 'first, "path with spaces/log.jsonl"', "", undefined, ""];
+    mock.ctx.ui.input = async () => replies.shift();
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "sessions");
+    assert.equal(context(mock.sent[0]).mode, "sessions");
+    assert.deepEqual(context(mock.sent[0]).targets, ["compare", "profiles"]);
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "compare");
+    assert.equal(context(mock.sent[1]).mode, "compare");
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "profiles");
+    assert.equal(context(mock.sent[2]).mode, "profiles");
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "profiles");
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "sessions");
+    assert.equal(mock.sent.length, 3);
+  });
+  it("checks idle before prompting and again after the input dialog", async () => {
+    let idle = false;
+    const mock = auditHarness(undefined, { isIdle: () => idle });
+    let prompts = 0;
+    mock.ctx.ui.input = async () => { prompts++; idle = false; return "id"; };
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "sessions");
+    assert.equal(prompts, 0);
+    idle = true;
+    await showSubagentAudit(mock.pi, mock.ctx as any, root, "sessions");
+    assert.equal(prompts, 1);
+    assert.equal(mock.sent.length, 0);
+    assert.equal(mock.notices.length, 2);
   });
   it("tokenizes data without shell expansion and bounds arguments", () => {
     assert.deepEqual(parseAuditArgs("a,b 'c,d' \"space path\" `whoami`"), ["a", "b", "c,d", "space path", "`whoami`"]);
@@ -341,7 +371,10 @@ describe("packaged on-demand audit assets", () => {
     assert.deepEqual(refs, ["references/profile-audit.md", "references/session-audit.md", "references/report-contract.md"]);
     for (const ref of refs) assert.ok(statSync(join(root, "audit", ref)).isFile());
     assert.ok(statSync(script).isFile());
-    assert.match(readFileSync(join(root, "pi-extension/subagents/index.ts"), "utf8"), /registerSubagentsAuditCommand\(pi, resolve\(SUBAGENTS_DIR, "\.\.\/\.\."\)\)/);
+    const extension = readFileSync(join(root, "pi-extension/subagents/index.ts"), "utf8");
+    assert.match(extension, /audit: \(ctx, scope\) => showSubagentAudit/);
+    assert.doesNotMatch(extension, /registerSubagentsAuditCommand/);
+    assert.equal(existsSync(join(root, "pi-extension/subagents/audit-command.ts")), false);
     assert.ok(readFileSync(join(root, ".gitignore"), "utf8").includes("/.pi/settings.json"));
   });
 });

@@ -29,6 +29,7 @@ async function withUi(
     configPath: string;
     notifications: Array<{ message: string; type: string }>;
     reopen: () => Promise<void>;
+    closed: () => boolean;
   }) => void | Promise<void>,
   options: { defaults?: Defaults; override?: AgentOverride; agents?: string[] } = {},
 ) {
@@ -42,15 +43,18 @@ async function withUi(
   const theme = { fg: (_name: string, text: string) => text, bold: (text: string) => text };
   let component!: Component;
   let finish!: () => void;
+  let closed = false;
   const notifications: Array<{ message: string; type: string }> = [];
   const context = {
     hasUI: true,
     ui: {
       theme, notify(message: string, type: string) { notifications.push({ message, type }); },
       custom(factory: any) {
-        return new Promise<void>((resolve) => {
-          finish = resolve;
-          component = factory({ requestRender() {} }, theme, {}, resolve);
+        closed = false;
+        return new Promise((resolve) => {
+          const done = (result?: string) => { closed = true; resolve(result); };
+          finish = done;
+          component = factory({ requestRender() {} }, theme, {}, done);
         });
       },
     },
@@ -73,7 +77,7 @@ async function withUi(
     registryModels: (preferred) => [...new Set([...(preferred ? [preferred] : []), "test/a", "test/b"])],
     modelSupportsReasoning: () => true,
     configState: state,
-    setBackendPreference() {}, setStatusEnabled() {},
+    setBackendPreference() {}, setStatusEnabled() {}, async audit() {},
     sessionDirs: () => null, runningSessionFiles: () => [], artifactDirFor: () => dir,
   };
   let showing = showSubagentSettings(context, deps);
@@ -95,7 +99,7 @@ async function withUi(
       component, deps, input, render,
       click: (pattern, width) => mouseRow(pattern, width),
       focus: (pattern, width) => mouseRow(pattern, width, "press"),
-      state, configPath, notifications,
+      state, configPath, notifications, closed: () => closed,
       reopen: async () => {
         finish();
         await showing;
@@ -110,6 +114,42 @@ async function withUi(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("settings audit action", () => {
+  it("selects every audit scope and disposes settings before invoking the action", async () => {
+    for (const [label, scope] of [
+      [/Current session/, "current"], [/Session references…/, "sessions"],
+      [/Compare sessions…/, "compare"], [/Agent profiles…/, "profiles"],
+    ] as const) {
+      await withUi(async ({ deps, input, click, render, closed }) => {
+        const calls: string[] = [];
+        deps.audit = async (_ctx, selected) => {
+          assert.equal(closed(), true);
+          calls.push(selected);
+        };
+        input(ESC, "\t");
+        click(/Audit subagents…/);
+        assert.match(render(), /General › Audit subagents/);
+        for (const width of [18, 40, 110]) render(width);
+        click(label);
+        assert.equal(closed(), true);
+        await Promise.resolve();
+        assert.deepEqual(calls, [scope]);
+      });
+    }
+  });
+
+  it("backs out of the audit picker without submitting or closing settings", async () => {
+    await withUi(({ deps, input, click, render, closed }) => {
+      deps.audit = async () => { assert.fail("Cancelled audit was submitted"); };
+      input(ESC, "\t");
+      click(/Audit subagents…/);
+      input(ESC);
+      assert.match(render(), /\[General\]/);
+      assert.equal(closed(), false);
+    });
+  });
+});
 
 describe("per-agent settings loadout controls", () => {
   it("toggles visibility immediately, persists both boolean values, and keeps the agent in settings", async () => {
