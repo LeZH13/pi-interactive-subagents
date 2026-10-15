@@ -228,7 +228,12 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
 
 ```json
 {
-  "status": { "enabled": true },
+  "status": {
+    "enabled": true,
+    "animated": true,
+    "cycleSeconds": 6,
+    "trailFraction": 0.6666666666666666
+  },
   "multiplexing": { "backend": "auto" },
   "agents": {
     "worker": {
@@ -249,7 +254,7 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
 `/subagent-settings` opens a settings page (same style as pi's `/settings`) with two tabs:
 
 - **Agents** (default) — search `scout`, `researcher`, `worker`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above the second group (Tools, Skills, Spawnable agents, Max concurrent), with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, **Pi default**, or **Extension default** for an omitted concurrency limit) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Max concurrent** accepts a positive safe integer or explicit **Unlimited**; invalid/cancelled input leaves the previous value intact. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. Tools/spawnable agents/skills/fallback controls support Pi-backed agents only and are marked unsupported for `cli: claude`; Max concurrent is backend-neutral.
-- **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved. **Audit subagents…** opens a scope picker for the current session, explicit session references, comparisons, or agent profiles; settings closes before any input dialog or audit request.
+- **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Widget appearance…** opens controls for the animated border, loop duration, and trail length; changes save and apply immediately. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved. **Audit subagents…** opens a scope picker for the current session, explicit session references, comparisons, or agent profiles; settings closes before any input dialog or audit request.
 
 Use **← / →** for the previous / next panel when the search is empty, **Tab / Shift+Tab** to cycle forward / backward, or click a tab. When a search query exists, horizontal arrows move its cursor—even at the query's beginning or end—while Tab / Shift+Tab still switch panels. Each panel retains its selection, and Agents retains its search. Panel switching is disabled in nested screens, which replace tabs with breadcrumbs; **Esc** returns one level, then closes the page from a panel's list. Search errors and empty results explain how to recover. In list pickers, **Space / Enter** or a checkbox click toggles and saves immediately; **Esc** returns without undoing saved changes. The concise footer shows move, toggle, and back shortcuts. Keyboard hints wrap at narrow widths.
 
@@ -349,6 +354,24 @@ Background output is saved to `artifacts/<sessionId>/subagent-logs/<name>-<id>.l
 ## Status widget
 
 The widget tracks each sub-agent with a two-line status block: the primary line shows identity, elapsed time, and real-time state (`starting`, `active`, `waiting`, `stalled`, or `running`), while the secondary telemetry line shows cumulative token consumption (`↑in↓out`), cache metrics, cost, model, and color-coded context window occupancy. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`. Toggle the widget via the `/subagent-settings` status-widget row (persists to the user agent config).
+
+By default, the frame has a subdued, theme-aware border with a soft rainbow trail circulating clockwise every six seconds (targeting 40 FPS). The fading trail extends behind the head for two thirds of the total screen-space perimeter, with an additional soft leading fade. Travel time is proportional to each edge's screen distance, using Pi's current terminal-cell dimensions (cells are typically about twice as tall as they are wide). This keeps visual speed consistent across long and short edges instead of spending two seconds on every side. The glow and soft leading/trailing fades use the same screen-distance coordinates. Thin text borders remain cell-based: 40 FPS is a redraw target, not 40 distinct spatial positions per second. The title uses the theme's normal text color without bold; the running count stays muted. Labels, status colors, and telemetry remain steady. Colors use the terminal's truecolor or 256-color capabilities; truecolor gives the smoothest fades, while 256-color terminals have coarser color steps. The widget is mounted once; its animation timer is released when hidden, empty, disposed, reloaded, or shut down. It renders only in interactive TUI mode.
+
+### Widget appearance
+
+Open `/subagent-settings` → **General** → **Widget appearance…**:
+
+| Setting | Choices | Default |
+| --- | --- | --- |
+| Animated border | On / Off | On |
+| Loop duration | 4, 6, 8, 10, or 12 seconds | 6 seconds |
+| Trail length | ¼, ⅓, ½, ⅔, or ¾ of the perimeter | ⅔ |
+
+**Animated border: Off** uses a static, theme-aware border while live status, elapsed time, and telemetry continue updating once a second. The separate **Status widget** toggle hides the entire widget. Appearance preferences are retained while the widget is hidden or animation is off, and apply to current and future widgets without a reload or remount. The title and count keep their steady colors in either mode.
+
+These settings persist under `status.animated`, `status.cycleSeconds`, and `status.trailFraction`; the last is a numeric fraction (for example, `0.6666666666666666` for ⅔). Omitted fields use the defaults above. Only the listed durations/fractions are accepted. Appearance controls do not launch agents or generate model calls; there is no runtime preview/debug command.
+
+`node --test test/subagent-widget.test.ts` checks deterministic frames, screen-distance timing, cell-size changes, short-edge color transitions, supported durations/trail lengths, static borders, color-mode conversion, narrow widths/Unicode, stable text, live configuration changes, persistent mounting, and timer cleanup without model calls.
 
 ## Session Storage & Orphan Cleanup
 

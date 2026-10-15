@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { getPowerShellConfig, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  createSubagentsConfigState, DEFAULT_SUBAGENTS_CONFIG, loadSubagentsConfig,
-  parseSubagentsConfig, serializeSubagentsConfig, type AgentOverride,
+  createSubagentsConfigState, DEFAULT_SUBAGENTS_CONFIG, EXAMPLE_CONFIG_PATH, loadSubagentsConfig,
+  parseSubagentsConfig, serializeSubagentsConfig, WIDGET_CYCLE_SECONDS, WIDGET_TRAIL_FRACTIONS, type AgentOverride,
 } from "../pi-extension/subagents/config.ts";
 import { __test__ as runtime, registerToolExtension } from "../pi-extension/subagents/index.ts";
 import { readSubagentLoadout, writeSubagentLoadout, loadoutSidecarPath } from "../pi-extension/subagents/session.ts";
@@ -139,7 +139,7 @@ describe("persisted subagent launch overrides", () => {
     const path = join(dir, "config.json");
     const other = { model: "provider/primary", tools: [], skills: ["review"], subagentAgents: [], modelFallback: null };
     const hidden = { maxConcurrent: null, thinking: "high" };
-    const state = createSubagentsConfigState({ status: { enabled: false }, multiplexing: { backend: "background" },
+    const state = createSubagentsConfigState({ status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false }, multiplexing: { backend: "background" },
       agents: { worker: other, hidden } }, path);
     state.update((draft) => { draft.agents.worker.maxConcurrent = 37; });
     const saved = loadSubagentsConfig(path);
@@ -152,7 +152,7 @@ describe("persisted subagent launch overrides", () => {
     state.update((draft) => { draft.agents.worker.maxConcurrent = null; });
     assert.deepEqual(loadSubagentsConfig(path).agents.worker, { ...other, maxConcurrent: null });
     state.update((draft) => { delete draft.agents.worker.maxConcurrent; });
-    assert.deepEqual(loadSubagentsConfig(path), { status: { enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
+    assert.deepEqual(loadSubagentsConfig(path), { status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
   }));
 
   it("keeps live state unchanged if an update cannot be validated or persisted", () => withTempDir((dir) => {
@@ -164,6 +164,80 @@ describe("persisted subagent launch overrides", () => {
     const blocked = createSubagentsConfigState(DEFAULT_SUBAGENTS_CONFIG, join(path, "config.json"));
     assert.throws(() => blocked.update((draft) => { draft.agents.worker = { skills: [] }; }));
     assert.deepEqual(blocked.get(), DEFAULT_SUBAGENTS_CONFIG);
+  }));
+});
+
+describe("status widget appearance config", () => {
+  const defaultStatus = { enabled: true, animated: true, cycleSeconds: 6, trailFraction: 2 / 3 };
+
+  it("fills absent status keys with defaults so enabled-only configs keep working", () => {
+    assert.deepEqual(parseSubagentsConfig({}), { status: defaultStatus, multiplexing: { backend: "auto" }, agents: {} });
+    assert.deepEqual(parseSubagentsConfig({ status: { enabled: false } }).status,
+      { enabled: false, animated: true, cycleSeconds: 6, trailFraction: 2 / 3 });
+    assert.deepEqual(parseSubagentsConfig({ status: { animated: false } }).status,
+      { enabled: true, animated: false, cycleSeconds: 6, trailFraction: 2 / 3 });
+  });
+
+  it("accepts exactly the exported cycle and trail choices", () => {
+    assert.deepEqual([...WIDGET_CYCLE_SECONDS], [4, 6, 8, 10, 12]);
+    assert.deepEqual([...WIDGET_TRAIL_FRACTIONS], [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4]);
+    for (const cycleSeconds of WIDGET_CYCLE_SECONDS) {
+      assert.equal(parseSubagentsConfig({ status: { cycleSeconds } }).status.cycleSeconds, cycleSeconds);
+    }
+    for (const trailFraction of WIDGET_TRAIL_FRACTIONS) {
+      assert.equal(parseSubagentsConfig({ status: { trailFraction } }).status.trailFraction, trailFraction);
+    }
+  });
+
+  it("rejects invalid booleans, unsupported keys, and numbers outside the exported choices", () => {
+    for (const value of [null, "true", 0, 1, [], {}]) {
+      assert.throws(() => parseSubagentsConfig({ status: { animated: value } }), /status.animated must be a boolean/);
+    }
+    for (const cycleSeconds of [3, 5, 7, 14, 0, -6, 4.5, NaN, Infinity, "6", null, true, [], {}]) {
+      assert.throws(() => parseSubagentsConfig({ status: { cycleSeconds } }), /status.cycleSeconds must be one of 4, 6, 8, 10, 12/);
+    }
+    for (const trailFraction of [0, 1, 0.6, 0.66, 0.6666666666666667, -1 / 3, NaN, Infinity, "2/3", null, true, [], {}]) {
+      assert.throws(() => parseSubagentsConfig({ status: { trailFraction } }), /status.trailFraction must be one of 1\/4, 1\/3, 1\/2, 2\/3, 3\/4/);
+    }
+    assert.throws(() => parseSubagentsConfig({ status: { enabled: true, speed: 6 } }), /status has unsupported key\(s\): speed/);
+  });
+
+  it("round-trips every status field through the serializer without losing precision", () => {
+    const parsed = parseSubagentsConfig({ status: { enabled: false, animated: false, cycleSeconds: 10, trailFraction: 1 / 3 } });
+    assert.deepEqual(parseSubagentsConfig(JSON.parse(serializeSubagentsConfig(parsed))), parsed);
+    assert.deepEqual(parseSubagentsConfig(JSON.parse(serializeSubagentsConfig(DEFAULT_SUBAGENTS_CONFIG))), DEFAULT_SUBAGENTS_CONFIG);
+    assert.deepEqual(JSON.parse(serializeSubagentsConfig(parsed)).status,
+      { enabled: false, animated: false, cycleSeconds: 10, trailFraction: 1 / 3 });
+  });
+
+  it("preserves every status field across state updates and rejects invalid appearance values atomically", () => withTempDir((dir) => {
+    const path = join(dir, "config.json");
+    const state = createSubagentsConfigState(DEFAULT_SUBAGENTS_CONFIG, path);
+    state.update((draft) => {
+      draft.status.enabled = false;
+      draft.status.animated = false;
+      draft.status.cycleSeconds = 12;
+      draft.status.trailFraction = WIDGET_TRAIL_FRACTIONS[4]; // 3/4
+    });
+    const saved = loadSubagentsConfig(path);
+    assert.deepEqual(saved.status, { enabled: false, animated: false, cycleSeconds: 12, trailFraction: 3 / 4 });
+    for (const [field, value, message] of [
+      ["animated", "yes", "a boolean"], ["cycleSeconds", 7, "one of 4, 6, 8, 10, 12"], ["trailFraction", 0.9, "one of 1/4"],
+    ] as const) {
+      assert.throws(() => state.update((draft) => {
+        (draft.status as Record<string, unknown>)[field] = value;
+      }), new RegExp(`status.${field} must be .*${message.replace("/", "\\/")}`));
+      assert.deepEqual(state.get(), saved);
+      assert.deepEqual(loadSubagentsConfig(path), saved);
+    }
+    // A deleted status key falls back to its default instead of persisting an absent field.
+    state.update((draft) => { delete (draft.status as Record<string, unknown>).animated; });
+    assert.deepEqual(loadSubagentsConfig(path).status, { ...saved.status, animated: true });
+  }));
+
+  it("loads the committed example template with full default appearance via the missing-file fallback", () => withTempDir((dir) => {
+    assert.deepEqual(loadSubagentsConfig(join(dir, "absent", "config.json")).status, defaultStatus);
+    assert.deepEqual(parseSubagentsConfig(JSON.parse(readFileSync(EXAMPLE_CONFIG_PATH, "utf8"))).status, defaultStatus);
   }));
 });
 

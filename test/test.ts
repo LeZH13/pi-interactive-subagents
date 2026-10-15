@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, mkdtempSync, writeFileSync, readFileSync, re
 import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, rgbColor, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { initTheme, Theme } from "@earendil-works/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import { formatSubagentIdentity } from "../pi-extension/subagents/identity.ts";
@@ -1392,10 +1392,11 @@ describe("session.ts", () => {
 describe("config.ts (unified subagent config)", () => {
   it("parses the unified config with defaults", () => {
     assert.deepEqual(parseSubagentsConfig({}), {
-      status: { enabled: true },
+      status: { enabled: true, animated: true, cycleSeconds: 6, trailFraction: 2 / 3 },
       multiplexing: { backend: "auto" },
       agents: {},
     });
+    // Partial raw status input: absent appearance keys fill from defaults.
     assert.deepEqual(
       parseSubagentsConfig({
         status: { enabled: false },
@@ -1403,7 +1404,7 @@ describe("config.ts (unified subagent config)", () => {
         agents: { worker: { model: "openai/gpt-5", thinking: "high" } },
       }),
       {
-        status: { enabled: false },
+        status: { enabled: false, animated: true, cycleSeconds: 6, trailFraction: 2 / 3 },
         multiplexing: { backend: "background" },
         agents: { worker: { model: "openai/gpt-5", thinking: "high" } },
       },
@@ -1419,7 +1420,7 @@ describe("config.ts (unified subagent config)", () => {
   it("loads the shared example when local config is absent", () => {
     const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
     assert.deepEqual(loadSubagentsConfig(examplePath), {
-      status: { enabled: true },
+      status: { enabled: true, animated: true, cycleSeconds: 6, trailFraction: 2 / 3 },
       multiplexing: { backend: "auto" },
       agents: {},
     });
@@ -1438,7 +1439,7 @@ describe("config.ts (unified subagent config)", () => {
           "config.json",
         );
         const config = {
-          status: { enabled: false },
+          status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false },
           multiplexing: { backend: "tmux" as const },
           agents: { worker: { thinking: "high" } },
         };
@@ -1521,14 +1522,14 @@ describe("config.ts (unified subagent config)", () => {
       const configPath = join(dir, "config.json");
       writeSubagentsConfig(
         {
-          status: { enabled: false },
+          status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false },
           multiplexing: { backend: "tmux" },
           agents: { worker: { model: "  ", thinking: "high" }, ghost: {} },
         },
         configPath,
       );
       assert.deepEqual(loadSubagentsConfig(configPath), {
-        status: { enabled: false },
+        status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false },
         multiplexing: { backend: "tmux" },
         agents: { worker: { thinking: "high" } },
       });
@@ -2005,7 +2006,7 @@ describe("tabbed subagent settings", () => {
         modelSupportsReasoning: () => true,
         configState,
         setBackendPreference: (backend) => { backends.push(backend); },
-        setStatusEnabled: (enabled) => { statusChanges.push(enabled); },
+        refreshWidget: () => { statusChanges.push(configState.get().status.enabled); },
         sessionDirs: () => null,
         runningSessionFiles: () => [],
         artifactDirFor: (_sessionDir, _sessionId) => dir,
@@ -2389,7 +2390,7 @@ describe("tabbed subagent settings", () => {
       deps.sessionDirs = () => ({ sessionDir: dir, sessionId: "current" });
       context.ui.confirm = async () => false;
       component.handleInput!("\t");
-      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
       component.handleInput!("\r"); component.handleInput!("\r");
       await Promise.resolve();
       assert.equal(existsSync(join(artifactDir, "subagent-registry.json")), true);
@@ -2402,7 +2403,7 @@ describe("tabbed subagent settings", () => {
   it("explains unavailable cleanup and lets Enter return to General", async () => {
     await withSettingsUi(({ component, render }) => {
       component.handleInput!("\t");
-      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
       component.handleInput!("\r");
       assert.match(render(), /Open a persistent session/);
       component.handleInput!("\r");
@@ -2424,7 +2425,7 @@ describe("tabbed subagent settings", () => {
       let confirmation = "";
       context.ui.confirm = async (_title: string, message: string) => { confirmation = message; return true; };
       component.handleInput!("\t");
-      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
+      component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B"); component.handleInput!("\x1b[B");
       component.handleInput!("\r");
       assert.match(render(), /orphan-a/);
       assert.match(render(), /orphan-b/);
@@ -5821,6 +5822,8 @@ describe("subagent startup delay", () => {
 });
 const levels = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const thinkingTheme = {
+  colors: { borderMuted: rgbColor(80, 90, 110) },
+  getColorMode: () => "truecolor" as const,
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
   getThinkingBorderColor: (level: string) => (text: string) => `\x1b[38;5;${levels.indexOf(level) + 1}m${text}\x1b[39m`,
@@ -6848,6 +6851,7 @@ describe("subagent badge rendering and conciseness rules", () => {
   it("renderSubagentWidgetLines shows badge when distinct and omits when same", () => {
     const now = 1_000_000;
     const theme = {
+      ...thinkingTheme,
       ...createTheme(),
       getThinkingBorderColor: (_level: string) => (text: string) => text,
     };
@@ -7316,7 +7320,7 @@ describe("subagent badge rendering and conciseness rules", () => {
     const runningEntry = Array.from(runningMap.values()).find((entry) => entry.sessionFile === testApi.canonicalSessionPath(sessionFile));
     assert.ok(runningEntry, "expected running entry to be registered");
     assert.equal(runningEntry.agent, "scout");
-    assert.equal((globalThis as any)[Symbol.for("pi-subagents/widget-interval")] ?? null, null,
+    assert.equal((globalThis as any)[Symbol.for("pi-subagents/widget-dispose")] ?? null, null,
       "headless runs must not start a UI refresh timer");
 
     const completed = await completion;

@@ -24,7 +24,7 @@ import {
 import { basename } from "node:path";
 import type { AuditScope } from "./audit.ts";
 import { cleanOrphanArtifactDirs, findOrphanArtifactDirs } from "./session.ts";
-import type { AgentOverride, SubagentsConfigState } from "./config.ts";
+import { WIDGET_CYCLE_SECONDS, WIDGET_TRAIL_FRACTIONS, type AgentOverride, type SubagentsConfig, type SubagentsConfigState } from "./config.ts";
 import { isHerdrAvailable, isTmuxAvailable, resolveSurfaceBackend } from "./surface.ts";
 
 export interface SubagentSettingsDeps {
@@ -50,8 +50,8 @@ export interface SubagentSettingsDeps {
   configState: SubagentsConfigState;
   /** Called after backend changes so the live preference takes effect. */
   setBackendPreference: (backend: "auto" | "tmux" | "herdr" | "background") => void;
-  /** Called after the status toggle so widget rendering follows. */
-  setStatusEnabled: (enabled: boolean) => void;
+  /** Apply widget visibility/appearance changes immediately without remounting. */
+  refreshWidget: () => void;
   sessionDirs: (ctx: ExtensionContext) => { sessionDir: string; sessionId: string } | null;
   runningSessionFiles: () => string[];
   artifactDirFor: (sessionDir: string, sessionId: string) => string;
@@ -703,6 +703,73 @@ function agentView(
   };
 }
 
+const TRAIL_LABELS = new Map<number, string>([[1 / 4, "¼"], [1 / 3, "⅓"], [1 / 2, "½"], [2 / 3, "⅔"], [3 / 4, "¾"]]);
+
+function widgetAppearanceView(
+  ctx: ExtensionContext, deps: SubagentSettingsDeps,
+  push: (view: SettingsView) => void, back: () => void,
+): SettingsView {
+  const path = ["Widget appearance"];
+  const save = (mutate: (status: SubagentsConfig["status"]) => void): boolean => {
+    try {
+      deps.configState.update((draft) => mutate(draft.status));
+      deps.refreshWidget();
+      return true;
+    } catch (error) {
+      ctx.ui.notify(`Could not save widget appearance: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return false;
+    }
+  };
+  const labels: Record<string, string> = {
+    animated: "Animated border", cycleSeconds: "Loop duration", trailFraction: "Trail length",
+  };
+  return selectionView(ctx, {
+    path, action: "Change",
+    items: Object.entries(labels).map(([value, label]) => ({ value, label })),
+    empty: "No widget appearance settings available.",
+    formatItems: (items) => {
+      const status = deps.configState.get().status;
+      const values: Record<string, string> = {
+        animated: status.animated ? "On" : "Off",
+        cycleSeconds: `${status.cycleSeconds} seconds`,
+        trailFraction: `${TRAIL_LABELS.get(status.trailFraction)} of perimeter`,
+      };
+      const labelWidth = Math.max(...Object.values(labels).map(visibleWidth));
+      for (const item of items) item.label = `${padColumn(labels[item.value], labelWidth)}${FIELD_GAP}${values[item.value]}`;
+    },
+    detail: (item) => item.value === "animated"
+      ? "Enter toggles the rainbow border. Off uses a static border; live progress still updates."
+      : item.value === "cycleSeconds"
+        ? "Time for one clockwise loop. Lower is faster. Saved even when animation is off."
+        : "Fading trail behind the head, measured along the whole perimeter. A soft leading fade is additional.",
+    onSelect: (item) => {
+      if (item.value === "animated") {
+        save((status) => { status.animated = !status.animated; });
+      } else if (item.value === "cycleSeconds") {
+        push(selectionView(ctx, {
+          path: [...path, "Loop duration"], initial: String(deps.configState.get().status.cycleSeconds),
+          items: WIDGET_CYCLE_SECONDS.map((seconds) => ({ value: String(seconds), label: `${seconds} seconds${seconds === 6 ? " (default)" : ""}` })),
+          empty: "No loop durations available.",
+          onSelect: (choice) => {
+            const seconds = WIDGET_CYCLE_SECONDS.find((value) => String(value) === choice.value)!;
+            if (save((status) => { status.cycleSeconds = seconds; })) back();
+          },
+          onBack: back,
+        }));
+      } else {
+        push(selectionView(ctx, {
+          path: [...path, "Trail length"], initial: String(deps.configState.get().status.trailFraction),
+          items: WIDGET_TRAIL_FRACTIONS.map((fraction) => ({ value: String(fraction), label: `${TRAIL_LABELS.get(fraction)} of perimeter${fraction === 2 / 3 ? " (default)" : ""}` })),
+          empty: "No trail lengths available.",
+          onSelect: (choice) => { if (save((status) => { status.trailFraction = Number(choice.value); })) back(); },
+          onBack: back,
+        }));
+      }
+    },
+    onBack: back,
+  });
+}
+
 export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: SubagentSettingsDeps): Promise<void> {
   if (!ctx.hasUI) { ctx.ui.notify("Subagent settings require interactive mode.", "warning"); return; }
   const auditScope = await ctx.ui.custom<AuditScope | undefined>((tui, theme, _keybindings, done) => {
@@ -737,6 +804,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
         items: [
           { value: "backend", label: "Launch surface" },
           { value: "status-widget", label: "Status widget" },
+          { value: "widget-appearance", label: "Widget appearance…" },
           { value: "orphan-cleanup", label: "Orphan cleanup" },
           { value: "audit", label: "Audit subagents…" },
         ],
@@ -746,12 +814,14 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
           const compact = width < 48;
           const labels: Record<string, string> = {
             backend: "Launch surface",
-            "status-widget": "Status widget", "orphan-cleanup": "Orphan cleanup", audit: "Audit subagents…",
+            "status-widget": "Status widget", "widget-appearance": "Widget appearance…",
+            "orphan-cleanup": "Orphan cleanup", audit: "Audit subagents…",
           };
           const labelWidth = Math.max(...Object.values(labels).map(visibleWidth));
           for (const item of items) {
             const value = item.value === "backend" ? backendSummary :
               item.value === "status-widget" ? config.status.enabled ? "On" : "Off" :
+              item.value === "widget-appearance" ? config.status.animated ? "Animated" : "Static" :
               item.value === "audit" ? "Choose scope" : cleanupSummary;
             const displayedValue = compact && item.value === "backend" ? value.replace(/^Automatic/, "Auto") : value;
             item.label = `${padColumn(labels[item.value], labelWidth)}${FIELD_GAP}${displayedValue}`;
@@ -759,13 +829,16 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
         },
         detail: (item) => item.value === "backend" ? `${backendSummary}. Where new subagents run. Automatic chooses an available surface.` :
           item.value === "status-widget" ? "Show live subagent progress above the editor. Enter toggles On / Off." :
+          item.value === "widget-appearance" ? "Animated border, loop duration, and trail length. Changes save and apply immediately." :
           item.value === "audit" ? "Read-only orchestration review of sessions or profiles. Closes settings and starts an audit while idle." :
           "Review artifacts from deleted parent sessions. Deletion requires confirmation.",
         onSelect: (item) => {
           if (item.value === "status-widget") {
             const enabled = !deps.configState.get().status.enabled;
             deps.configState.update((draft) => { draft.status.enabled = enabled; });
-            deps.setStatusEnabled(enabled);
+            deps.refreshWidget();
+          } else if (item.value === "widget-appearance") {
+            push(widgetAppearanceView(ctx, deps, push, back));
           } else if (item.value === "audit") {
             push(selectionView(ctx, {
               path: ["Audit subagents"], action: "Audit",
@@ -903,7 +976,7 @@ export async function showSubagentSettings(ctx: ExtensionCommandContext, deps: S
 
 export function registerSubagentSettingsCommand(pi: ExtensionAPI, deps: SubagentSettingsDeps): void {
   pi.registerCommand("subagent-settings", {
-    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, concurrency, surface/status, cleanup, audit",
+    description: "Subagent settings: model/thinking, tools, spawnable agents, startup skills, fallback, concurrency, surface/status, widget appearance, cleanup, audit",
     handler: async (_args, ctx) => { await showSubagentSettings(ctx, deps); },
   });
 }

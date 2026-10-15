@@ -62,6 +62,7 @@ import { registerSubagentSettingsCommand } from "./settings.ts";
 import { showSubagentAudit } from "./audit.ts";
 import { hasBash, resolveBashGuardExtension, validateBashGuardExtension, validateShellSelection } from "./bash-guard.ts";
 import { formatSubagentIdentity } from "./identity.ts";
+import { AnimatedWidget, borderLine, createBorderPalette, renderWidgetFrame, type BorderTheme, type WidgetAppearance, type WidgetRow } from "./widget.ts";
 import { canonicalSessionPath, claimSession, abandonStartingSession, enqueueMessage, pendingMessages, finalizeSession, type SessionOwner, type InboxMessage } from "./protocol.ts";
 import {
   DEFAULT_STATUS_LINE_LIMIT,
@@ -89,16 +90,14 @@ const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
 // the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
-const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
+const WIDGET_DISPOSE_KEY = Symbol.for("pi-subagents/widget-dispose");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 {
-  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
-  if (prevInterval) {
-    clearInterval(prevInterval);
-    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-  }
+  const disposeWidget = (globalThis as any)[WIDGET_DISPOSE_KEY] as (() => void) | undefined;
+  disposeWidget?.();
+  (globalThis as any)[WIDGET_DISPOSE_KEY] = null;
   const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY];
   if (prevStatusInterval) {
     clearInterval(prevStatusInterval);
@@ -1330,78 +1329,20 @@ let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
 
-/** Interval timer for widget re-renders. */
-let widgetInterval: ReturnType<typeof setInterval> | null = null;
+/** One persistent component per visible widget. */
+let widget: AnimatedWidget | null = null;
 
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
-function formatElapsedMMSS(startTime: number): string {
-  const seconds = Math.floor((Date.now() - startTime) / 1000);
+function formatElapsedMMSS(startTime: number, now: number): string {
+  const seconds = Math.floor((now - startTime) / 1000);
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-const ACCENT = "\x1b[38;2;77;163;255m";
 const RST = "\x1b[0m";
-
-/**
- * Build a bordered content line: │left          right│
- * Left content is truncated if needed, right is preserved, padded to fill width.
- */
-function borderLine(left: string, right: string, width: number): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}│${RST}`;
-
-  // width = total visible chars for the whole line including │ and │
-  const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
-  const rightVis = visibleWidth(right);
-
-  // If the status chunk alone is too wide, prefer preserving it in compact form
-  // rather than overflowing the terminal.
-  if (rightVis >= contentWidth) {
-    const truncRight = truncateToWidth(right, contentWidth);
-    const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
-    return `${ACCENT}│${RST}${truncRight}${" ".repeat(rightPad)}${ACCENT}│${RST}`;
-  }
-
-  const maxLeft = Math.max(0, contentWidth - rightVis);
-  const truncLeft = truncateToWidth(left, maxLeft);
-  const leftVis = visibleWidth(truncLeft);
-  const pad = Math.max(0, contentWidth - leftVis - rightVis);
-  return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
-}
-
-/**
- * Build the bordered top line: ╭─ Title ──── info ─╮
- * All chars are accounted for within `width`.
- */
-function borderTop(title: string, info: string, width: number): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╭${RST}`;
-
-  // ╭─ Title ───...─── info ─╮
-  // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
-  const inner = Math.max(0, width - 2); // inside ╭ and ╮
-  const titlePart = `─ ${title} `;
-  const infoPart = ` ${info} ─`;
-  const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
-  const fill = "─".repeat(fillLen);
-  const content = `${titlePart}${fill}${infoPart}`.slice(0, inner).padEnd(inner, "─");
-  return `${ACCENT}╭${content}╮${RST}`;
-}
-
-/**
- * Build the bordered bottom line: ╰──────────────────╯
- */
-function borderBottom(width: number): string {
-  if (width <= 0) return "";
-  if (width === 1) return `${ACCENT}╰${RST}`;
-
-  const inner = Math.max(0, width - 2);
-  return `${ACCENT}╰${"─".repeat(inner)}╯${RST}`;
-}
 
 function formatWidgetTelemetryClusters(stats: {
   inputTokens?: number;
@@ -1479,21 +1420,22 @@ function formatWidgetTelemetryLine(
   return { left, right };
 }
 
-function renderSubagentWidgetLines(
-  agents: RunningSubagent[],
-  width: number,
-  theme: ThinkingTheme & Pick<Theme, "fg" | "bold">,
-): string[] {
-  const count = agents.length;
-  const title = "Subagents";
-  const info = `${count} running`;
+type WidgetAgent = Pick<RunningSubagent, "name" | "agent" | "startTime" | "cli" | "statusState">;
 
-  const lines: string[] = [borderTop(title, info, width)];
+function renderSubagentWidgetLines(
+  agents: WidgetAgent[],
+  width: number,
+  theme: ThinkingTheme & Pick<Theme, "fg" | "bold"> & BorderTheme,
+  now = Date.now(),
+  appearance: WidgetAppearance = configState.get().status,
+  palette = createBorderPalette(theme, appearance.trailFraction),
+): string[] {
+  const rows: WidgetRow[] = [];
 
   for (const agent of agents) {
-    const elapsed = formatElapsedMMSS(agent.startTime);
+    const elapsed = formatElapsedMMSS(agent.startTime, now);
     const identity = formatSubagentIdentity(agent.name, agent.agent, theme);
-    const snapshot = classifyStatus(agent.statusState, Date.now());
+    const snapshot = classifyStatus(agent.statusState, now);
     const icon = widgetIcon(snapshot.kind);
     const left = ` ${icon} ${elapsed}  ${identity} `;
     const right = statusConfig.enabled
@@ -1502,42 +1444,46 @@ function renderSubagentWidgetLines(
         ? " running… "
         : " starting… ";
 
-    lines.push(borderLine(left, right, width));
+    rows.push({ left, right });
 
     const telemetryLine = formatWidgetTelemetryLine(snapshot, theme);
-    if (telemetryLine) lines.push(borderLine(telemetryLine.left, telemetryLine.right, width));
+    if (telemetryLine) rows.push(telemetryLine);
   }
 
-  lines.push(borderBottom(width));
-  return lines;
+  return renderWidgetFrame(
+    "Subagents", `${agents.length} running`,
+    rows, width, now, theme, palette, undefined, appearance,
+  );
+}
+
+function removeWidget() {
+  widget?.dispose();
+  widget = null;
+  (globalThis as any)[WIDGET_DISPOSE_KEY] = null;
+  if (latestCtx?.mode === "tui") latestCtx.ui.setWidget("subagent-status", undefined);
 }
 
 function updateWidget() {
-  const visible = visibleRunningSubagents();
-  if (visible.length === 0) {
-    if (latestCtx?.hasUI) latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-    }
+  if (!latestCtx || latestCtx.mode !== "tui") return;
+  if (visibleRunningSubagents().length === 0 || !statusConfig.enabled) {
+    if (widget) removeWidget();
     return;
   }
-
-  if (!latestCtx?.hasUI) return;
-
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui, theme) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(visibleRunningSubagents(), width, theme);
-        },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+  if (!widget || widget.disposed) {
+    latestCtx.ui.setWidget("subagent-status", (tui, theme) => {
+      widget = new AnimatedWidget(tui, theme, (width, time, palette, appearance) => {
+        return renderSubagentWidgetLines(
+          visibleRunningSubagents(), width, theme, time, appearance, palette,
+        );
+      }, () => {
+        if (visibleRunningSubagents().length === 0 || !statusConfig.enabled) removeWidget();
+      }, configState.get().status);
+      (globalThis as any)[WIDGET_DISPOSE_KEY] = () => widget?.dispose();
+      return widget;
+    }, { placement: "aboveEditor" });
+  }
+  widget?.setAppearance(configState.get().status);
+  widget?.refresh();
 }
 
 /**
@@ -2276,6 +2222,7 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   renderSubagentWidgetLines,
+  updateWidget,
   loadAgentDefaults,
   discoverAgentDefinitions,
   getSubagentArgumentCompletions,
@@ -2351,15 +2298,6 @@ export const __test__ = {
   wrapCommandWithCompletion,
   clearRunSignals,
 };
-
-function startWidgetRefresh() {
-  if (!latestCtx?.hasUI || widgetInterval) return;
-  updateWidget(); // immediate first render
-  widgetInterval = setInterval(() => {
-    updateWidget();
-  }, 1000);
-  (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
-}
 
 /**
  * Launch a subagent: creates the multiplexer pane, builds the command, and
@@ -2989,6 +2927,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
+    removeWidget();
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -3003,11 +2942,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", async (_event, _ctx) => {
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-    }
+    removeWidget();
+    latestCtx = null;
     if (statusInterval) {
       clearInterval(statusInterval);
       statusInterval = null;
@@ -3191,8 +3127,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        // Start widget refresh and status supervision when the first agent launches
-        startWidgetRefresh();
+        // Mount the animated widget and start status supervision on launch
+        updateWidget();
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background. A configured model
@@ -3227,7 +3163,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 finalRunning = await lifecycle.launchSubagent(retryParams, ctx, { parent, parentLeafId: spawnParentLeafId, piTools, ownedSessions });
                 trackSession(finalRunning);
                 finalRunning.abortController = watcherAbort;
-                startWidgetRefresh();
+                updateWidget();
                 startStatusRefresh(pi);
                 result = await lifecycle.watchSubagent(finalRunning, watcherAbort.signal);
                 const retained = [...(primaryResult.undeliveredMessages ?? []), ...(result.undeliveredMessages ?? [])];
@@ -3855,7 +3791,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         launched = running;
         runningSubagents.set(id, running);
         reservation.resolve(running);
-        startWidgetRefresh();
+        updateWidget();
         startStatusRefresh(pi);
 
         // Fire-and-forget watcher
@@ -4055,7 +3991,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
     configState,
     setBackendPreference: (backend) => setSurfaceBackendPreference(backend),
-    setStatusEnabled: () => updateWidget(),
+    refreshWidget: () => updateWidget(),
     sessionDirs: (ctx) => {
       try {
         const sessionFile = ctx.sessionManager.getSessionFile();

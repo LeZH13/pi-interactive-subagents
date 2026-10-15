@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, visibleWidth, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
-import { createSubagentsConfigState, DEFAULT_SUBAGENTS_CONFIG, loadSubagentsConfig, type AgentOverride } from "../pi-extension/subagents/config.ts";
+import { createSubagentsConfigState, DEFAULT_SUBAGENTS_CONFIG, loadSubagentsConfig, WIDGET_CYCLE_SECONDS, WIDGET_TRAIL_FRACTIONS, type AgentOverride } from "../pi-extension/subagents/config.ts";
 import { showSubagentSettings, type SubagentSettingsDeps } from "../pi-extension/subagents/settings.ts";
 
 const ENTER = "\r";
@@ -77,7 +77,7 @@ async function withUi(
     registryModels: (preferred) => [...new Set([...(preferred ? [preferred] : []), "test/a", "test/b"])],
     modelSupportsReasoning: () => true,
     configState: state,
-    setBackendPreference() {}, setStatusEnabled() {}, async audit() {},
+    setBackendPreference() {}, refreshWidget() {}, async audit() {},
     sessionDirs: () => null, runningSessionFiles: () => [], artifactDirFor: () => dir,
   };
   let showing = showSubagentSettings(context, deps);
@@ -114,6 +114,120 @@ async function withUi(
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe("widget appearance settings", () => {
+  it("lives in General, persists changes immediately, and keeps visibility separate", async () => {
+    await withUi(async ({ deps, state, input, click, render, reopen, configPath }) => {
+      const applied: unknown[] = [];
+      deps.refreshWidget = () => applied.push(state.get().status);
+      input(ESC, "\t");
+      click(/Status widget\s+On/);
+      assert.equal(state.get().status.enabled, false);
+      click(/Widget appearance…\s+Animated/);
+      assert.match(render(), /General › Widget appearance/);
+      assert.match(render(), /Animated border\s+On/);
+      assert.match(render(), /Loop duration\s+6 seconds/);
+      assert.match(render(), /Trail length\s+⅔ of perimeter/);
+      click(/Animated border\s+On/);
+      assert.equal(state.get().status.animated, false);
+      click(/Loop duration\s+6 seconds/);
+      assert.match(render(), /Widget appearance › Loop duration/);
+      click(/10 seconds$/);
+      assert.match(render(), /Loop duration\s+10 seconds/);
+      click(/Trail length\s+⅔/);
+      click(/¼ of perimeter$/);
+      assert.equal(applied.length, 4, "visibility and all three appearance changes apply live");
+      const expected = { enabled: false, animated: false, cycleSeconds: 10, trailFraction: 1 / 4 };
+      assert.deepEqual(state.get().status, expected);
+      assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).status, expected);
+      for (const width of [18, 40, 110]) {
+        assert.ok(render(width).split("\n").every((line) => visibleWidth(line) <= width));
+      }
+      input(ESC);
+      assert.match(render(), /Status widget\s+Off/);
+      assert.match(render(), /Widget appearance…\s+Static/);
+      await reopen();
+      input("\t");
+      click(/Widget appearance…\s+Static/);
+      assert.match(render(), /Animated border\s+Off/);
+      assert.match(render(), /Loop duration\s+10 seconds/);
+      assert.match(render(), /Trail length\s+¼ of perimeter/);
+      click(/Animated border\s+Off/);
+      assert.equal(state.get().status.animated, true);
+      assert.equal(state.get().status.enabled, false, "animation does not unhide the widget");
+      assert.equal(state.get().status.cycleSeconds, 10);
+      assert.equal(state.get().status.trailFraction, 1 / 4);
+    });
+  });
+
+  it("supports every duration and trail choice and preserves unrelated settings", async () => {
+    await withUi(({ deps, state, input, click, render }) => {
+      const agents = state.get().agents;
+      let applied = 0;
+      deps.refreshWidget = () => { applied++; };
+      input(ESC, "\t");
+      click(/Widget appearance…/);
+      for (const seconds of WIDGET_CYCLE_SECONDS) {
+        click(/Loop duration\s+\d+ seconds/);
+        click(new RegExp(`${seconds} seconds(?: \\(default\\))?$`));
+        assert.equal(state.get().status.cycleSeconds, seconds);
+        assert.match(render(), /General › Widget appearance/);
+      }
+      for (const [i, label] of ["¼", "⅓", "½", "⅔", "¾"].entries()) {
+        click(/Trail length\s+/);
+        click(new RegExp(`${label} of perimeter(?: \\(default\\))?$`));
+        assert.equal(state.get().status.trailFraction, WIDGET_TRAIL_FRACTIONS[i]);
+      }
+      assert.equal(applied, WIDGET_CYCLE_SECONDS.length + WIDGET_TRAIL_FRACTIONS.length);
+      assert.deepEqual(state.get().agents, agents);
+      assert.deepEqual(state.get().multiplexing, DEFAULT_SUBAGENTS_CONFIG.multiplexing);
+    }, { override: { model: "test/b", tools: [] } });
+  });
+
+  it("supports keyboard toggling and cancellation without saving a picker choice", async () => {
+    await withUi(({ deps, state, input, click, render, configPath }) => {
+      let applied = 0;
+      deps.refreshWidget = () => { applied++; };
+      input(ESC, "\t", DOWN, DOWN, ENTER);
+      assert.match(render(), /General › Widget appearance/);
+      input(ENTER);
+      assert.equal(state.get().status.animated, false);
+      input(" ");
+      assert.equal(state.get().status.animated, true);
+      const saved = readFileSync(configPath, "utf8");
+      click(/Loop duration\s+6 seconds/);
+      input(DOWN, ESC);
+      click(/Trail length\s+⅔/);
+      input(DOWN, ESC);
+      assert.equal(readFileSync(configPath, "utf8"), saved);
+      assert.equal(applied, 2);
+      input(ESC);
+      assert.match(render(), /\[General\]/);
+    });
+  });
+
+  it("reports save errors without applying or leaving the picker", async () => {
+    await withUi(({ deps, state, input, click, render, notifications }) => {
+      let applied = 0;
+      deps.refreshWidget = () => { applied++; };
+      input(ESC, "\t");
+      click(/Widget appearance…/);
+      const initial = state.get();
+      const update = state.update;
+      state.update = () => { throw new Error("disk unavailable"); };
+      try {
+        click(/Animated border\s+On/);
+        click(/Loop duration\s+6 seconds/);
+        click(/8 seconds$/);
+        assert.match(render(), /Widget appearance › Loop duration/);
+        assert.deepEqual(state.get(), initial);
+        assert.equal(applied, 0);
+        assert.equal(notifications.length, 2);
+        assert.ok(notifications.every(({ message, type }) => type === "error" && /disk unavailable/.test(message)));
+      } finally { state.update = update; }
+    });
+  });
+});
 
 describe("settings audit action", () => {
   it("selects every audit scope and disposes settings before invoking the action", async () => {
@@ -876,10 +990,10 @@ describe("per-agent settings loadout controls", () => {
     await withUi(({ state, click, input, saved, configPath }) => {
       const hidden = { maxConcurrent: null, model: "other/model", tools: [] };
       const other = { model: "test/b", thinking: "high", tools: [], skills: ["review"], subagentAgents: [], modelFallback: null };
-      state.replace({ status: { enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
+      state.replace({ status: { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false }, multiplexing: { backend: "background" }, agents: { worker: other, hidden } });
       const check = (expected: AgentOverride | undefined) => {
         const config = JSON.parse(readFileSync(configPath, "utf8"));
-        assert.deepEqual(config.status, { enabled: false });
+        assert.deepEqual(config.status, { ...DEFAULT_SUBAGENTS_CONFIG.status, enabled: false });
         assert.deepEqual(config.multiplexing, { backend: "background" });
         assert.deepEqual(config.agents.hidden, hidden);
         assert.deepEqual(state.get().agents.hidden, hidden);

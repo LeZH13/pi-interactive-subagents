@@ -45,14 +45,30 @@ export type AgentOverride = {
   maxConcurrent?: number | null;
 };
 
+/** Allowed status-widget border cycle durations, in seconds. */
+export const WIDGET_CYCLE_SECONDS = [4, 6, 8, 10, 12] as const;
+
+/** Allowed status-widget trail lengths as fractions of the full frame perimeter. */
+export const WIDGET_TRAIL_FRACTIONS = [1 / 4, 1 / 3, 1 / 2, 2 / 3, 3 / 4] as const;
+
 export interface SubagentsConfig {
-  status: { enabled: boolean };
+  status: {
+    enabled: boolean;
+    animated: boolean;
+    cycleSeconds: (typeof WIDGET_CYCLE_SECONDS)[number];
+    trailFraction: (typeof WIDGET_TRAIL_FRACTIONS)[number];
+  };
   multiplexing: { backend: "auto" | "tmux" | "herdr" | "background" };
   agents: Record<string, AgentOverride>;
 }
 
 export const DEFAULT_SUBAGENTS_CONFIG: SubagentsConfig = {
-  status: { enabled: true },
+  status: {
+    enabled: true,
+    animated: true,
+    cycleSeconds: WIDGET_CYCLE_SECONDS[1], // 6s
+    trailFraction: WIDGET_TRAIL_FRACTIONS[3], // 2/3
+  },
   multiplexing: { backend: "auto" },
   agents: {},
 };
@@ -73,6 +89,20 @@ function requireObject(value: unknown, source: string, field: string): Record<st
 function requireBoolean(value: unknown, source: string, field: string): boolean {
   if (typeof value !== "boolean") throw invalid(source, `${field} must be a boolean`);
   return value;
+}
+
+/** Require a number that is strictly one of the allowed choices (NaN/Infinity/out-of-set all rejected). */
+function requireChoiceNumber<T extends number>(
+  value: unknown,
+  choices: readonly T[],
+  label: string,
+  source: string,
+  field: string,
+): T {
+  if (typeof value !== "number" || !choices.includes(value as T)) {
+    throw invalid(source, `${field} must be one of ${label}`);
+  }
+  return value as T;
 }
 
 function optionalTrimmedString(value: unknown, source: string, field: string): string | undefined {
@@ -132,6 +162,23 @@ export function parseAgentOverride(raw: unknown, source = "config.json", field =
   return override;
 }
 
+/** Parse the status-widget block; absent keys fall back to defaults. */
+function parseStatus(raw: unknown, source: string): SubagentsConfig["status"] {
+  const value = requireObject(raw, source, "status");
+  rejectUnsupportedKeys(value, ["enabled", "animated", "cycleSeconds", "trailFraction"], source, "status");
+  const defaults = DEFAULT_SUBAGENTS_CONFIG.status;
+  return {
+    enabled: value.enabled === undefined ? defaults.enabled : requireBoolean(value.enabled, source, "status.enabled"),
+    animated: value.animated === undefined ? defaults.animated : requireBoolean(value.animated, source, "status.animated"),
+    cycleSeconds: value.cycleSeconds === undefined
+      ? defaults.cycleSeconds
+      : requireChoiceNumber(value.cycleSeconds, WIDGET_CYCLE_SECONDS, WIDGET_CYCLE_SECONDS.join(", "), source, "status.cycleSeconds"),
+    trailFraction: value.trailFraction === undefined
+      ? defaults.trailFraction
+      : requireChoiceNumber(value.trailFraction, WIDGET_TRAIL_FRACTIONS, "1/4, 1/3, 1/2, 2/3, 3/4", source, "status.trailFraction"),
+  };
+}
+
 /**
  * Parse the full unified config. Unknown top-level keys are rejected except
  * the legacy `picker` key, which is silently ignored (it was removed in favor
@@ -143,14 +190,7 @@ export function parseSubagentsConfig(raw: unknown, source = "config.json"): Suba
   rejectUnsupportedKeys(root, ["status", "multiplexing", "agents", "picker"], source, "root");
 
   // status
-  let statusEnabled = DEFAULT_SUBAGENTS_CONFIG.status.enabled;
-  if (root.status !== undefined) {
-    const status = requireObject(root.status, source, "status");
-    rejectUnsupportedKeys(status, ["enabled"], source, "status");
-    statusEnabled = status.enabled === undefined
-      ? DEFAULT_SUBAGENTS_CONFIG.status.enabled
-      : requireBoolean(status.enabled, source, "status.enabled");
-  }
+  const status = root.status === undefined ? { ...DEFAULT_SUBAGENTS_CONFIG.status } : parseStatus(root.status, source);
 
   // multiplexing
   let backend: SubagentsConfig["multiplexing"]["backend"] = "auto";
@@ -189,7 +229,7 @@ export function parseSubagentsConfig(raw: unknown, source = "config.json"): Suba
     }
   }
 
-  return { status: { enabled: statusEnabled }, multiplexing: { backend }, agents };
+  return { status, multiplexing: { backend }, agents };
 }
 
 function readConfigFile(
@@ -238,7 +278,7 @@ export function serializeSubagentsConfig(config: SubagentsConfig): string {
   }
   return JSON.stringify(
     {
-      status: { enabled: config.status.enabled },
+      status: parseStatus(config.status, "config.json"),
       multiplexing: { backend: config.multiplexing.backend },
       agents,
     },
@@ -287,6 +327,9 @@ export function createSubagentsConfigState(
     update(mutator: (draft: SubagentsConfig) => void, options?: { pruneAgents?: string[] }): void {
       const draft = structuredClone(current);
       mutator(draft);
+      // Normalize/validate the status block before persisting: invalid values
+      // throw here, so neither the live state nor the file changes (atomic).
+      draft.status = parseStatus(draft.status, configPath);
       if (options?.pruneAgents) {
         const known = new Set(options.pruneAgents);
         for (const name of Object.keys(draft.agents)) {

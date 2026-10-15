@@ -1,6 +1,9 @@
 {
   "status": {
-    "enabled": true
+    "enabled": true,
+    "animated": true,
+    "cycleSeconds": 6,
+    "trailFraction": 0.6666666666666666
   },
   "multiplexing": {
     "backend": "auto"
