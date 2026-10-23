@@ -38,6 +38,8 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 | `subagents_list` | List available agents with effective defaults for new spawns |
 | `ask_question` | *(sub-agent sessions only)* Ask the orchestrator a question and wait for the reply |
 
+`subagent`, `subagents_list`, and `ask_question` are declared to the model directly. `subagent_message` and `subagent_interrupt` have `deferred` exposure in the `subagents` namespace: they are not declared up front, and the first successful `subagent` call activates them for that session. Before then they stay reachable through Pi's `tool_search` and `codemode` when enabled, and the child `--tools` allowlist still gates them. `subagents_list` stays direct because a spawn must name a known agent.
+
 There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
 ### Shell safety

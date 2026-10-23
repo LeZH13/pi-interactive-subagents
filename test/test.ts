@@ -208,6 +208,7 @@ function createMockExtensionApi() {
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
   const eventHandlers = new Map<string, Array<(...args: any[]) => any>>();
+  let activeTools = ["read", "bash", "edit", "write"];
   return {
     async emit(event: string, ...args: any[]) {
       for (const handler of eventHandlers.get(event) ?? []) await handler(...args);
@@ -243,7 +244,10 @@ function createMockExtensionApi() {
         return [];
       },
       getActiveTools() {
-        return ["read", "bash", "edit", "write"];
+        return activeTools;
+      },
+      setActiveTools(names: string[]) {
+        activeTools = names;
       },
       getCommands() {
         return [];

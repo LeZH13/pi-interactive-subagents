@@ -285,6 +285,28 @@ const SPAWNING_TOOLS = [
   "subagents_list",
 ] as const;
 
+/**
+ * Lifecycle tools that only matter once a subagent exists. They are registered
+ * `deferred` (found via `tool_search` or codemode, not declared to the model) and
+ * activated by the first successful spawn. `subagent` and `subagents_list` stay
+ * `direct`: a spawn must name a known agent, so discovery cannot be lazy.
+ */
+const FOLLOW_UP_TOOLS = ["subagent_message", "subagent_interrupt"] as const;
+
+const SUBAGENTS_NAMESPACE = {
+  name: "subagents",
+  description: "Steer, resume, or cancel subagents spawned with `subagent`.",
+  instructions:
+    "`subagent_message` steers a running subagent or resumes a finished one by name, or resumes a recorded session by `sessionPath`. " +
+    "`subagent_interrupt` cancels a running Pi-backed subagent. Both are declared automatically after the first successful `subagent` call.",
+} as const;
+
+function activateFollowUpTools(pi: ExtensionAPI): void {
+  const active = pi.getActiveTools();
+  const missing = FOLLOW_UP_TOOLS.filter((tool) => !active.includes(tool));
+  if (missing.length > 0) pi.setActiveTools([...active, ...missing]);
+}
+
 /** Built-in tools pi provides natively — no extension needs to be loaded. */
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "powershell", "grep", "find", "ls"]);
 
@@ -2978,15 +3000,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "The first successful spawn also declares subagent_message (steer/resume) and subagent_interrupt (cancel).",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         SUBAGENT_DEFAULT_SELECTION_GUIDANCE +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Fire-and-forget: its result arrives later as a steer message. Never poll for completion or fabricate results.",
       parameters: SubagentParams,
       outputSchema: SubagentActionOutputSchema,
 
@@ -3130,6 +3149,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Mount the animated widget and start status supervision on launch
         updateWidget();
         startStatusRefresh(pi);
+        activateFollowUpTools(pi);
 
         // Fire-and-forget: start watching in background. A configured model
         // fallback gets one fresh retry from the original task; failed-session
@@ -3319,6 +3339,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagent_interrupt tool ──
   pi.registerTool({
       name: "subagent_interrupt",
+      exposure: "deferred",
+      namespace: SUBAGENTS_NAMESPACE,
       label: "Interrupt Subagent",
       description:
         "Cancel a running Pi-backed subagent by exact `id` or `name`. " +
@@ -3467,6 +3489,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // ── subagent_message tool ──
   pi.registerTool({
       name: "subagent_message",
+      exposure: "deferred",
+      namespace: SUBAGENTS_NAMESPACE,
       label: "Message Subagent",
       description:
         "Send a message to a subagent by name, or resume a recorded session file by path. Names are unique within your session and persist after a subagent finishes, " +

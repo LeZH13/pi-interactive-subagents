@@ -43,11 +43,16 @@ function setup(t: TestContext) {
   const tools = new Map<string, any>();
   const events = new Map<string, any>();
   const messages: any[] = [];
+  // Mirrors pi: only direct/model-only tools are activated on registration.
+  let activeTools = ["read"];
   const api = {
-    registerTool: (tool: any) => tools.set(tool.name, tool),
+    registerTool: (tool: any) => {
+      tools.set(tool.name, tool);
+      if (!tool.exposure || tool.exposure === "direct" || tool.exposure === "model-only") activeTools = [...activeTools, tool.name];
+    },
     registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {},
     on: (name: string, handler: any) => events.set(name, handler),
-    getActiveTools: () => ["read"], getAllTools: () => [], getCommands: () => [],
+    getActiveTools: () => activeTools, setActiveTools: (names: string[]) => { activeTools = names; }, getAllTools: () => [], getCommands: () => [],
     sendMessage: (message: any) => messages.push(message),
   } as any;
   const parent = { file: join(dir, "parent.jsonl"), id: "parent" };
@@ -113,7 +118,7 @@ function setup(t: TestContext) {
       if (reservation.owner) recordCompletion(file, reservation.owner, 1);
     }
   };
-  return { dir, parent, ctx, api, surfaces, commands, watches, messages, closed, call, session, profile, artifactDir, original, completeClaims };
+  return { dir, parent, ctx, api, tools, activeTools: () => activeTools, surfaces, commands, watches, messages, closed, call, session, profile, artifactDir, original, completeClaims };
 }
 
 function assertError(result: any, pattern: RegExp) {
@@ -749,6 +754,25 @@ describe("lifecycle identity and launch reservations", { concurrency: false }, (
     await h.call("subagent", { agent: "reviewer", task: "one" });
     await h.call("subagent", { agent: "reviewer", task: "two" });
     assertError(await h.call("subagent", { agent: "reviewer", task: "excess" }), /maxConcurrent: 2/);
+  });
+
+  it("declares only discovery and spawn tools until the first successful spawn", async (t) => {
+    const h = setup(t);
+    for (const name of ["subagent_message", "subagent_interrupt"]) {
+      assert.equal(h.tools.get(name).exposure, "deferred");
+      assert.equal(h.tools.get(name).namespace.name, "subagents");
+    }
+    for (const name of ["subagent", "subagents_list"]) assert.equal(h.tools.get(name).exposure, undefined);
+    assert.deepEqual(h.activeTools().filter((tool) => tool.startsWith("subagent")), ["subagent", "subagents_list"]);
+
+    assertError(await h.call("subagent", { agent: "missing", task: "x" }), /.*/);
+    assert.ok(!h.activeTools().includes("subagent_message"), "a failed spawn does not load follow-up tools");
+
+    await h.call("subagent", { agent: "scout", task: "one" });
+    assert.ok(h.activeTools().includes("subagent_message"));
+    assert.ok(h.activeTools().includes("subagent_interrupt"));
+    await h.call("subagent", { agent: "scout", name: "two", task: "two" });
+    assert.equal(h.activeTools().filter((tool) => tool === "subagent_message").length, 1, "activation is idempotent");
   });
 
   it("reserves spawn session identity before surface creation so a path caller joins, not relaunches", async (t) => {
