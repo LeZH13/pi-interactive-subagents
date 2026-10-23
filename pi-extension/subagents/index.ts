@@ -112,44 +112,38 @@ function getModuleAbortSignal(): AbortSignal {
   return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
 }
 
-const SUBAGENT_DEFAULT_SELECTION_GUIDANCE =
-  "Omit `model` and `thinking` to use the agent's effective defaults, including settings overrides. " +
-  "Only set either field when the user explicitly requests that override. " +
-  "Do not copy the orchestrator's model or thinking level or choose replacements based on task complexity. ";
-
 const SubagentParams = Type.Object({
   agent: Type.String({
-    description:
-      "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
-      "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents. " +
-      "Each profile's current concurrency policy applies per parent runtime, including startup, resume, and fallback.",
+    description: "Agent profile to run (sets model, tools, and system prompt). Use a name from `subagents_list`.",
   }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  task: Type.String({
+    description:
+      "Complete instructions for the subagent. It sees only this text, not your conversation (unless its profile uses `session-mode: fork`), " +
+      "so include the goal, relevant paths and context, constraints, and the output you want back.",
+  }),
   name: Type.Optional(
     Type.String({
       description:
-        "Optional persistent name for follow-up messages and the pane/widget. Defaults to a unique agent-based name. " +
-        "Explicit names already used in this parent session are rejected, including finished handles. " +
-        "Use `agent`, not `name`, to select the profile.",
+        "Optional handle for follow-ups and the pane label; defaults to a unique agent-based name. " +
+        "Must be new in this session (finished subagents keep their names). Does not select the profile.",
     }),
   ),
   model: Type.Optional(Type.String({
     description:
-      "Model override. Omit to use the agent's effective model default, including settings overrides. " +
-      "Only set when the user explicitly requests a model override; do not copy the orchestrator's model.",
+      "Model override. Omit to use the agent's default, including settings overrides. " +
+      "Set only when the user explicitly asks; don't copy your own model or pick one based on task difficulty.",
   })),
   thinking: Type.Optional(
     Type.String({
       description:
-        "Thinking / reasoning level override (e.g. 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', or token budget). " +
-        "Omit to use the agent's effective thinking default, including settings overrides. " +
-        "Only set when the user explicitly requests a thinking override; do not copy the orchestrator's thinking level.",
+        "Thinking level override: off, minimal, low, medium, high, xhigh, max, or a token budget. " +
+        "Omit to use the agent's default, including settings overrides. " +
+        "Set only when the user explicitly asks; don't copy your own thinking level or pick one based on task difficulty.",
     }),
   ),
   cwd: Type.Optional(
     Type.String({
-      description:
-        "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
+      description: "Working directory for the subagent. It loads that folder's .pi/ config, CLAUDE.md, skills, and extensions.",
     }),
   ),
 });
@@ -158,12 +152,10 @@ const CLAUDE_MESSAGE_ERROR = "Claude CLI children do not support durable subagen
 
 const SubagentMessageParams = Type.Object({
   name: Type.Optional(Type.String({
-    description:
-      "Exact display name of the subagent. Steers it if it is still running; resumes its session if it has finished. Mutually exclusive with `sessionPath`.",
+    description: "Subagent name from this session. Steers it if running; resumes it if finished.",
   })),
   sessionPath: Type.Optional(Type.String({
-    description:
-      "Path to a recorded Pi subagent session (.jsonl), bypassing the name registry. Mutually exclusive with `name`. A finished-session resume requires its `.loadout.json`, current ownership metadata, and matching wrapper completion; unknown or foreign active ownership is refused.",
+    description: "Path to a recorded subagent session (.jsonl) that isn't in this session's registry, e.g. from an earlier session.",
   })),
   message: Type.String({
     description:
@@ -298,7 +290,7 @@ const SUBAGENTS_NAMESPACE = {
   description: "Steer, resume, or cancel subagents spawned with `subagent`.",
   instructions:
     "`subagent_message` steers a running subagent or resumes a finished one by name, or resumes a recorded session by `sessionPath`. " +
-    "`subagent_interrupt` cancels a running Pi-backed subagent. Both are declared automatically after the first successful `subagent` call.",
+    "`subagent_interrupt` cancels a running subagent. Both are enabled automatically after the first successful `subagent` call.",
 } as const;
 
 function activateFollowUpTools(pi: ExtensionAPI): void {
@@ -942,13 +934,14 @@ function buildSubagentTask(
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously. When you are finished, simply stop — your session ends automatically."
     : "Complete your task. The user can interact with you at any time, and the session ends when the user exits the pane.";
+  const contextHint = "You don't see the orchestrator's conversation; if resumed, you keep your prior work in this session.";
   const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
+    ? "Your final message is returned to the orchestrator as your result."
+    : "Your final message before the user exits is returned to the orchestrator as your result.";
   const identity = agentDefs?.body ?? null;
   const identityInSystemPrompt = agentDefs?.systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  return `${roleBlock}\n\n${modeHint}\n\n${task}\n\n${summaryInstruction}`;
+  return `${roleBlock}\n\n${modeHint} ${contextHint}\n\n${task}\n\n${summaryInstruction}`;
 }
 
 /**
@@ -2754,7 +2747,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
+  const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. The subagent waits until you reply.`;
 
   latestPi?.sendMessage(
     {
@@ -2994,18 +2987,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        SUBAGENT_DEFAULT_SELECTION_GUIDANCE +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
-        "The first successful spawn also declares subagent_message (steer/resume) and subagent_interrupt (cancel).",
-      promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        SUBAGENT_DEFAULT_SELECTION_GUIDANCE +
-        "Fire-and-forget: its result arrives later as a steer message. Never poll for completion or fabricate results.",
+        "Spawn a subagent to work on a task asynchronously. Returns only a launch acknowledgement; " +
+        "the result arrives later as a new message that starts your next turn. " +
+        "Don't poll, sleep, read its logs, or call `subagents_list` to check progress, and don't guess its result. " +
+        "After spawning, end your turn or continue independent work, including spawning more subagents in parallel. " +
+        "Omit `model` and `thinking` unless the user explicitly asks for an override. " +
+        "The first successful spawn also enables `subagent_message` (steer/resume) and `subagent_interrupt` (cancel).",
+      promptSnippet: "Spawn an async subagent; its result arrives later as a message",
       parameters: SubagentParams,
       outputSchema: SubagentActionOutputSchema,
 
@@ -3254,10 +3242,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text:
-                `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                `Sub-agent "${params.name}" started. Its result will arrive automatically as a new message; don't predict it. ` +
+                `Continue other work or end your turn.`,
             },
           ],
           details: {
@@ -3343,13 +3329,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       namespace: SUBAGENTS_NAMESPACE,
       label: "Interrupt Subagent",
       description:
-        "Cancel a running Pi-backed subagent by exact `id` or `name`. " +
-        "This cancels its in-flight turn, terminates its child process, and closes its pane. " +
-        "The watcher then steers a concise interruption notice instead of a result. " +
-        "Use for a runaway or obsolete subagent. Claude Code CLI children cannot be interrupted.",
-      promptSnippet:
-        "Cancel a running Pi-backed subagent by exact id or name. Terminates the child process and closes its pane; " +
-        "the watcher steers a concise interruption notice instead of a result.",
+        "Cancel a running subagent by `id` or `name`: stops its current turn, ends its process, and closes its pane. " +
+        "You'll get a short interruption notice instead of a result. Use for runaway or obsolete work. " +
+        "Not supported for Claude Code CLI subagents.",
+      promptSnippet: "Cancel a running subagent",
       parameters: Type.Object({
         id: Type.Optional(Type.String({ description: "Exact running subagent id" })),
         name: Type.Optional(Type.String({ description: "Exact running subagent display name" })),
@@ -3422,13 +3405,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List available subagents with effective model, thinking, and fallback defaults for new spawns (including settings overrides). " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List available subagents with effective model, thinking, and fallback defaults for new spawns (including settings overrides). " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List spawnable agents with their descriptions and default model, thinking level, and fallback (settings overrides applied). " +
+        "Project agents (.pi/agents/) override global ones (~/.pi/agent/agents/).",
+      promptSnippet: "List spawnable agents and their defaults",
       parameters: Type.Object({}),
       outputSchema: SubagentListOutputSchema,
 
@@ -3493,20 +3472,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       namespace: SUBAGENTS_NAMESPACE,
       label: "Message Subagent",
       description:
-        "Send a message to a subagent by name, or resume a recorded session file by path. Names are unique within your session and persist after a subagent finishes, " +
-        "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
-        "if it has finished, your message resumes that session and continues it. " +
-        "Pass `sessionPath` instead of `name` to reach recorded Pi sessions missing from this registry. Finished-session resume requires the original loadout, current ownership metadata, and matching post-exit wrapper completion. Unknown or foreign active ownership is refused. Claude CLI messaging and message-based resume are unsupported. " +
-        "`message` is always required; provide exactly one of `name` or `sessionPath`. " +
-        "Queueing to a running subagent returns a local queued acknowledgement, not an ingestion receipt, and does NOT by itself emit a new result. " +
-        "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
-        "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
-        "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
-      promptSnippet:
-        "Message a subagent by name (steers it if running, resumes it if finished), or resume a recorded session file via `sessionPath` when the name is not in this session's registry. " +
-        "`message` is required; provide exactly one of `name` or `sessionPath`. Queueing returns immediately without claiming ingestion; closed delivery rejects late input so retry with explicit resume after completion. Resuming delivers its result later as a steer message. " +
-        "Claude CLI messaging is unsupported; finished-session resume requires the loadout and matching ownership/completion evidence. " +
-        "Do not poll or fabricate results.",
+        "Send `message` to a subagent identified by exactly one of `name` or `sessionPath`. " +
+        "If it is running, the message is queued into its live session; the acknowledgement means accepted, not yet read, and produces no new result. " +
+        "If it has finished, the session resumes with `message` as its next task, under its original tools and settings; " +
+        "as with `subagent`, the result arrives later as a message, so don't poll or guess it. " +
+        "Resume is refused if the session can't be safely reused, and the error says why. " +
+        "Claude Code CLI subagents can't be messaged or resumed; spawn a new one instead.",
+      promptSnippet: "Steer a running subagent or resume a finished one",
       parameters: SubagentMessageParams,
 
       renderCall(args, theme) {

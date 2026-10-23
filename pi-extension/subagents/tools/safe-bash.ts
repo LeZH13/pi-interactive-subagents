@@ -43,12 +43,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "safe_bash",
 		label: "Safe Bash",
-		description:
-			"Execute a bash command. Blocks dangerous commands (rm -rf /, sudo, mkfs, etc.).",
+		description: `${bashTool.description} Refuses dangerous commands (rm -rf /, sudo, mkfs, curl | sh, …).`,
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),
 			timeout: Type.Optional(
-				Type.Number({ description: "Timeout in seconds (optional)" }),
+				Type.Number({ description: "Timeout in seconds" }),
 			),
 		}),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {

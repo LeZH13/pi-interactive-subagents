@@ -3148,11 +3148,11 @@ describe("subagent discovery", () => {
     const task = "Review this plan.";
     assert.equal(
       testApi.buildSubagentTask(task, false, { body: "Advisor identity", autoExit: true }),
-      `\n\nAdvisor identity\n\nComplete your task autonomously. When you are finished, simply stop — your session ends automatically.\n\n${task}\n\nYour FINAL assistant message should summarize what you accomplished.`,
+      `\n\nAdvisor identity\n\nComplete your task autonomously. When you are finished, simply stop — your session ends automatically. You don't see the orchestrator's conversation; if resumed, you keep your prior work in this session.\n\n${task}\n\nYour final message is returned to the orchestrator as your result.`,
     );
     assert.equal(
       testApi.buildSubagentTask(task, false, { body: "Advisor identity", systemPromptMode: "append" }),
-      `\n\nComplete your task. The user can interact with you at any time, and the session ends when the user exits the pane.\n\n${task}\n\nYour FINAL assistant message (before the user exits) should summarize what you accomplished.`,
+      `\n\nComplete your task. The user can interact with you at any time, and the session ends when the user exits the pane. You don't see the orchestrator's conversation; if resumed, you keep your prior work in this session.\n\n${task}\n\nYour final message before the user exits is returned to the orchestrator as your result.`,
     );
   });
 
@@ -4534,10 +4534,10 @@ describe("tool registration", () => {
       "agent and task must be required",
     );
     // `name` is optional, but remains the persistent follow-up routing handle.
-    assert.match(props.name.description, /persistent name.*follow-up/i);
-    assert.match(props.name.description, /already used.*rejected.*finished/i);
-    assert.match(props.agent.description, /each profile.*concurrency policy.*parent runtime/i);
-    assert.match(props.thinking.description, /reasoning level override/i);
+    assert.match(props.name.description, /handle for follow-ups/i);
+    assert.match(props.name.description, /must be new in this session.*finished/i);
+    assert.match(props.task.description, /not your conversation/i);
+    assert.match(props.thinking.description, /thinking level override/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
@@ -4550,17 +4550,12 @@ describe("tool registration", () => {
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
-    for (const guidance of [subagentTool.description, subagentTool.promptSnippet]) {
-      assert.match(guidance, /omit `model` and `thinking`.*effective defaults.*settings overrides/i);
-      assert.match(guidance, /only set either field when the user explicitly requests that override/i);
-      assert.match(guidance, /do not copy the orchestrator's model or thinking level/i);
-      assert.match(guidance, /or choose replacements based on task complexity/i);
-    }
+    assert.match(subagentTool.description, /omit `model` and `thinking` unless the user explicitly asks for an override/i);
     const props = subagentTool.parameters.properties;
     for (const field of ["model", "thinking"]) {
-      assert.match(props[field].description, /omit.*effective.*default.*settings overrides/i);
-      assert.match(props[field].description, new RegExp(`only set when the user explicitly requests a ${field} override`, "i"));
-      assert.match(props[field].description, new RegExp(`do not copy the orchestrator's ${field}`, "i"));
+      assert.match(props[field].description, /omit to use the agent's default, including settings overrides/i);
+      assert.match(props[field].description, /set only when the user explicitly asks/i);
+      assert.match(props[field].description, /don't copy your own .*pick one based on task difficulty/i);
     }
   });
 
@@ -4608,7 +4603,7 @@ describe("tool registration", () => {
     );
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
-    assert.match(props.sessionPath.description, /loadout/i);
+    assert.match(messageTool.description, /resumes .*under its original tools and settings/i);
   });
 
   it("refuses a message with both name and sessionPath", async () => {

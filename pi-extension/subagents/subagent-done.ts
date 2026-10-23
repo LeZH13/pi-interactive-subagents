@@ -603,26 +603,13 @@ export default async function (pi: ExtensionAPI) {
     name: "ask_question",
     label: "ask_question",
     description:
-      "Ask the orchestrator (the parent agent that spawned you) a single question and pause until they reply. " +
-      "Use this when requirements are ambiguous, a decision would materially affect your work, you're blocked, " +
-      "or you need information or confirmation only the orchestrator has. Prefer asking over guessing. " +
-      "The tool waits and returns their answer before you continue. " +
-      "Ask exactly one question per call; make separate calls for unrelated questions.",
-    promptSnippet:
-      "Use this tool to ask the orchestrator one clarifying, missing-requirement, preference, or decision question before continuing — instead of guessing.",
-    promptGuidelines: [
-      "Ask exactly one question per tool call.",
-      "If you need answers to multiple things, make separate ask_question calls instead of bundling them.",
-      "Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
-      "Use it when multiple valid paths exist and the right one depends on the orchestrator's intent.",
-      "Give enough context in the question that the orchestrator can answer without re-reading your whole task.",
-      "The tool pauses execution until the reply arrives; continue only after it returns the answer.",
-    ],
+      "Ask the orchestrator (the agent that spawned you) one question and wait for the answer. " +
+      "Use it when you're blocked, or when a decision would materially change the outcome and the task, code, and docs don't settle it. " +
+      "Otherwise make a reasonable choice and note it in your report. " +
+      "Make the question self-contained, since the orchestrator hasn't seen your work. One question per call.",
+    promptSnippet: "Ask the orchestrator a blocking question and wait for the reply",
     parameters: Type.Object({
-      question: Type.String({
-        description:
-          "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
-      }),
+      question: Type.String({ description: "One self-contained question for the orchestrator." }),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;

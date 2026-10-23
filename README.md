@@ -143,7 +143,7 @@ This is cancellation, not a pause: it sends Escape (SIGINT for headless backgrou
 
 ### ask_question
 
-A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The `ask_question` tool call **waits for a reply**: the model cannot continue to its next provider request while it is pending. The parent is notified with the sub-agent's name and replies via `subagent_message({ name, message })`. The first valid reply for the current run is returned once as the tool's answer, not also injected as a custom message or a new turn. A human can answer through the child's input too.
+A sub-agent can ask its orchestrator a single freeform question when it is blocked or a decision would materially change the outcome and the task, code, and docs don't settle it; otherwise it is told to make a reasonable choice and note it in its report. The `ask_question` tool call **waits for a reply**: the model cannot continue to its next provider request while it is pending. The parent is notified with the sub-agent's name and replies via `subagent_message({ name, message })`. The first valid reply for the current run is returned once as the tool's answer, not also injected as a custom message or a new turn. A human can answer through the child's input too.
 
 Different sub-agents can wait in parallel; each child permits only one pending question. Further messages follow the ordinary steer path. Abort or session shutdown releases the wait and removes the pending question file; abort parks the session rather than completing the task. If nobody replies or cancels, the tool keeps waiting. Only available inside sub-agent sessions.
 
