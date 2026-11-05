@@ -4,7 +4,7 @@ description: Implementer — edits code, runs commands and tests; can delegate r
 tools: read, write, edit, bash, web_enable, web_search, fetch_content, get_search_content, source_check, codemode
 subagent_agents: scout, researcher
 max-concurrent: 1
-model: openrouter/z-ai/glm-5.3
+model: openai-codex/gpt-6.1-terra
 model-fallback: inherit
 thinking: high
 system-prompt: append

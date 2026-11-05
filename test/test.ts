@@ -2607,8 +2607,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("bundled scout/researcher/worker/general all resolve as non-interactive (auto-exit)", () => {
+    for (const name of ["scout", "researcher", "worker", "general"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -2649,8 +2649,8 @@ describe("subagent discovery", () => {
     assert.ok(tools.has("bash"), "expected worker to keep bash");
   });
 
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
+  it("scout, researcher, and general do not declare spawning permissions", () => {
+    for (const name of ["scout", "researcher", "general"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
@@ -6686,11 +6686,47 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
         scout: ["read", "grep", "find", "ls", "codemode"],
         researcher: ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "bash", "codemode"],
         worker: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
+        general: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
       };
       for (const [name, tools] of Object.entries(expected)) {
         const profile = testApi.loadAgentDefaults(name);
         assert.ok(profile, `expected bundled profile ${name}`);
         assert.deepEqual(profile.tools?.split(",").map((tool: string) => tool.trim()), tools);
+      }
+    });
+  });
+
+  it("general has worker task tools without spawning or a concurrency cap", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const general = testApi.loadAgentDefaults("general");
+      const worker = testApi.loadAgentDefaults("worker");
+      assert.ok(general);
+      assert.ok(worker);
+      assert.equal(general.tools, worker.tools);
+      assert.equal(general.subagentAgents, undefined);
+      assert.equal(general.maxConcurrent, undefined);
+      assert.equal(testApi.resolveEffectiveInteractive({ name: "general", task: "" }, general), false);
+      const tools = new Set(testApi.buildSubagentToolAllowlist(general.tools).split(","));
+      for (const tool of ["subagent", "subagent_interrupt", "subagent_message", "subagents_list"]) {
+        assert.equal(tools.has(tool), false, `general should not have ${tool}`);
+      }
+    });
+  });
+
+  it("bundled profiles declare configured openai-codex models and thinking levels", async () => {
+    await withIsolatedAgentEnv(async () => {
+      const expected: Record<string, { model: string; thinking: string }> = {
+        general: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" },
+        worker: { model: "openai-codex/gpt-6.1-terra", thinking: "high" },
+        scout: { model: "openai-codex/gpt-6-luna", thinking: "medium" },
+        researcher: { model: "openai-codex/gpt-6-luna", thinking: "medium" },
+      };
+      for (const [name, config] of Object.entries(expected)) {
+        const profile = testApi.loadAgentDefaults(name);
+        assert.ok(profile, `expected bundled profile ${name}`);
+        assert.equal(profile.model, config.model, `${name} should have model ${config.model}`);
+        assert.equal(profile.thinking, config.thinking, `${name} should have thinking ${config.thinking}`);
+        assert.equal(profile.modelFallback, "inherit", `${name} should inherit fallback`);
       }
     });
   });
