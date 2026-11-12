@@ -13,12 +13,12 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux o
 ╭─ Subagents ───────────────────────────────────────────────────────────── 2 running ─╮
 │ ⟳ 00:23  scout                                                     active · bash 7s │
 │          ↳ ↑14k↓420  $0.008                            gemini-3.7-flash · 7.1%/1M │
-│ ○ 00:45  cleanup-design [worker]                                  waiting 2m · done │
+│ ○ 00:45  cleanup-design [general]                                 waiting 2m · done │
 │          ↳ ↑39k↓1.6k  R12k  $0.042                        gpt-5.6-sol · 19.6%/200k │
 ╰─────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-Agent profiles appear as dim `[worker]` badges only when the display name differs from the profile name (ignoring case). Transcript headers share the `subagent · name [profile]` identity; completions show the result first, followed by a dim divider and a single muted footer line: `model:thinking · N tools · duration · ↑input ↓output`, for both new spawns and resumed Pi agents. Cache, cost, context usage, and follow-up/session details appear only when expanded; narrow terminals wrap the footer. Completion tool counts and usage are cumulative across the recorded session. Run independent profiles in parallel within their configured concurrency limits; their results steer back independently. The bundled worker declares `max-concurrent: 1`, rather than receiving special treatment in code. Limits are per profile and parent runtime, including startup, resume, and model fallback.
+Agent profiles appear as dim `[general]` badges only when the display name differs from the profile name (ignoring case). Transcript headers share the `subagent · name [profile]` identity; completions show the result first, followed by a dim divider and a single muted footer line: `model:thinking · N tools · duration · ↑input ↓output`, for both new spawns and resumed Pi agents. Cache, cost, context usage, and follow-up/session details appear only when expanded; narrow terminals wrap the footer. Completion tool counts and usage are cumulative across the recorded session. Run independent profiles in parallel within their configured concurrency limits; their results steer back independently. Profiles can declare `max-concurrent` to limit parallel runs. Limits are per profile and parent runtime, including startup, resume, and model fallback; they do not lock a shared workspace.
 
 Panes are kept evenly sized after every spawn and exit (debounced). The extension reads the tmux window dimensions and applies `even-horizontal` (equal columns) when columns are at least twice the row count (accounting for character cell aspect ratio), or `even-vertical` (equal rows) for portrait/square dimensions. Resizing alone does not trigger a rebalance; the new aspect ratio takes effect on the next spawn or exit.
 
@@ -40,7 +40,7 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 
 `subagent`, `subagents_list`, and `ask_question` are declared to the model directly. `subagent_message` and `subagent_interrupt` have `deferred` exposure in the `subagents` namespace: they are not declared up front, and the first successful `subagent` call activates them for that session. Before then they stay reachable through Pi's `tool_search` and `codemode` when enabled, and the child `--tools` allowlist still gates them. `subagents_list` stays direct because a spawn must name a known agent.
 
-There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent worker:high Fix the tests` overrides only the thinking level, while `/subagent worker@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent worker@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
+There is also a `/subagent <agent>[@<model>][:<thinking>] [task]` command for requesting a spawn through the main model, and a `/subagent-settings` page for backend, status widget, per-agent model/thinking defaults, and orphan cleanup. For example, `/subagent general:high Fix the tests` overrides only the thinking level, while `/subagent general@openai/o3-mini:high Fix the tests` overrides both model and thinking. Colons in model IDs are preserved, so `/subagent general@ollama/llama3.1:8b Fix the tests` selects the `ollama/llama3.1:8b` model.
 
 ### Shell safety
 
@@ -58,7 +58,7 @@ Alternatively, explicitly select `safe_bash` for its existing static dangerous-c
 
 ### Codemode (Pi 1.0)
 
-Codemode is included in the bundled **scout**, **researcher**, **worker**, and **general** profiles for batching independent calls and filtering large results. Custom profiles remain **opt-in**: include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
+Codemode is included in the bundled **scout**, **researcher**, and **general** profiles for batching independent calls and filtering large results. Custom profiles remain **opt-in**: include `codemode` in an agent's `tools` frontmatter alongside every tool its scripts may call:
 
 ```yaml
 tools: read, grep, find, ls, codemode
@@ -87,7 +87,7 @@ The orchestrator should omit `model` and `thinking` to use the agent's effective
 
 ```typescript
 subagent({ agent: "scout", task: "Analyze the auth module" });
-subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode toggle" });
+subagent({ agent: "general", name: "dark-mode", task: "Implement the dark mode toggle" });
 ```
 
 | Parameter | Type | Default | Description |
@@ -153,16 +153,17 @@ Different sub-agents can wait in parallel; each child permits only one pending q
 | ----- | ----- | ----- | ---- |
 | **scout** | `openai-codex/gpt-6-luna` | `read`, `grep`, `find`, `ls`, `codemode` | Fast read-only codebase recon |
 | **researcher** | `openai-codex/gpt-6-luna` | `web_search`, `fetch_content`, `get_search_content`, `source_check`, `bash`, `codemode` | Web research, synthesized into a sourced brief |
-| **worker** | `openai-codex/gpt-6.1-terra` | `read`, `write`, `edit`, `bash`, `web_search`, `fetch_content`, `get_search_content`, `codemode` + spawning | General implementer; may spawn `scout` and `researcher` |
-| **general** | `openai-codex/gpt-6.1-sol` | Same task tools as `worker`, without spawning | Delegated tasks that don't fit a specialist; task-appropriate approach and output |
+| **general** | `openai-codex/gpt-6.1-sol` | `read`, `write`, `edit`, `bash`, `web_enable`, `web_search`, `fetch_content`, `get_search_content`, `source_check`, `codemode` | Delegated tasks, including implementation; no child spawning |
 
-All four are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if their primary model fails.
+All three are autonomous (`auto-exit: true`), carry their identity in the system prompt (`system-prompt: append`), and use the immediate spawner's model as a one-shot fallback if their primary model fails.
 
-`general` uses a short, task-neutral prompt and worker-level file, shell, web, and codemode access, but cannot spawn children by default. It has no fixed report template or profile concurrency cap. Use `worker` for implementation, `scout` for code exploration, and `researcher` for external research; reserve `general` for tasks outside those roles. Tool access does not authorize unrelated changes.
+Use `general` for implementation and other delegated tasks, `scout` for code exploration, and `researcher` for external research. The parent coordinates specialist investigations; none of the bundled profiles can spawn children by default. `general` has file, shell, web, and codemode access, implementation safeguards, and no fixed report template or profile concurrency cap. Tool access does not authorize unrelated changes.
+
+The bundled `worker` profile is retired. Remove any global/project `worker` definitions and saved `agents.worker` overrides when retiring a local installation; higher-priority definitions remain independently discoverable. New implementation assignments should use `general`.
 
 ### Keeping orchestration lean
 
-- Use one worker for implementation and parallel read-only agents for independent investigations. Assign file ownership and one integration/test owner; separate conversations do not isolate a shared workspace. Use separate worktrees when overlapping edits are unavoidable.
+- Use `general` for implementation and let the parent coordinate independent scout/researcher investigations. Assign file ownership and one integration/test owner; separate conversations do not isolate a shared workspace. Serialize overlapping edits or use separate worktrees.
 - Resume for focused follow-ups on the same task. For a substantially new phase, spawn a fresh agent with a short handoff and a new name.
 - Request concise findings, decisions, blockers, changed paths, and verification counts. Main should inspect critical changes and run final integration checks instead of repeating broad exploration or ingesting full passing logs.
 - Result transport remains lossless: the normal Pi child's full final text is embedded in a completion wrapper. Collapsing its TUI preview does not reduce parent context. Keep reports concise through task/profile instructions; store lengthy evidence in files when appropriate.
@@ -241,12 +242,12 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
   },
   "multiplexing": { "backend": "auto" },
   "agents": {
-    "worker": {
+    "general": {
       "model": "openai/gpt-5",
       "thinking": "high",
       "maxConcurrent": 2,
       "tools": ["read", "bash", "edit", "write"],
-      "subagentAgents": ["scout", "researcher"],
+      "subagentAgents": [],
       "skills": [],
       "modelFallback": "inherit"
     }
@@ -258,7 +259,7 @@ The persisted store is `<agentDir>/extensions/pi-interactive-subagents/config.js
 
 `/subagent-settings` opens a settings page (same style as pi's `/settings`) with two tabs:
 
-- **Agents** (default) — search `scout`, `researcher`, `worker`, `general`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above the second group (Tools, Skills, Spawnable agents, Max concurrent), with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, **Pi default**, or **Extension default** for an omitted concurrency limit) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Max concurrent** accepts a positive safe integer or explicit **Unlimited**; invalid/cancelled input leaves the previous value intact. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. Tools/spawnable agents/skills/fallback controls support Pi-backed agents only and are marked unsupported for `cli: claude`; Max concurrent is backend-neutral.
+- **Agents** (default) — search `scout`, `researcher`, `general`, and custom agents. Rows show the effective model and thinking level in aligned columns; long model names shorten before the thinking level does, and search keeps the same column positions. A `*` after an agent name indicates saved overrides (including explicit empty lists or disabled fallback); the `* Saved overrides` legend explains it. Resetting the final overridden field removes the marker. The suffix is display-only and does not change names or search. Open an agent for compact, aligned settings rows: model/thinking/fallback above the second group (Tools, Skills, Spawnable agents, Max concurrent), with reset at the bottom. A shared help area shows the focused field's source (**Agent default**, **Custom override**, **Pi default**, or **Extension default** for an omitted concurrency limit) and explanation; list memberships are summarized rather than filling the page. Long scalar values expand in the help area where space permits. **Model** searches registered `provider/model` IDs with regex; **Thinking** selects reasoning effort (shown as `off` and locked for non-reasoning models). **Tools**, **Spawnable agents**, and **Skills** open searchable multi-select pickers. Skills are startup `/skill:name` prompts, not a skill-access restriction. **Model fallback** selects one registered model, `inherit`, or **Disabled**, using the existing single-retry behavior. **Max concurrent** accepts a positive safe integer or explicit **Unlimited**; invalid/cancelled input leaves the previous value intact. **Delete** resets the focused field to its agent default; **Reset to agent defaults** at the bottom removes all overrides. Single-value choices return to the agent page; list toggles save immediately and keep the picker open. Tools/spawnable agents/skills/fallback controls support Pi-backed agents only and are marked unsupported for `cli: claude`; Max concurrent is backend-neutral.
 - **General** — **Launch surface** selects Automatic, tmux, Herdr, or Background. Setting names and values use aligned columns with a clear spacing gap. Automatic shows the resolved surface in parentheses (for example, `Automatic (Herdr)`); the picker marks unavailable surfaces. **Status widget** toggles **On / Off** directly. **Widget appearance…** opens controls for the animated border, loop duration, and trail length; changes save and apply immediately. **Orphan cleanup** shows `N orphans · X files · Y KB`; open it to review candidate directories and confirm deletion of only the selected directory's recognized extension artifacts. Other files are preserved. **Audit subagents…** opens a scope picker for the current session, explicit session references, comparisons, or agent profiles; settings closes before any input dialog or audit request.
 
 Use **← / →** for the previous / next panel when the search is empty, **Tab / Shift+Tab** to cycle forward / backward, or click a tab. When a search query exists, horizontal arrows move its cursor—even at the query's beginning or end—while Tab / Shift+Tab still switch panels. Each panel retains its selection, and Agents retains its search. Panel switching is disabled in nested screens, which replace tabs with breadcrumbs; **Esc** returns one level, then closes the page from a panel's list. Search errors and empty results explain how to recover. In list pickers, **Space / Enter** or a checkbox click toggles and saves immediately; **Esc** returns without undoing saved changes. The concise footer shows move, toggle, and back shortcuts. Keyboard hints wrap at narrow widths.
@@ -339,7 +340,7 @@ project/
 ```
 
 ```typescript
-subagent({ agent: "worker", cwd: "agents/sre", task: "Review the deployment pipeline" });
+subagent({ agent: "general", cwd: "agents/sre", task: "Review the deployment pipeline" });
 ```
 
 Set a per-agent default with `cwd:` in frontmatter.
@@ -399,7 +400,7 @@ Sub-agent session transcripts (`.jsonl`) and their sandbox loadout sidecars (`.l
 
 - **Clean Session Picker**: `pi -r` and `/resume` only list human/interactive conversations — sub-agent runs never clutter the picker.
 - **Full Resumability**: Resuming via `subagent_message({ name, message })` resolves the scoped session path seamlessly from the parent's `subagent-registry.json`.
-- **Nested Hierarchies**: When a worker subagent spawns child scouts or researchers, the children are nested in `artifacts/<parentSessionId>/subagents/artifacts/<workerSessionId>/subagents/`.
+- **Nested Hierarchies**: When a custom profile with spawning permissions launches children, they are nested in `artifacts/<parentSessionId>/subagents/artifacts/<childSessionId>/subagents/`.
 - **Explicit Retention**: Completed child sessions remain alongside the parent and are retained even after parent deletion until orphan cleanup is explicitly applied.
 - **Existing History Unchanged**: Legacy top-level child sessions are not moved automatically; clean them up manually if desired.
 

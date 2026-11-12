@@ -2607,16 +2607,18 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker/general all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker", "general"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous, auto-exit)`,
-      );
-    }
+  it("bundled scout/researcher/general all resolve as non-interactive (auto-exit)", async () => {
+    await withIsolatedAgentEnv(async () => {
+      for (const name of ["scout", "researcher", "general"]) {
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
+        assert.equal(
+          testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
+          false,
+          `${name} should resolve as non-interactive (autonomous, auto-exit)`,
+        );
+      }
+    });
   });
 
   it("loads model-fallback from frontmatter", async () => {
@@ -2635,18 +2637,41 @@ describe("subagent discovery", () => {
     });
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
-    const worker = testApi.loadAgentDefaults("worker");
-    assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+  it("custom profiles can grant the spawning toolset restricted to scout and researcher", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "implementation-lead", [
+        "name: implementation-lead",
+        "tools: read, write, edit, bash",
+        "subagent_agents: scout, researcher",
+      ].join("\n"));
+      const profile = testApi.loadAgentDefaults("implementation-lead");
+      assert.ok(profile, "expected custom profile to be discoverable");
+      assert.deepEqual(profile.subagentAgents, ["scout", "researcher"]);
 
-    const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
-    assert.ok(allowlist, "expected an allowlist");
-    const tools = new Set(allowlist!.split(","));
-    for (const t of ["subagent", "subagent_interrupt", "subagent_message", "subagents_list"]) {
-      assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
-    }
-    assert.ok(tools.has("bash"), "expected worker to keep bash");
+      const allowlist = testApi.buildSubagentToolAllowlist(profile.tools, { grantSpawning: true });
+      assert.ok(allowlist, "expected an allowlist");
+      const tools = new Set(allowlist!.split(","));
+      for (const t of ["subagent", "subagent_interrupt", "subagent_message", "subagents_list"]) {
+        assert.ok(tools.has(t), `expected spawning tool ${t} in custom profile allowlist`);
+      }
+      assert.ok(tools.has("bash"), "expected custom profile to keep bash");
+    });
+  });
+
+  it("does not discover or dispatch the retired bundled worker profile", async () => {
+    await withIsolatedAgentEnv(async () => {
+      assert.deepEqual(testApi.discoverAgentDefinitions().map((agent: any) => agent.name).sort(),
+        ["general", "researcher", "scout"]);
+      assert.equal(testApi.loadAgentDefaults("worker"), null);
+      assert.deepEqual(testApi.getSubagentArgumentCompletions("worker"), []);
+      const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const notices: string[] = [];
+      const command = registeredCommands.find((item) => item.name === "subagent")!;
+      command.handler("worker implement the fix", { ui: { notify: (message: string) => notices.push(message) } });
+      assert.equal(sentUserMessages.length, 0);
+      assert.ok(notices.some((message) => message.includes("worker")));
+    });
   });
 
   it("scout, researcher, and general do not declare spawning permissions", () => {
@@ -4407,12 +4432,12 @@ describe("commands", () => {
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
 
-    subagent.handler("worker@ollama/llama3.1:8b:high implement the fix", {
+    subagent.handler("general@ollama/llama3.1:8b:high implement the fix", {
       ui: { notify() {} },
     });
 
     assert.deepEqual(sentUserMessages, [
-      '[pi-subagent-dispatch] Call subagent({ agent: "worker", model: "ollama/llama3.1:8b", thinking: "high", name: "Worker", task: "implement the fix" }) immediately. Do not check subagents_list.',
+      '[pi-subagent-dispatch] Call subagent({ agent: "general", model: "ollama/llama3.1:8b", thinking: "high", name: "General", task: "implement the fix" }) immediately. Do not check subagents_list.',
     ]);
   });
 
@@ -4422,12 +4447,12 @@ describe("commands", () => {
     const subagent = registeredCommands.find((command) => command.name === "subagent");
     assert.ok(subagent, "expected /subagent to be registered");
 
-    subagent.handler("worker:high inspect the failure", {
+    subagent.handler("general:high inspect the failure", {
       ui: { notify() {} },
     });
 
     assert.deepEqual(sentUserMessages, [
-      '[pi-subagent-dispatch] Call subagent({ agent: "worker", thinking: "high", name: "Worker", task: "inspect the failure" }) immediately. Do not check subagents_list.',
+      '[pi-subagent-dispatch] Call subagent({ agent: "general", thinking: "high", name: "General", task: "inspect the failure" }) immediately. Do not check subagents_list.',
     ]);
   });
 
@@ -6685,7 +6710,6 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
       const expected: Record<string, string[]> = {
         scout: ["read", "grep", "find", "ls", "codemode"],
         researcher: ["web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "bash", "codemode"],
-        worker: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
         general: ["read", "write", "edit", "bash", "web_enable", "web_search", "fetch_content", "get_search_content", "source_check", "codemode"],
       };
       for (const [name, tools] of Object.entries(expected)) {
@@ -6696,13 +6720,11 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
     });
   });
 
-  it("general has worker task tools without spawning or a concurrency cap", async () => {
+  it("general supports implementation without spawning or a concurrency cap", async () => {
     await withIsolatedAgentEnv(async () => {
       const general = testApi.loadAgentDefaults("general");
-      const worker = testApi.loadAgentDefaults("worker");
       assert.ok(general);
-      assert.ok(worker);
-      assert.equal(general.tools, worker.tools);
+      assert.match(general.description, /implementation/);
       assert.equal(general.subagentAgents, undefined);
       assert.equal(general.maxConcurrent, undefined);
       assert.equal(testApi.resolveEffectiveInteractive({ name: "general", task: "" }, general), false);
@@ -6717,7 +6739,6 @@ describe("Pi 1.0 sandbox and structured outputs", () => {
     await withIsolatedAgentEnv(async () => {
       const expected: Record<string, { model: string; thinking: string }> = {
         general: { model: "openai-codex/gpt-6.1-sol", thinking: "medium" },
-        worker: { model: "openai-codex/gpt-6.1-terra", thinking: "high" },
         scout: { model: "openai-codex/gpt-6-luna", thinking: "medium" },
         researcher: { model: "openai-codex/gpt-6-luna", thinking: "medium" },
       };
