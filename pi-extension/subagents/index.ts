@@ -886,6 +886,7 @@ function resolveFallbackModelAndThinking(
   agentDefs: AgentDefaults | null,
   parent: ParentModelDefaults,
 ): { model: string | undefined; thinking: string | undefined } | undefined {
+  if (params.model?.trim()) return undefined;
   const rawFallback = resolveEffectiveModelFallback(params.agent, agentDefs);
   if (!rawFallback) return undefined;
   const fallbackModel = rawFallback.toLowerCase() === "inherit"
@@ -1306,6 +1307,8 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Primary model id when this run is an automatic fallback retry. */
+  fallbackFrom?: string;
   /**
    * Captured when the orchestration caller cancels with `subagent_interrupt`. The pane is
    * being torn down: hide the widget entry, ignore status transitions and
@@ -1386,6 +1389,7 @@ function formatWidgetTelemetryClusters(stats: {
 function formatWidgetTelemetryLine(
   snapshot: StatusSnapshot,
   theme: ThinkingTheme,
+  fallbackFrom?: string,
 ): { left: string; right: string } | null {
   const hasTelemetry = [
     snapshot.model,
@@ -1395,7 +1399,7 @@ function formatWidgetTelemetryLine(
     snapshot.cacheWriteTokens,
     snapshot.contextTokens,
     snapshot.cost,
-  ].some((value) => value != null);
+  ].some((value) => value != null) || !!fallbackFrom;
   if (!hasTelemetry) return null;
 
   const usageClusters = formatWidgetTelemetryClusters({
@@ -1405,9 +1409,18 @@ function formatWidgetTelemetryLine(
     cacheWriteTokens: snapshot.cacheWriteTokens ?? 0,
     cost: snapshot.cost ?? 0,
   });
+  const fallbackTag = fallbackFrom ? "  (fallback)" : "";
   const telemetryText = usageClusters.length > 0
-    ? `↳ ${usageClusters.join("  ")}`
-    : "↳ starting…";
+    ? `↳ ${usageClusters.join("  ")}${fallbackTag}`
+    : snapshot.kind === "starting"
+      ? `↳ starting…${fallbackTag}`
+      : snapshot.activeScope === "retrying"
+        ? `↳ retrying…${fallbackTag}`
+        : snapshot.activeScope === "provider"
+          ? `↳ awaiting model…${fallbackTag}`
+          : snapshot.kind === "waiting"
+            ? `↳ waiting…${fallbackTag}`
+            : `↳ running…${fallbackTag}`;
   const left = `          ${ICON_DIM}${telemetryText}${RST} `;
 
   const rightSegments: string[] = [];
@@ -1435,7 +1448,7 @@ function formatWidgetTelemetryLine(
   return { left, right };
 }
 
-type WidgetAgent = Pick<RunningSubagent, "name" | "agent" | "startTime" | "cli" | "statusState">;
+type WidgetAgent = Pick<RunningSubagent, "name" | "agent" | "startTime" | "cli" | "statusState" | "fallbackFrom">;
 
 function renderSubagentWidgetLines(
   agents: WidgetAgent[],
@@ -1461,7 +1474,7 @@ function renderSubagentWidgetLines(
 
     rows.push({ left, right });
 
-    const telemetryLine = formatWidgetTelemetryLine(snapshot, theme);
+    const telemetryLine = formatWidgetTelemetryLine(snapshot, theme, agent.fallbackFrom);
     if (telemetryLine) rows.push(telemetryLine);
   }
 
@@ -3169,6 +3182,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               };
               try {
                 finalRunning = await lifecycle.launchSubagent(retryParams, ctx, { parent, parentLeafId: spawnParentLeafId, piTools, ownedSessions });
+                finalRunning.fallbackFrom = primarySelection.model ?? "(default)";
                 trackSession(finalRunning);
                 finalRunning.abortController = watcherAbort;
                 updateWidget();
@@ -4024,10 +4038,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
         const identity = formatSubagentIdentity(name, details.agent, theme);
+        const fallbackInfo = details.fallback as SubagentResult["fallback"] | undefined;
+        const fallbackSuffix = fallbackInfo
+          ? `fallback from ${fallbackInfo.primaryModel ?? "primary"}`
+          : "";
         let header = `${icon} ${theme.fg("dim", "subagent · ")}${identity}`;
         if (failed) {
           const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
-          header += ` ${theme.fg("dim", "—")} ${theme.fg("error", reason)}`;
+          const fullReason = fallbackSuffix ? `${reason} (${fallbackSuffix})` : reason;
+          header += ` ${theme.fg("dim", "—")} ${theme.fg("error", fullReason)}`;
+        } else if (fallbackSuffix) {
+          header += ` ${theme.fg("dim", "—")} ${theme.fg("warning", fallbackSuffix)}`;
         }
 
         // Quiet footer: model:thinking · tools · duration · ↑in ↓out.
@@ -4057,8 +4078,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const rawContent = typeof message.content === "string" ? message.content : "";
 
-        // Clean summary (remove follow-up ref and leading label for display)
-        const summary = rawContent
+        // Clean summary (remove follow-up ref and leading labels for display)
+        const strippedFallback = fallbackInfo
+          ? rawContent.replace(/^Primary model(?: [^\n]+)? failed \([\s\S]*?\); retried with [^\n]+\.\n\n/, "")
+          : rawContent;
+        const summary = strippedFallback
           .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
           .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
@@ -4084,8 +4108,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (extraSegments.length) contentLines.push(extraSegments.join(theme.fg("dim", " · ")));
 
         if (options.expanded) {
-          if (details.name || details.sessionFile) {
+          if (details.name || details.sessionFile || fallbackInfo) {
             contentLines.push("");
+            if (fallbackInfo?.reason) {
+              contentLines.push(theme.fg("muted", `Fallback reason: ${fallbackInfo.reason.replace(/\s+/g, " ").trim()}`));
+            }
+            if (fallbackInfo?.failedSessionFile) {
+              contentLines.push(theme.fg("muted", `Failed primary session: ${fallbackInfo.failedSessionFile}`));
+            }
             if (details.name) {
               contentLines.push(
                 theme.fg(

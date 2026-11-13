@@ -464,7 +464,8 @@ export default async function (pi: ExtensionAPI) {
   pi.on("agent_end", (event, ctx) => {
     // A loop ending is not final: Pi may retry, compact, drain queues, or
     // continue from agent_before_settle. Keep recording until settlement.
-    recorder.agentEnd(lifecycleTelemetry(latestAssistantMessage(event.messages), ctx));
+    const retrying = findLatestAssistantError(event.messages) != null;
+    recorder.agentEnd(lifecycleTelemetry(latestAssistantMessage(event.messages), ctx), { retrying });
   });
 
   pi.on("agent_before_settle", (event, ctx) => {

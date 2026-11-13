@@ -3031,6 +3031,24 @@ describe("subagent discovery", () => {
       ),
       undefined,
     );
+    assert.equal(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T", model: "cliproxy/byesu-gemini/gemini-4-carbon" },
+        { model: "openai-codex/gpt-6-astra", modelFallback: "inherit", thinking: "high" },
+        parent,
+      ),
+      undefined,
+      "explicit per-call model override must not silently fall back via inherit",
+    );
+    assert.equal(
+      testApi.resolveFallbackModelAndThinking(
+        { agent: "worker", task: "T", model: "cliproxy/byesu-gemini/gemini-4-carbon" },
+        { model: "openai-codex/gpt-6-astra", modelFallback: "anthropic/backup", thinking: "high" },
+        parent,
+      ),
+      undefined,
+      "explicit per-call model override must not silently fall back to a profile backup",
+    );
   });
 
   it("recognizes broad fallback failures but not cancellation or interruption", () => {
@@ -4949,7 +4967,15 @@ describe("subagent activity snapshots", () => {
       const interim = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(interim.ok);
       assert.equal(interim.activity.phase, "active");
+      assert.equal(interim.activity.activeScope, "agent");
       assert.equal(interim.activity.latestEvent, "agent_end");
+
+      recorder.agentEnd(undefined, { retrying: true });
+      const retrying = readSubagentActivityFile(activityFile, "child-2");
+      assert.ok(retrying.ok);
+      assert.equal(retrying.activity.phase, "active");
+      assert.equal(retrying.activity.activeScope, "retrying");
+      assert.equal(retrying.activity.latestEvent, "agent_end");
       currentNow = 3_000;
       recorder.agentSettledWaiting();
       let read = readSubagentActivityFile(activityFile, "child-2");
@@ -6172,6 +6198,60 @@ describe("subagent display helpers", () => {
       assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot("off"), thinkingTheme).right, /:off/);
       assert.doesNotMatch(testApi.formatWidgetTelemetryLine(snapshot(undefined), thinkingTheme).right, /:/);
     });
+
+    it("avoids misleading starting text once active, labels retries, and marks fallback runs", () => {
+      const strip = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+      const makeSnapshot = (activeScope: string) => ({
+        ...classifyStatus(observeStatus(createStatusState({ source: "pi", startTimeMs: 0 }), {
+          snapshot: "present",
+          updatedAt: 5_000,
+          sequence: 1,
+          phase: "active",
+          active: true,
+          activeScope,
+          activeSince: 5_000,
+          model: "byesu-gemini/gemini-4-carbon",
+          contextTokens: 161_569,
+        }, 5_000), 125_000),
+      });
+
+      const retryingLine = testApi.formatWidgetTelemetryLine(makeSnapshot("retrying"), thinkingTheme);
+      assert.match(strip(retryingLine.left), /↳ retrying…/);
+      assert.doesNotMatch(strip(retryingLine.left), /starting…/);
+
+      const providerLine = testApi.formatWidgetTelemetryLine(makeSnapshot("provider"), thinkingTheme);
+      assert.match(strip(providerLine.left), /↳ awaiting model…/);
+
+      const fallbackLine = testApi.formatWidgetTelemetryLine(
+        makeSnapshot("streaming"),
+        thinkingTheme,
+        "byesu-gemini/gemini-4-carbon",
+      );
+      assert.match(strip(fallbackLine.left), /↳ running… {2}\(fallback\)/);
+
+      const widgetLines = testApi.renderSubagentWidgetLines([{
+        id: "a1",
+        name: "Advisor",
+        agent: "advisor",
+        startTime: 0,
+        fallbackFrom: "byesu-gemini/gemini-4-carbon",
+        statusState: observeStatus(createStatusState({ source: "pi", startTimeMs: 0 }), {
+          snapshot: "present",
+          updatedAt: 5_000,
+          sequence: 1,
+          phase: "active",
+          active: true,
+          activeScope: "retrying",
+          activeSince: 5_000,
+          model: "W&B/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          thinking: "high",
+          inputTokens: 1200,
+          outputTokens: 300,
+        }, 5_000),
+      }], 110, thinkingTheme, 125_000).map(strip);
+      assert.match(widgetLines[1], /active · retrying 2m/);
+      assert.match(widgetLines[2], /↳ ↑1\.2k↓300 {2}\(fallback\)/);
+    });
   });
 
   describe("formatModelWithThinking", () => {
@@ -7150,6 +7230,60 @@ describe("subagent badge rendering and conciseness rules", () => {
         assert.equal(lines[dividerIndex + 1].trim(), "8s");
       }
     }
+  });
+
+  it("surfaces model fallback clearly in subagent_result header and expanded details without hiding the summary", () => {
+    initTheme("dark", false);
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const renderer = registeredMessageRenderers.find((entry) => entry.name === "subagent_result")!.renderer;
+    const fallback = {
+      primaryModel: "cliproxy/byesu-gemini/gemini-4-carbon",
+      fallbackModel: "cliproxy/W&B/deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      reason: "503: model_not_found\nno available channel",
+      failedSessionFile: "/tmp/failed-primary.jsonl",
+    };
+    const content = testApi.resolveResultPresentation({
+      exitCode: 0,
+      elapsed: 102,
+      summary: "**Verdict: CORRECT**\nLine 2\nLine 3\nLine 4\nLine 5",
+      sessionFile: "/tmp/retry.jsonl",
+      sessionId: "retry-id",
+      fallback,
+    }, "Advisor");
+
+    const collapsed = renderer({
+      content,
+      details: {
+        name: "Advisor",
+        agent: "advisor",
+        elapsed: 102,
+        exitCode: 0,
+        sessionFile: "/tmp/retry.jsonl",
+        fallback,
+        stats: { model: "W&B/deepseek-ai/DeepSeek-V4.1-Flash-1017", thinking: "high", toolCount: 98, inputTokens: 510752, outputTokens: 91860, cacheReadTokens: 0, cacheWriteTokens: 0, contextTokens: 217592, cost: 0 },
+      },
+    }, { expanded: false }, createTheme()).render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const header = collapsed.find((line: string) => line.includes("subagent · Advisor"))!;
+    assert.match(header, /fallback from cliproxy\/byesu-gemini\/gemini-4-carbon/);
+    const bodyText = collapsed.join("\n");
+    assert.match(bodyText, /\*\*Verdict: CORRECT\*\*/);
+    assert.match(bodyText, /Line 5/);
+    assert.doesNotMatch(bodyText, /Primary model cliproxy\/byesu-gemini\/gemini-4-carbon failed/);
+
+    const expanded = renderer({
+      content,
+      details: {
+        name: "Advisor",
+        agent: "advisor",
+        elapsed: 102,
+        exitCode: 0,
+        sessionFile: "/tmp/retry.jsonl",
+        fallback,
+      },
+    }, { expanded: true }, createTheme()).render(140).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+    assert.match(expanded, /Fallback reason: 503: model_not_found no available channel/);
+    assert.match(expanded, /Failed primary session: \/tmp\/failed-primary\.jsonl/);
   });
 
   it("shows a single-line footer and reveals cache/cost/context only when expanded", () => {

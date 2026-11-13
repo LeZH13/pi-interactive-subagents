@@ -224,7 +224,7 @@ This is parent admission policy, not a frozen child permission. Resumes keep the
 
 ### Model fallback
 
-`model-fallback` is attempted once when the primary run reports a provider/agent error, exits non-zero, or exits without any non-whitespace assistant text. The failed child is retained in the parent's artifacts and a fresh child starts from the original task under the same display name. User cancellation never triggers fallback, and a fallback that resolves to the same model and thinking level is skipped.
+`model-fallback` is attempted once when the primary run reports a provider/agent error, exits non-zero, or exits without any non-whitespace assistant text. The failed child is retained in the parent's artifacts and a fresh child starts from the original task under the same display name. User cancellation never triggers fallback, an explicit per-call `model` override (`subagent({ model: ... })` or `/subagent agent@model`) disables fallback so the requested model is never silently swapped, and a fallback that resolves to the same model and thinking level is skipped.
 
 With `model-fallback: inherit`, nested agents inherit from their **immediate spawner**, not always from the top-level conversation. Fallback thinking resolves in this order: an explicit per-spawn value, the settings-page override, the agent's `thinking`, the spawner's live thinking level, then Pi's default. The fallback model and thinking are frozen in the retry's loadout, so later `subagent_message` resumes replay the same selection.
 

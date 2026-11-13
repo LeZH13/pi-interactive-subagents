@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
-export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
+export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool" | "retrying";
 
 export type SubagentActivityEvent =
   | "session_start"
@@ -70,7 +70,7 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(telemetry?: SubagentTelemetry): void;
   agentStart(telemetry?: SubagentTelemetry): void;
-  agentEnd(telemetry?: SubagentTelemetry): void;
+  agentEnd(telemetry?: SubagentTelemetry, options?: { retrying?: boolean }): void;
   agentSettledWaiting(telemetry?: SubagentTelemetry): void;
   agentSettledDone(telemetry?: SubagentTelemetry): void;
   turnStart(turnIndex?: number, telemetry?: SubagentTelemetry): void;
@@ -91,7 +91,7 @@ export interface SubagentActivityRecorder {
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
 const MAX_WRITE_FAILURES = 3;
 const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
-const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
+const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool", "retrying"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_start",
   "input",
@@ -557,12 +557,12 @@ export function createSubagentActivityRecorder(params: {
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEnd(telemetry) {
+    agentEnd(telemetry, options) {
       record("agent_end", (current, observedAt) => {
         finishTelemetryTurn(current, telemetry);
         clearActiveState(current);
         current.agentActive = true;
-        markActive(current, "agent", observedAt);
+        markActive(current, options?.retrying ? "retrying" : "agent", observedAt);
       }, "immediate");
     },
     agentSettledWaiting(telemetry) {

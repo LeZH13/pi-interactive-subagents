@@ -287,6 +287,7 @@ describe("effective Pi launch selection", () => {
     assert.equal(runtime.resolveFallbackModelAndThinking(params, defaults, parent), undefined);
     setOverride({ model: "provider/custom", thinking: "max", modelFallback: "inherit" });
     assert.deepEqual(runtime.resolveFallbackModelAndThinking(params, defaults, parent), { model: "provider/parent", thinking: "max" });
+    assert.equal(runtime.resolveFallbackModelAndThinking({ ...params, model: "provider/explicit-call" }, defaults, parent), undefined);
     assert.deepEqual(runtime.resolveEffectiveModelAndThinking({ ...params, model: "provider/tool:high", thinking: "2048" }, defaults), { model: "provider/tool", thinking: "2048" });
     setOverride({ modelFallback: "provider/explicit" });
     assert.deepEqual(runtime.resolveFallbackModelAndThinking(params, defaults, parent), { model: "provider/explicit", thinking: "low" });
